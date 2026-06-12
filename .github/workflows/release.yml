@@ -1,0 +1,117 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*' # v1.4.0
+
+env:
+  PUBLIC_RELEASES_REPO: pa-arth/promptster-cli-releases
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Extract version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify release metadata
+        run: |
+          VERSION=${{ steps.version.outputs.VERSION }}
+          node scripts/cli-release-notes.mjs "$VERSION" > /tmp/cli-release-notes.md
+          node -e "
+            const pkg = require('./npm/package.json');
+            if (pkg.version !== '${{ steps.version.outputs.VERSION }}') {
+              throw new Error('npm/package.json version does not match tag');
+            }
+          "
+
+      - name: Run Go tests
+        run: go test ./...
+
+      - name: Build all platform binaries
+        run: node npm/scripts/build.js "${{ steps.version.outputs.VERSION }}"
+
+      - name: Verify packaged binaries
+        run: node npm/scripts/check-binaries.js
+
+      - name: Publish to npm
+        working-directory: npm
+        run: pnpm publish --access public --no-git-checks
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Clone public releases repo
+        env:
+          GH_TOKEN: ${{ secrets.PUBLIC_RELEASES_TOKEN }}
+        run: |
+          gh repo clone "$PUBLIC_RELEASES_REPO" /tmp/promptster-cli-releases
+
+      - name: Update public installer script
+        env:
+          GH_TOKEN: ${{ secrets.PUBLIC_RELEASES_TOKEN }}
+        run: |
+          cp install.sh /tmp/promptster-cli-releases/install.sh
+          cp install.sh /tmp/promptster-cli-releases/index.html
+          cd /tmp/promptster-cli-releases
+          if ! git diff --quiet -- install.sh index.html; then
+            git config user.name "promptster-release-bot"
+            git config user.email "actions@users.noreply.github.com"
+            git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ env.PUBLIC_RELEASES_REPO }}.git"
+            git add install.sh index.html
+            git commit -m "chore: update installer for ${{ github.ref_name }}"
+            git push origin HEAD
+          fi
+
+      - name: Create public GitHub Release (releases repo)
+        env:
+          GH_TOKEN: ${{ secrets.PUBLIC_RELEASES_TOKEN }}
+        run: |
+          VERSION=${{ steps.version.outputs.VERSION }}
+          BIN=npm/binaries
+          gh release create "cli-v${VERSION}" \
+            --repo "$PUBLIC_RELEASES_REPO" \
+            --title "CLI v${VERSION}" \
+            --notes-file /tmp/cli-release-notes.md \
+            install.sh#install.sh \
+            "$BIN/promptster-linux-x64#promptster-linux-x64" \
+            "$BIN/promptster-linux-arm64#promptster-linux-arm64" \
+            "$BIN/promptster-darwin-x64#promptster-darwin-x64" \
+            "$BIN/promptster-darwin-arm64#promptster-darwin-arm64" \
+            "$BIN/promptster-win32-x64.exe#promptster-win32-x64.exe"
+
+      - name: Create GitHub Release (this repo)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=${{ steps.version.outputs.VERSION }}
+          BIN=npm/binaries
+          gh release create "${{ github.ref_name }}" \
+            --title "v${VERSION}" \
+            --notes-file /tmp/cli-release-notes.md \
+            install.sh#install.sh \
+            "$BIN/promptster-linux-x64#promptster-linux-x64" \
+            "$BIN/promptster-linux-arm64#promptster-linux-arm64" \
+            "$BIN/promptster-darwin-x64#promptster-darwin-x64" \
+            "$BIN/promptster-darwin-arm64#promptster-darwin-arm64" \
+            "$BIN/promptster-win32-x64.exe#promptster-win32-x64.exe"

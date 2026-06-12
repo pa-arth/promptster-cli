@@ -1,0 +1,22 @@
+{
+  "ownedPaths": [
+    ".github/workflows/release.yml",
+    "README.md",
+    "npm",
+    "scripts/cli-release-config.json",
+    "scripts/cli-release-lib.mjs",
+    "scripts/cli-release-notes.mjs",
+    "scripts/cli-release-prepare.mjs",
+    "scripts/cli-release-tag.mjs"
+  ],
+  "releaseManifestPaths": [
+    "npm/package.json",
+    "npm/CHANGELOG.md"
+  ],
+  "changelogSourcePaths": [
+    "."
+  ],
+  "packageFile": "npm/package.json",
+  "changelogFile": "npm/CHANGELOG.md",
+  "tagPrefix": "v"
+}

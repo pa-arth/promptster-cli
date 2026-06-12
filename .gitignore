@@ -1,0 +1,7 @@
+promptster
+promptster-cli
+bin/
+dist/
+npm/binaries/
+node_modules/
+.DS_Store

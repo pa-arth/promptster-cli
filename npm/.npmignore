@@ -1,0 +1,3 @@
+scripts/build.js
+*.sh
+.DS_Store
