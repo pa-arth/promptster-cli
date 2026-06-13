@@ -55,12 +55,15 @@ var httpClient = &http.Client{
 
 // RedeemResponse is the response from POST /v1/candidate/redeem.
 type RedeemResponse struct {
-	SessionID         string `json:"sessionId"`
-	SessionToken      string `json:"sessionToken"`
-	AssessmentID      string `json:"assessmentId"`
-	AssessmentTitle   string `json:"assessmentTitle"`
-	OrgName           string `json:"orgName"`
-	TaskBrief         string `json:"taskBrief"`
+	SessionID       string `json:"sessionId"`
+	SessionToken    string `json:"sessionToken"`
+	AssessmentID    string `json:"assessmentId"`
+	AssessmentTitle string `json:"assessmentTitle"`
+	OrgName         string `json:"orgName"`
+	TaskBrief       string `json:"taskBrief"`
+	// Brief is the structured assessment brief. Nil when the backend
+	// predates structured briefs — TaskBrief is the fallback.
+	Brief             *Brief `json:"brief"`
 	RepoURL           string `json:"repoUrl"`
 	RepoCommit        string `json:"repoCommit"`
 	SetupInstructions string `json:"setupInstructions"`

@@ -11,112 +11,111 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
+// cmdBrief shows the assessment brief. By default it opens the live brief
+// viewer (countdown + structured task doc) in a brand-new terminal window so
+// it stays visible next to the candidate's editor.
+//
+//	promptster brief          open the viewer in a new terminal window
+//	promptster brief --here   run the viewer in this terminal
+//	promptster brief --plain  print once, no interactivity (also the no-TTY path)
+//	promptster brief --json   machine-readable output
+//	promptster brief --demo   preview the viewer with sample content (no session)
 func cmdBrief(args []string) {
-	jsonOutput := false
+	var jsonOutput, here, plain, demo bool
 	for _, a := range args {
-		if a == "--json" {
+		switch a {
+		case "--json":
 			jsonOutput = true
+		case "--here", "--inline":
+			here = true
+		case "--plain":
+			plain = true
+		case "--demo":
+			demo = true
 		}
 	}
 
-	session, err := loadSession()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		os.Exit(1)
+	var session Session
+	var brief Brief
+	if demo {
+		session, brief = demoBriefSession()
+	} else {
+		s, err := loadSession()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		session = s
+		brief = resolveBrief(s)
 	}
 
 	if jsonOutput {
-		title := session.AssessmentTitle
-		if title == "" {
-			title = "Assessment Task"
-		}
-
-		out := map[string]interface{}{
-			"title":             title,
-			"taskBrief":         session.TaskBrief,
-			"timeLimitMinutes":  session.TimeLimitMinutes,
-			"workspace":         session.TaskRoot,
-			"setupInstructions": session.SetupInstructions,
-		}
-
-		if session.TimeLimitMinutes > 0 && !session.StartedAt.IsZero() {
-			elapsed := time.Since(session.StartedAt)
-			remaining := time.Duration(session.TimeLimitMinutes)*time.Minute - elapsed
-			if remaining < 0 {
-				remaining = 0
-			}
-			out["remainingMinutes"] = int(remaining.Minutes())
-		}
-
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		_ = enc.Encode(out)
+		printBriefJSON(session, brief)
 		return
 	}
 
-	// Human-readable output (original).
-	titleStyle := lipgloss.NewStyle().
-		Bold(true).
-		Foreground(cStrong)
-
-	briefStyle := lipgloss.NewStyle().
-		Foreground(cBody).
-		Width(68)
-
-	metaStyle := lipgloss.NewStyle().
-		Foreground(cMuted)
-
-	boxStyle := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color("#22c55e")).
-		Padding(1, 2).
-		Width(74)
-
-	// No title: assessment titles are auto-derived from upstream issue text
-	// which leaks the answer (see project_audit_may2026_results.md). The brief
-	// itself is the single source of truth for what the candidate must do.
-	var content strings.Builder
-	content.WriteString(titleStyle.Render("Task"))
-	content.WriteString("\n\n")
-
-	// Task brief
-	if session.TaskBrief != "" {
-		wrapped := strings.Join(wordWrap(session.TaskBrief, 68), "\n")
-		content.WriteString(briefStyle.Render(wrapped))
-		content.WriteString("\n")
+	if plain || !stdoutIsTerminal() {
+		printBriefStatic(session, brief)
+		return
 	}
 
-	// Time info
-	content.WriteString("\n")
-	if session.TimeLimitMinutes > 0 {
+	if here || demo {
+		if err := runBriefTUI(session, brief); err != nil {
+			printBriefStatic(session, brief)
+		}
+		return
+	}
+
+	// Default: pop the viewer in its own terminal window so the brief stays
+	// accessible while the candidate works. Fall back to inline on failure.
+	if err := openBriefWindow(); err != nil {
+		if err := runBriefTUI(session, brief); err != nil {
+			printBriefStatic(session, brief)
+		}
+		return
+	}
+
+	muted := lipgloss.NewStyle().Foreground(cMuted)
+	fmt.Println()
+	fmt.Println("  " + lipgloss.NewStyle().Foreground(cStrong).Render("Opened the brief in a new terminal window."))
+	fmt.Println("  " + muted.Render("Keep it on a corner of your screen — the countdown updates live."))
+	fmt.Println("  " + muted.Render("Prefer it here? Run: promptster brief --here"))
+	fmt.Println()
+}
+
+func printBriefJSON(session Session, brief Brief) {
+	title := session.AssessmentTitle
+	if title == "" {
+		title = "Assessment Task"
+	}
+
+	out := map[string]interface{}{
+		"title":             title,
+		"taskBrief":         session.TaskBrief,
+		"brief":             brief,
+		"timeLimitMinutes":  session.TimeLimitMinutes,
+		"workspace":         session.TaskRoot,
+		"setupInstructions": session.SetupInstructions,
+	}
+
+	if session.TimeLimitMinutes > 0 && !session.StartedAt.IsZero() {
 		elapsed := time.Since(session.StartedAt)
 		remaining := time.Duration(session.TimeLimitMinutes)*time.Minute - elapsed
 		if remaining < 0 {
 			remaining = 0
 		}
-
-		content.WriteString(metaStyle.Render(fmt.Sprintf("⏱  Time limit: %d minutes", session.TimeLimitMinutes)))
-		if !session.StartedAt.IsZero() {
-			content.WriteString("\n")
-			if remaining > 0 {
-				content.WriteString(metaStyle.Render(fmt.Sprintf("⏳  Remaining: ~%d minutes", int(remaining.Minutes()))))
-			} else {
-				content.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("#ef4444")).Bold(true).Render("⏳  Time limit exceeded"))
-			}
-		}
+		out["remainingMinutes"] = int(remaining.Minutes())
 	}
 
-	// Workspace
-	if session.TaskRoot != "" {
-		content.WriteString("\n")
-		content.WriteString(metaStyle.Render(fmt.Sprintf("📁  Workspace: %s", session.TaskRoot)))
-	}
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(out)
+}
 
-	fmt.Println()
-	fmt.Println(boxStyle.Render(content.String()))
-	fmt.Println()
-	fmt.Println(metaStyle.Render("  Tip: This info is also in TASK.md in your workspace."))
-	fmt.Println()
+// stdoutIsTerminal reports whether stdout is a terminal (vs piped/redirected).
+func stdoutIsTerminal() bool {
+	fi, err := os.Stdout.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
 }
 
 // writeTaskFile creates TASK.md in the workspace root with the assessment brief.

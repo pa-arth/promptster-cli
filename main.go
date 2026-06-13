@@ -106,7 +106,7 @@ func interactiveMenu() {
 
 	items := []menuItem{
 		{"1", "Start assessment", "Redeem a key and begin", false},
-		{"2", "View task brief", "Show the current task + time remaining", true},
+		{"2", "View task brief", "Open the brief + live countdown in its own window", true},
 		{"3", "Explain a decision", "Document your rationale for recent work", true},
 		{"4", "Check status", "Show session info and event count", true},
 		{"5", "Submit assessment", "Push code and complete the session", true},
@@ -178,7 +178,8 @@ Commands:
   done                         Submit your assessment when finished
   abort [--reason X]           Discard the current session + tear down hooks (no submit)
   reset [--purge]              Wipe local Promptster config to recover a broken setup
-  brief [--json]               Show the task brief, time remaining, and workspace
+  brief [--here|--json]        Open the live task brief in a new terminal window
+                               (--here shows it in this terminal instead)
   status [--json]              Show current session info and live event count
   doctor                       Check setup and diagnose configuration issues
   explain [--last 20m]         Document your decision rationale for recent work
