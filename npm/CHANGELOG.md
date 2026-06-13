@@ -1,5 +1,11 @@
 # CLI Changelog
 
+## 1.4.0 - 2026-06-12
+
+- feat(capture): every Claude Code hook event now carries the per-process lane identity (`meta.ideSessionId` = Claude's `session_id`, `meta.cwd`) — previously only prompts did. Concurrent `claude` sessions in the same workspace are now fully distinguishable downstream, including which lane authored each file edit and command (feeds the worker's parallel-orchestration signals)
+- feat(capture): the BYO transcript watcher stamps the same lane identity on every transcript-derived event (one transcript file = one Claude process)
+- feat(capture): the transcript watcher now also tails sessions running in git worktrees registered to the workspace repo (`git worktree list` is consulted every poll) — candidates who parallelize with `git worktree add ../fix` are no longer invisible to BYO capture
+
 ## 1.3.4 - 2026-06-11
 
 - feat(capture): the BYO transcript watcher now converts candidate-typed slash commands (`<command-name>` envelopes) into `tool_intent` events with `toolName: "SlashCommand"` instead of dropping them — pure-transcript capture now feeds the ecosystem_leverage rubric dimension the same way hook capture does. Claude Code built-ins with dedicated semantics (`/clear`, `/compact`, `/model`, etc.) stay excluded; Promptster's own `/explain` is emitted and filtered worker-side by input preview, matching the hook path

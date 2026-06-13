@@ -380,6 +380,7 @@ func pollClaudeTranscripts(
 	progress := loadClaudeWatchProgress()
 	sent := 0
 	var consumed int64
+	roots := workspaceMatchRoots(workspace)
 
 	for _, path := range candidateClaudeTranscripts(startCutoff) {
 		switch progress.Match[path] {
@@ -388,7 +389,7 @@ func pollClaudeTranscripts(
 		case "yes":
 			// proceed to tail
 		default:
-			switch classifyClaudeTranscript(path, workspace, startCutoff) {
+			switch classifyClaudeTranscript(path, roots, startCutoff) {
 			case claudeMatchYes:
 				progress.Match[path] = "yes"
 			case claudeMatchNo:
@@ -466,11 +467,36 @@ const (
 	claudeMatchNo
 )
 
+// workspaceMatchRoots returns the workspace plus every git worktree
+// registered to its repository. Candidates who parallelize with
+// `git worktree add ../fix` run claude processes whose cwd is OUTSIDE the
+// workspace directory; those transcripts belong to the assessment and must
+// be tailed. Re-read every poll so worktrees created mid-session are picked
+// up before their transcripts get classified.
+func workspaceMatchRoots(workspace string) []string {
+	roots := []string{workspace}
+	out, err := exec.Command("git", "-C", workspace, "worktree", "list", "--porcelain").Output()
+	if err != nil {
+		return roots
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if !strings.HasPrefix(line, "worktree ") {
+			continue
+		}
+		p := resolvePath(strings.TrimSpace(strings.TrimPrefix(line, "worktree ")))
+		if p != "" && p != workspace {
+			roots = append(roots, p)
+		}
+	}
+	return roots
+}
+
 // classifyClaudeTranscript decides whether a transcript belongs to this
-// workspace by scanning its first lines for one carrying cwd. Early lines
+// assessment by scanning its first lines for one carrying cwd and matching
+// it against the workspace or any of its registered worktrees. Early lines
 // (mode, permission-mode, ...) often lack cwd, so a file with no cwd yet stays
 // undecided rather than being cached as a mismatch.
-func classifyClaudeTranscript(path, workspace string, startCutoff time.Time) claudeMatchResult {
+func classifyClaudeTranscript(path string, roots []string, startCutoff time.Time) claudeMatchResult {
 	f, err := os.Open(path)
 	if err != nil {
 		return claudeMatchUndecided
@@ -503,8 +529,11 @@ func classifyClaudeTranscript(path, workspace string, startCutoff time.Time) cla
 				return claudeMatchNo
 			}
 		}
-		if pathWithin(resolvePath(rec.Cwd), workspace) {
-			return claudeMatchYes
+		resolved := resolvePath(rec.Cwd)
+		for _, root := range roots {
+			if pathWithin(resolved, root) {
+				return claudeMatchYes
+			}
 		}
 		return claudeMatchNo
 	}
@@ -517,12 +546,13 @@ func classifyClaudeTranscript(path, workspace string, startCutoff time.Time) cla
 // on. Used after a hook-takeover window.
 func fastForwardClaudeTranscripts(workspace string, startCutoff time.Time) {
 	progress := loadClaudeWatchProgress()
+	roots := workspaceMatchRoots(workspace)
 	for _, path := range candidateClaudeTranscripts(startCutoff) {
 		if progress.Match[path] == "no" {
 			continue
 		}
 		if progress.Match[path] != "yes" {
-			if classifyClaudeTranscript(path, workspace, startCutoff) != claudeMatchYes {
+			if classifyClaudeTranscript(path, roots, startCutoff) != claudeMatchYes {
 				continue
 			}
 			progress.Match[path] = "yes"

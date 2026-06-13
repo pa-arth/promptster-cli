@@ -1189,12 +1189,49 @@ func relativizeEventPaths(event *Event, taskRoot string) {
 	rewrite("file_path")
 }
 
+// attachClaudeLaneMeta threads the per-process lane identifiers — Claude
+// Code's session_id and the hook payload's cwd — into data.meta on EVERY
+// hook event, not just prompts. Distinct session_ids are distinct concurrent
+// `claude` processes (parallel sessions in the same workspace); distinct
+// cwds are worktree/checkout isolation. The worker's parallelism signals and
+// cross-lane file-collision detection key on these. Existing meta keys are
+// never overwritten.
+func attachClaudeLaneMeta(e *Event, payload map[string]interface{}) {
+	sid, _ := payload["session_id"].(string)
+	cwd, _ := payload["cwd"].(string)
+	if sid == "" && cwd == "" {
+		return
+	}
+	data, ok := e.Data.(map[string]interface{})
+	if !ok || data == nil {
+		return
+	}
+	meta, _ := data["meta"].(map[string]interface{})
+	if meta == nil {
+		meta = map[string]interface{}{}
+	}
+	if sid != "" {
+		if _, exists := meta["ideSessionId"]; !exists {
+			meta["ideSessionId"] = sid
+		}
+	}
+	if cwd != "" {
+		if _, exists := meta["cwd"]; !exists {
+			meta["cwd"] = cwd
+		}
+	}
+	data["meta"] = meta
+}
+
 // normalize dispatches to the right normalizer based on detected source.
 func normalize(payload map[string]interface{}, sessionID string) (Event, bool) {
 	src := detectSource(payload)
 	switch src {
 	case "claude-code":
 		e, ok := normalizeClaudeCode(payload, sessionID)
+		if ok {
+			attachClaudeLaneMeta(&e, payload)
+		}
 		e.Source = src
 		return e, ok
 	case "cursor":

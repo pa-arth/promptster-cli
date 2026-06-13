@@ -274,28 +274,28 @@ func TestClassifyClaudeTranscript(t *testing.T) {
 		`{"type":"mode","mode":"normal"}`,
 		fmt.Sprintf(`{"type":"user","cwd":"%s","timestamp":"2026-06-10T10:00:00Z","message":{"content":"hi"}}`, ws),
 	)
-	if got := classifyClaudeTranscript(match, ws, cutoff); got != claudeMatchYes {
+	if got := classifyClaudeTranscript(match, []string{ws}, cutoff); got != claudeMatchYes {
 		t.Errorf("match: got %v", got)
 	}
 
 	other := write("other.jsonl",
 		fmt.Sprintf(`{"type":"user","cwd":"%s","timestamp":"2026-06-10T10:00:00Z","message":{"content":"hi"}}`, filepath.Join(tmp, "elsewhere")),
 	)
-	if got := classifyClaudeTranscript(other, ws, cutoff); got != claudeMatchNo {
+	if got := classifyClaudeTranscript(other, []string{ws}, cutoff); got != claudeMatchNo {
 		t.Errorf("other: got %v", got)
 	}
 
 	// No cwd yet — file just created, must stay undecided (retry next poll),
 	// NOT be cached as a mismatch.
 	young := write("young.jsonl", `{"type":"mode","mode":"normal"}`)
-	if got := classifyClaudeTranscript(young, ws, cutoff); got != claudeMatchUndecided {
+	if got := classifyClaudeTranscript(young, []string{ws}, cutoff); got != claudeMatchUndecided {
 		t.Errorf("young: got %v", got)
 	}
 
 	old := write("old.jsonl",
 		fmt.Sprintf(`{"type":"user","cwd":"%s","timestamp":"2026-06-10T08:00:00Z","message":{"content":"hi"}}`, ws),
 	)
-	if got := classifyClaudeTranscript(old, ws, cutoff); got != claudeMatchNo {
+	if got := classifyClaudeTranscript(old, []string{ws}, cutoff); got != claudeMatchNo {
 		t.Errorf("old session before cutoff: got %v", got)
 	}
 }

@@ -76,6 +76,13 @@ type claudeTranscriptProcessor struct {
 	// time; here the watcher observes lines up to a poll later, so deltas must
 	// come from line timestamps, not time.Now().
 	lastPromptTs time.Time
+	// Lane identity of this transcript: one file IS one Claude Code process
+	// (the filename is the session uuid), so the first record carrying
+	// sessionId/cwd pins both for every event the file produces. Distinct
+	// lanes = parallel sessions; the worker's parallelism signals key on
+	// meta.ideSessionId / meta.cwd.
+	ideSessionID string
+	laneCwd      string
 }
 
 func newClaudeTranscriptProcessor(sessionID string, consentToIntegrity bool) *claudeTranscriptProcessor {
@@ -125,10 +132,51 @@ func (p *claudeTranscriptProcessor) newTranscriptEvent(kind, ts string) Event {
 }
 
 // process parses one transcript line and returns zero or more canonical events.
+// attachLane stamps the transcript's lane identity (meta.ideSessionId /
+// meta.cwd) onto every outgoing event whose data is a map, never overwriting
+// keys a normalizer already set.
+func (p *claudeTranscriptProcessor) attachLane(events []Event) []Event {
+	if p.ideSessionID == "" && p.laneCwd == "" {
+		return events
+	}
+	for i := range events {
+		data, ok := events[i].Data.(map[string]interface{})
+		if !ok || data == nil {
+			continue
+		}
+		meta, _ := data["meta"].(map[string]interface{})
+		if meta == nil {
+			meta = map[string]interface{}{}
+		}
+		if p.ideSessionID != "" {
+			if _, exists := meta["ideSessionId"]; !exists {
+				meta["ideSessionId"] = p.ideSessionID
+			}
+		}
+		if p.laneCwd != "" {
+			if _, exists := meta["cwd"]; !exists {
+				meta["cwd"] = p.laneCwd
+			}
+		}
+		data["meta"] = meta
+	}
+	return events
+}
+
 func (p *claudeTranscriptProcessor) process(line []byte) []Event {
+	return p.attachLane(p.processLine(line))
+}
+
+func (p *claudeTranscriptProcessor) processLine(line []byte) []Event {
 	var rec map[string]interface{}
 	if err := json.Unmarshal(line, &rec); err != nil {
 		return nil
+	}
+	if p.ideSessionID == "" {
+		p.ideSessionID = stringField(rec, "sessionId")
+	}
+	if p.laneCwd == "" {
+		p.laneCwd = stringField(rec, "cwd")
 	}
 	// Sidechain lines are subagent traffic: their "user" prompts are authored
 	// by the AGENT, not the candidate, so they must never become prompt events
@@ -317,7 +365,7 @@ func (p *claudeTranscriptProcessor) flushStale(maxAge time.Duration) []Event {
 	if p.accum == nil || time.Since(p.accum.updatedAt) < maxAge {
 		return nil
 	}
-	return p.flushAccum()
+	return p.attachLane(p.flushAccum())
 }
 
 func (p *claudeTranscriptProcessor) handleUser(rec map[string]interface{}, line []byte) []Event {
