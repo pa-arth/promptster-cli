@@ -22,13 +22,18 @@ func newHoneypotToken() string {
 
 // Session holds the local state persisted in <workspace>/.promptster/session.json.
 type Session struct {
-	SessionID         string `json:"sessionId"`
-	SessionToken      string `json:"sessionToken"`
-	Key               string `json:"key"`
-	AssessmentID      string `json:"assessmentId"`
-	AssessmentTitle   string `json:"assessmentTitle,omitempty"`
-	OrgName           string `json:"orgName,omitempty"`
-	TaskBrief         string `json:"taskBrief"`
+	SessionID       string `json:"sessionId"`
+	SessionToken    string `json:"sessionToken"`
+	Key             string `json:"key"`
+	AssessmentID    string `json:"assessmentId"`
+	AssessmentTitle string `json:"assessmentTitle,omitempty"`
+	OrgName         string `json:"orgName,omitempty"`
+	TaskBrief       string `json:"taskBrief"`
+	// Brief is the structured assessment brief (scenario, codebase
+	// orientation, phases, evaluation dimensions, ground rules,
+	// deliverables). Nil for older assessments — TaskBrief carries the
+	// legacy flat string in that case.
+	Brief             *Brief `json:"brief,omitempty"`
 	RepoURL           string `json:"repoUrl,omitempty"`
 	RepoCommit        string `json:"repoCommit,omitempty"`
 	RepoSubdir        string `json:"repoSubdir,omitempty"`

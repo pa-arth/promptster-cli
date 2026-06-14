@@ -69,6 +69,7 @@ func cmdRedeem(args []string) {
 		AssessmentTitle:   resp.AssessmentTitle,
 		OrgName:           resp.OrgName,
 		TaskBrief:         resp.TaskBrief,
+		Brief:             resp.Brief,
 		RepoURL:           resp.RepoURL,
 		RepoCommit:        resp.RepoCommit,
 		RepoSubdir:        resp.RepoSubdir,
