@@ -429,9 +429,19 @@ func normalizeClaudeCode(payload map[string]interface{}, sessionID string) (Even
 		} else if v, ok := payload["context_pct"].(float64); ok {
 			contextPct = v
 		}
-		e.Data = map[string]interface{}{
+		data := map[string]interface{}{
 			"contextPct": contextPct,
 		}
+		// Claude Code's PreCompact hook reports whether the compaction was a
+		// manual /compact or the auto-compact wall ("manual" | "auto"). The
+		// backend's context-management rubric distinguishes the two (a
+		// deliberate mid-thread /compact is a STRONG marker; compaction-by-wall
+		// is WEAK), and treats absence as unknown, never as zero — so only
+		// stamp the field when the hook actually provides it.
+		if trigger, ok := payload["trigger"].(string); ok && trigger != "" {
+			data["trigger"] = trigger
+		}
+		e.Data = data
 		e.RawPayload = raw
 		return e, true
 
