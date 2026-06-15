@@ -57,11 +57,39 @@ jobs:
       - name: Verify packaged binaries
         run: node npm/scripts/check-binaries.js
 
+      # Idempotent: skip if this version is already on npm, so a re-run of a
+      # failed release (e.g. after a downstream step failed) doesn't die here.
       - name: Publish to npm
         working-directory: npm
-        run: pnpm publish --access public --no-git-checks
         env:
+          VERSION: ${{ steps.version.outputs.VERSION }}
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ "$(npm view "@promptster/cli@${VERSION}" version 2>/dev/null)" = "${VERSION}" ]; then
+            echo "npm already has @promptster/cli@${VERSION}; skipping publish"
+          else
+            pnpm publish --access public --no-git-checks
+          fi
+
+      # This release uses the always-present github.token and is independent of
+      # the public-releases repo, so it runs BEFORE the public steps — a missing
+      # PUBLIC_RELEASES_TOKEN or public-repo failure can never skip it.
+      - name: Create GitHub Release (this repo)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=${{ steps.version.outputs.VERSION }}
+          BIN=npm/binaries
+          gh release delete "${{ github.ref_name }}" --yes 2>/dev/null || true
+          gh release create "${{ github.ref_name }}" \
+            --title "v${VERSION}" \
+            --notes-file /tmp/cli-release-notes.md \
+            install.sh#install.sh \
+            "$BIN/promptster-linux-x64#promptster-linux-x64" \
+            "$BIN/promptster-linux-arm64#promptster-linux-arm64" \
+            "$BIN/promptster-darwin-x64#promptster-darwin-x64" \
+            "$BIN/promptster-darwin-arm64#promptster-darwin-arm64" \
+            "$BIN/promptster-win32-x64.exe#promptster-win32-x64.exe"
 
       - name: Clone public releases repo
         env:
@@ -91,25 +119,10 @@ jobs:
         run: |
           VERSION=${{ steps.version.outputs.VERSION }}
           BIN=npm/binaries
+          gh release delete "cli-v${VERSION}" --repo "$PUBLIC_RELEASES_REPO" --yes 2>/dev/null || true
           gh release create "cli-v${VERSION}" \
             --repo "$PUBLIC_RELEASES_REPO" \
             --title "CLI v${VERSION}" \
-            --notes-file /tmp/cli-release-notes.md \
-            install.sh#install.sh \
-            "$BIN/promptster-linux-x64#promptster-linux-x64" \
-            "$BIN/promptster-linux-arm64#promptster-linux-arm64" \
-            "$BIN/promptster-darwin-x64#promptster-darwin-x64" \
-            "$BIN/promptster-darwin-arm64#promptster-darwin-arm64" \
-            "$BIN/promptster-win32-x64.exe#promptster-win32-x64.exe"
-
-      - name: Create GitHub Release (this repo)
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          VERSION=${{ steps.version.outputs.VERSION }}
-          BIN=npm/binaries
-          gh release create "${{ github.ref_name }}" \
-            --title "v${VERSION}" \
             --notes-file /tmp/cli-release-notes.md \
             install.sh#install.sh \
             "$BIN/promptster-linux-x64#promptster-linux-x64" \
