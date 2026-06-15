@@ -171,7 +171,7 @@ export function upsertChangelogEntry(version) {
 export function extractChangelogSection(version) {
   const changelog = readChangelog();
   const match = changelog.match(
-    new RegExp(`(^## ${escapeRegExp(version)} - .*?(?=\\n## |$))`, 'ms'),
+    new RegExp(`(^## ${escapeRegExp(version)} - [\\s\\S]*?(?=\\n## |$(?![\\r\\n])))`, 'm'),
   );
   if (!match) {
     fail(`missing changelog entry for ${version} in ${config.changelogFile}`);

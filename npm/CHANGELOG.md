@@ -1,5 +1,11 @@
 # CLI Changelog
 
+## 1.5.0 - 2026-06-15
+
+- feat(brief): `promptster brief` now opens a live, structured brief in its own terminal window by default, so the task stays on-screen beside the candidate's editor instead of scrolling away. The viewer is a scrollable Bubbletea TUI with a sticky header, a live countdown + color-coded progress bar, and per-phase cards — fed by a new structured brief (scenario, codebase orientation, ordered phases, evaluation dimensions, ground rules, deliverables) threaded through from the backend. `--here` keeps it in the current terminal, `--plain` prints once for piped/no-TTY use, `--json` emits machine-readable output, and `--demo` previews the viewer without a live session
+- feat(brief): new-window spawn is cross-platform — AppleScript/iTerm2 on macOS with fallbacks across 8 Linux terminal emulators; when no window can be opened the viewer falls back to running inline
+- compat(brief): assessments that still send the legacy flat `TaskBrief` string render unchanged — `resolveBrief()` falls back automatically, so older backends and in-flight sessions are unaffected
+
 ## 1.4.0 - 2026-06-12
 
 - feat(capture): every Claude Code hook event now carries the per-process lane identity (`meta.ideSessionId` = Claude's `session_id`, `meta.cwd`) — previously only prompts did. Concurrent `claude` sessions in the same workspace are now fully distinguishable downstream, including which lane authored each file edit and command (feeds the worker's parallel-orchestration signals)
