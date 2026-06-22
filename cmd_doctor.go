@@ -18,6 +18,13 @@ func cmdDoctor() {
 	binDir := filepath.Join(home, ".promptster", "bin")
 	session, sessionErr := loadSession()
 
+	// Tool relevance — only surface a tool's checks when this session actually
+	// instruments it. With no session we default to Claude (the historical
+	// default) so a fresh machine still gets a meaningful environment check.
+	claudeRelevant := sessionErr != nil || hasTool(session.Tools, toolClaude)
+	codexRelevant := codexProxyConfigured() || (sessionErr == nil && hasTool(session.Tools, toolCodex))
+	cursorRelevant := sessionErr == nil && hasTool(session.Tools, toolCursor)
+
 	fmt.Println("Promptster Doctor")
 	fmt.Println(strings.Repeat("─", 44))
 	fmt.Printf("  CLI version:  %s\n", version)
@@ -36,16 +43,38 @@ func cmdDoctor() {
 		}
 		return p, ""
 	})
-	check("claude binary", func() (string, string) {
-		p, err := exec.LookPath("claude")
-		if err != nil {
-			return "", "claude not found in PATH\n    Fix: " + claudeInstallHint()
-		}
-		if ver := getToolVersion("claude"); ver != "" {
-			return ver, ""
-		}
-		return p, ""
-	})
+	if claudeRelevant {
+		check("claude binary", func() (string, string) {
+			p, err := exec.LookPath("claude")
+			if err != nil {
+				return "", "claude not found in PATH\n    Fix: " + claudeInstallHint()
+			}
+			if ver := getToolVersion("claude"); ver != "" {
+				return ver, ""
+			}
+			return p, ""
+		})
+	}
+	if codexRelevant {
+		check("codex binary", func() (string, string) {
+			p, err := exec.LookPath("codex")
+			if err != nil {
+				return "", "codex not found in PATH\n    Fix: " + toolInstallHint(toolCodex)
+			}
+			return p, ""
+		})
+	}
+	if cursorRelevant {
+		check("cursor editor", func() (string, string) {
+			if !cursorInstalled() {
+				return "", "Cursor not detected\n    Fix: " + toolInstallHint(toolCursor)
+			}
+			if p, err := exec.LookPath("cursor"); err == nil {
+				return p, ""
+			}
+			return "app detected (cursor CLI not on PATH — open Cursor manually)", ""
+		})
+	}
 	check("promptster binary installed", func() (string, string) {
 		bin := promptsterBin()
 		info, err := os.Stat(bin)
@@ -72,30 +101,31 @@ func cmdDoctor() {
 			rc,
 		)
 	})
-	check("Conflicting Anthropic auth in shell", func() (string, string) {
-		// As of 1.2.0 the proxy is wired via Claude Code's apiKeyHelper, which
-		// has LOWER precedence than these env vars. If the candidate (or a stale
-		// pre-1.2.0 session) has either exported, Claude Code uses that instead
-		// of the helper — routing around the proxy and breaking capture.
-		var found []string
-		if strings.TrimSpace(os.Getenv("ANTHROPIC_API_KEY")) != "" {
-			found = append(found, "ANTHROPIC_API_KEY")
-		}
-		if strings.TrimSpace(os.Getenv("ANTHROPIC_AUTH_TOKEN")) != "" {
-			found = append(found, "ANTHROPIC_AUTH_TOKEN")
-		}
-		if len(found) == 0 {
-			return "none", ""
-		}
-		return "", strings.Join(found, "/") + " set in this shell — out-ranks the proxy apiKeyHelper\n    Fix: eval \"$(promptster env --clear)\" (or unset it) before opening Claude Code"
-	})
+	if claudeRelevant {
+		check("Conflicting Anthropic auth in shell", func() (string, string) {
+			// As of 1.2.0 the proxy is wired via Claude Code's apiKeyHelper, which
+			// has LOWER precedence than these env vars. If the candidate (or a stale
+			// pre-1.2.0 session) has either exported, Claude Code uses that instead
+			// of the helper — routing around the proxy and breaking capture.
+			var found []string
+			if strings.TrimSpace(os.Getenv("ANTHROPIC_API_KEY")) != "" {
+				found = append(found, "ANTHROPIC_API_KEY")
+			}
+			if strings.TrimSpace(os.Getenv("ANTHROPIC_AUTH_TOKEN")) != "" {
+				found = append(found, "ANTHROPIC_AUTH_TOKEN")
+			}
+			if len(found) == 0 {
+				return "none", ""
+			}
+			return "", strings.Join(found, "/") + " set in this shell — out-ranks the proxy apiKeyHelper\n    Fix: eval \"$(promptster env --clear)\" (or unset it) before opening Claude Code"
+		})
+	}
 	fmt.Println()
 
 	// ── Codex (OpenAI) proxy ────────────────────────────────────────────────
 	// Only shown when codex is instrumented for this session or a managed block
 	// is present. codex config is GLOBAL, so a block left by a dead session would
 	// break the user's personal codex everywhere — reconcile auto-heals that.
-	codexRelevant := codexProxyConfigured() || (sessionErr == nil && hasTool(session.Tools, toolCodex))
 	if codexRelevant {
 		reconcileCodexProxyIfStale()
 
@@ -159,20 +189,23 @@ func cmdDoctor() {
 		// This proves it would actually *emit* a token: cmdAuthToken returns
 		// nothing (and self-evicts) when the token/workspace is missing or the
 		// session has expired, in which case Claude Code silently 401s. Mirror
-		// its exact conditions so an expired session can't pass doctor.
-		check("apiKeyHelper resolves a token", func() (string, string) {
-			if strings.TrimSpace(session.SessionToken) == "" || strings.TrimSpace(session.TaskRoot) == "" {
-				return "", "session is missing token or workspace — apiKeyHelper emits nothing, Claude Code will 401\n    Fix: re-run promptster start"
-			}
-			if !session.ExpiresAt.IsZero() && time.Now().After(session.ExpiresAt) {
-				ago := time.Since(session.ExpiresAt).Round(time.Minute)
-				return "", fmt.Sprintf("session expired %s ago — apiKeyHelper emits no token (self-evicts), Claude Code will 401\n    Fix: promptster start PST-XXXX-XXXX (or promptster reset)", ago)
-			}
-			if session.ExpiresAt.IsZero() {
-				return "yes (no local TTL)", ""
-			}
-			return fmt.Sprintf("yes (expires in %s)", time.Until(session.ExpiresAt).Round(time.Minute)), ""
-		})
+		// its exact conditions so an expired session can't pass doctor. Claude
+		// only — Codex resolves its token separately (see the Codex section).
+		if claudeRelevant {
+			check("apiKeyHelper resolves a token", func() (string, string) {
+				if strings.TrimSpace(session.SessionToken) == "" || strings.TrimSpace(session.TaskRoot) == "" {
+					return "", "session is missing token or workspace — apiKeyHelper emits nothing, Claude Code will 401\n    Fix: re-run promptster start"
+				}
+				if !session.ExpiresAt.IsZero() && time.Now().After(session.ExpiresAt) {
+					ago := time.Since(session.ExpiresAt).Round(time.Minute)
+					return "", fmt.Sprintf("session expired %s ago — apiKeyHelper emits no token (self-evicts), Claude Code will 401\n    Fix: promptster start PST-XXXX-XXXX (or promptster reset)", ago)
+				}
+				if session.ExpiresAt.IsZero() {
+					return "yes (no local TTL)", ""
+				}
+				return fmt.Sprintf("yes (expires in %s)", time.Until(session.ExpiresAt).Round(time.Minute)), ""
+			})
+		}
 		check("Workspace pointer", func() (string, string) {
 			pointer := filepath.Join(home, ".promptster", "active-workspace")
 			data, err := os.ReadFile(pointer)
@@ -191,8 +224,8 @@ func cmdDoctor() {
 	}
 	fmt.Println()
 
-	if sessionErr == nil && session.TaskRoot != "" {
-		fmt.Println("Hooks")
+	if claudeRelevant && sessionErr == nil && session.TaskRoot != "" {
+		fmt.Println("Claude hooks")
 		settingsPath := claudeProjectSettingsPath(session.TaskRoot)
 		settings, settingsErr := readSettings(settingsPath)
 
@@ -271,6 +304,25 @@ func cmdDoctor() {
 					"\n    Fix: re-run promptster start, or source it in the current shell:\n      source " + shellPath
 			}
 			return strings.Join(sourced, ", "), ""
+		})
+		fmt.Println()
+	}
+
+	if cursorRelevant && sessionErr == nil && session.TaskRoot != "" {
+		fmt.Println("Cursor hooks")
+		cursorPath := cursorHooksPath(session.TaskRoot)
+		check("Cursor hooks file", func() (string, string) {
+			cfg, err := readSettings(cursorPath)
+			if err != nil {
+				if os.IsNotExist(err) {
+					return "", "missing: " + cursorPath + "\n    Fix: run promptster start --tools cursor"
+				}
+				return "", "invalid JSON at " + cursorPath + ": " + err.Error() + "\n    Fix: re-run promptster start"
+			}
+			if !isCursorHookConfigured(cfg) {
+				return "", "Promptster hooks not registered in " + cursorPath + "\n    Fix: re-run promptster start"
+			}
+			return cursorPath, ""
 		})
 		fmt.Println()
 	}

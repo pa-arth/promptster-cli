@@ -294,7 +294,15 @@ func cmdStart(args []string) {
 		// selectTools already printed which tools are allowed; bail out.
 		os.Exit(1)
 	}
+	// Narrow to the tools actually installed (early preflight only gated git, so
+	// a Codex/Cursor-only assessment isn't blocked by a missing `claude`). A
+	// missing tool is dropped with a warning; if NONE are installed the candidate
+	// has no working AI tool and resolveUsableTools exits.
+	tools = resolveUsableTools(tools)
 	session.Tools = tools
+	// Advise (don't block) if the assessment's run/test commands need a toolchain
+	// binary that isn't installed — environment fights measure nothing.
+	warnMissingProjectTools(resolveBrief(session))
 	useClaude := hasTool(tools, toolClaude)
 	useCodex := hasTool(tools, toolCodex)
 	useCursor := hasTool(tools, toolCursor)
@@ -427,28 +435,38 @@ func cmdStart(args []string) {
 			endStep(5, 7, "Testing Claude API proxy", "ready")
 		}
 	} else {
+		// No Claude Code in this session — the Claude proxy smoke test doesn't
+		// apply. Codex routes through its own proxy; Cursor is BYO with no proxy.
 		startStep(5, 7, "Testing Claude API proxy...")
-		endStep(5, 7, "Testing Claude API proxy", "skipped (Codex only)")
+		endStep(5, 7, "Testing Claude API proxy", "skipped (no Claude Code in this session)")
 	}
 
 	// Detect running editors and prompt for restart if needed ─────────────────
-	// Hooks live in <workspace>/.claude/settings.local.json, so a Claude Code
-	// window that was already open (anywhere) won't have them. Make that loud
-	// — candidates previously assumed their existing Claude session was being
+	// Hooks live in <workspace>/.<tool>/ (e.g. .claude/settings.local.json), so a
+	// tool window that was already open (anywhere) won't have them. Make that
+	// loud — candidates previously assumed their existing session was being
 	// captured and only found out later that nothing was recorded.
-	claudeRunning := detectRunningEditors()
-	editorsAlreadyRunning := claudeRunning
-	if editorsAlreadyRunning {
+	running := runningEditors(tools)
+	if len(running) > 0 {
+		nouns := make([]string, len(running))
+		for i, t := range running {
+			nouns[i] = toolBaseName(t)
+		}
+		runningLabel := strings.Join(nouns, " and ")
+		verb := "is"
+		if len(nouns) > 1 {
+			verb = "are"
+		}
 		warnStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#f59e0b")).Bold(true)
 		warnText := lipgloss.NewStyle().Foreground(cWarnText)
 		fmt.Println()
-		fmt.Printf("  %s %s\n", warnStyle.Render("!"), warnStyle.Render("Claude Code is already running"))
-		fmt.Printf("    %s\n", warnText.Render("Existing Claude Code windows will NOT capture this session."))
-		fmt.Printf("    %s\n", warnText.Render("You must open Claude Code fresh from the workspace below."))
+		fmt.Printf("  %s %s\n", warnStyle.Render("!"), warnStyle.Render(runningLabel+" "+verb+" already running"))
+		fmt.Printf("    %s\n", warnText.Render("Existing "+runningLabel+" windows will NOT capture this session."))
+		fmt.Printf("    %s\n", warnText.Render("You must open "+runningLabel+" fresh from the workspace below."))
 		if *restart {
 			doRestart := !stdinIsTerminal() // auto-kill when non-interactive
 			if stdinIsTerminal() {
-				fmt.Printf("\n  Restart Claude Code now? [y/N]: ")
+				fmt.Printf("\n  Restart %s now? [y/N]: ", runningLabel)
 				scanner := bufio.NewScanner(os.Stdin)
 				if scanner.Scan() {
 					ans := strings.TrimSpace(strings.ToLower(scanner.Text()))
@@ -456,9 +474,8 @@ func cmdStart(args []string) {
 				}
 			}
 			if doRestart {
-				killEditors(claudeRunning)
-				fmt.Printf("  Editors stopped. Reopen Claude Code in your workspace to continue.\n")
-				editorsAlreadyRunning = false
+				killEditors(running)
+				fmt.Printf("  Editors stopped. Reopen %s in your workspace to continue.\n", runningLabel)
 			}
 		}
 	}
