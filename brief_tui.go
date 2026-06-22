@@ -32,6 +32,34 @@ const (
 	briefMinDocWidth = 40
 )
 
+// briefToolsLabel returns the assessment's AI tool(s) as a display string, e.g.
+// "Claude Code · Codex CLI". It prefers the tools selected at start (s.Tools);
+// before start it falls back to the recruiter-allowed set (s.AllowedTools). It
+// returns "" when neither is set (legacy session) so callers omit the chip/row
+// rather than guessing.
+func briefToolsLabel(s Session) string {
+	src := s.Tools
+	if len(src) == 0 {
+		src = s.AllowedTools
+	}
+	if len(src) == 0 {
+		return ""
+	}
+	seen := map[string]bool{}
+	for _, t := range src {
+		if id := normalizeToolToken(t); id != "" {
+			seen[id] = true
+		}
+	}
+	var parts []string
+	for _, t := range allTools {
+		if seen[t] {
+			parts = append(parts, toolBaseName(t))
+		}
+	}
+	return strings.Join(parts, " · ")
+}
+
 // ── Document rendering (shared by the TUI viewport and static output) ───────
 
 func sectionHeader(title string, accent lipgloss.TerminalColor, w int) string {
@@ -197,6 +225,9 @@ func renderBriefDoc(b Brief, s Session, w int) string {
 		rows = append(rows, label.Render("Workspace")+body.Render(s.TaskRoot))
 		rows = append(rows, label.Render("Task file")+body.Render("TASK.md")+muted.Render(" — this brief, in your workspace"))
 	}
+	if tl := briefToolsLabel(s); tl != "" {
+		rows = append(rows, label.Render("Tools")+body.Render(tl))
+	}
 	rows = append(rows, label.Render("Submit")+code.Render("promptster done")+muted.Render(" — when everything is committed"))
 	rows = append(rows, label.Render("Rationale")+code.Render("promptster explain")+muted.Render(" — record why behind key decisions"))
 	sections = append(sections, sectionHeader("Logistics", briefSky, w)+"\n\n"+strings.Join(rows, "\n"))
@@ -275,8 +306,20 @@ func renderBriefHeader(s Session, w int, now time.Time) string {
 	}
 	line1 := left + strings.Repeat(" ", gap) + right
 
+	// Time row, with the assessment's tool(s) right-aligned as a chip. Dropped
+	// when the terminal is too narrow to fit both without overlap.
+	timeLine := renderTimeLine(s, now)
+	if chip := briefToolsLabel(s); chip != "" {
+		chipStr := lipgloss.NewStyle().Foreground(cMuted).Render("Tools: ") +
+			lipgloss.NewStyle().Foreground(cBody).Render(chip)
+		chipGap := w - lipgloss.Width(timeLine) - lipgloss.Width(chipStr)
+		if chipGap >= 2 {
+			timeLine = timeLine + strings.Repeat(" ", chipGap) + chipStr
+		}
+	}
+
 	rule := lipgloss.NewStyle().Foreground(cDim).Render(strings.Repeat("─", w))
-	return line1 + "\n" + renderTimeLine(s, now) + "\n" + rule
+	return line1 + "\n" + timeLine + "\n" + rule
 }
 
 // ── Bubbletea model ──────────────────────────────────────────────────────────

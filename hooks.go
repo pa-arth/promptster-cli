@@ -34,10 +34,18 @@ func promptsterBin() string {
 	return filepath.Join(home, ".promptster", "bin", name)
 }
 
-// detectRunningEditors returns whether Claude Code is currently running.
-func detectRunningEditors() (claudeRunning bool) {
-	claudeRunning = isProcessRunning("claude")
-	return
+// runningEditors returns the subset of the given tools whose launch binary is
+// currently running, in the order of `tools`. Hooks live in the workspace, so a
+// tool window opened before `start` (anywhere) won't capture this session — the
+// caller warns about each running tool by name.
+func runningEditors(tools []string) []string {
+	var running []string
+	for _, t := range tools {
+		if isProcessRunning(toolBinaryName(t)) {
+			running = append(running, t)
+		}
+	}
+	return running
 }
 
 // isProcessRunning returns true if a process with the given name (case-insensitive,
@@ -46,18 +54,11 @@ func isProcessRunning(name string) bool {
 	return exec.Command("pgrep", "-ix", name).Run() == nil
 }
 
-// killEditors sends SIGTERM to Claude Code if requested.
-func killEditors(killClaude bool) {
-	if killClaude {
-		_ = exec.Command("pkill", "-ix", "claude").Run()
+// killEditors sends SIGTERM to each running tool so it can be reopened with hooks.
+func killEditors(tools []string) {
+	for _, t := range tools {
+		_ = exec.Command("pkill", "-ix", toolBinaryName(t)).Run()
 	}
-}
-
-// detectEditors returns whether Claude Code is installed.
-func detectEditors() (hasClaude bool) {
-	_, err := exec.LookPath("claude")
-	hasClaude = err == nil
-	return
 }
 
 // configureHooks configures Claude Code hooks in the workspace.
@@ -71,11 +72,6 @@ func configureHooks(workspacePath string) error {
 		hookDebugf("install explain command: %v", err)
 	}
 	return nil
-}
-
-// configuredEditors returns a human-readable string of which editors got hooks.
-func configuredEditors() string {
-	return "Claude Code (project-level)"
 }
 
 // configureClaudeHooks installs Promptster hooks into the project-local Claude
