@@ -305,7 +305,11 @@ func cmdStart(args []string) {
 	// moves to the transcript watcher (which also carries the per-request
 	// token usage the proxy would otherwise meter), codex capture is already
 	// rollout-JSONL-based, and hooks stay installed as the fallback channel.
-	if *byoFlag {
+	//
+	// Triggered by the --byo-subscription flag OR by the assessment's own
+	// auth mode (session.AuthMode, set from the redeem response) so a recruiter
+	// can flip BYO from the dashboard without the candidate passing the flag.
+	if *byoFlag || session.AuthMode == "byo-subscription" {
 		session.AuthMode = "byo-subscription"
 		if useClaude {
 			session.CaptureMode = "transcript"
