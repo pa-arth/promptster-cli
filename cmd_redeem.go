@@ -77,6 +77,9 @@ func cmdRedeem(args []string) {
 		TimeLimitMinutes:  resp.TimeLimitMinutes,
 		IssueID:           resp.IssueID,
 		AllowedTools:      resp.AllowedTools,
+		// Recruiter-set auth mode. "byo-subscription" makes `start` skip the
+		// proxy and capture via transcript without a --byo-subscription flag.
+		AuthMode:          resp.AuthMode,
 		ConsentAccepted:   true,
 		StartedAt:         time.Now().UTC(),
 		ExpiresAt:         parseExpiresAt(resp.ExpiresAt),

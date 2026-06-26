@@ -81,6 +81,12 @@ type RedeemResponse struct {
 	// candidate is permitted to instrument for this assessment. Empty/nil means
 	// the server didn't send it (older API) — the CLI falls back to all tools.
 	AllowedTools []string `json:"allowedTools"`
+	// AuthMode is the recruiter-chosen credential mode for this assessment.
+	// "byo-subscription" means the candidate runs Claude/Codex on their OWN
+	// subscription (no Promptster proxy, transcript-based capture); "managed"
+	// (or empty, for older APIs) means the default proxy path. Lets the recruiter
+	// flip BYO from the dashboard so the candidate needn't pass --byo-subscription.
+	AuthMode string `json:"authMode,omitempty"`
 }
 
 func apiRedeem(key, candidateName, signingPubKey string) (RedeemResponse, error) {
