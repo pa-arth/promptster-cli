@@ -86,10 +86,11 @@ type claudeTranscriptProcessor struct {
 	// Interrupt tracking. Claude Code writes a synthetic user line
 	// ([Request interrupted by user] / ...for tool use) when the candidate hits
 	// ESC/Ctrl+C mid-response. We classify what was cut POSITIONALLY from the
-	// most-recent assistant record — interruptedMessageId is null ~1/3 of the
-	// time, so it can't be relied on. lastAssistantHadTool/lastCutTool* describe
-	// that record; lastAssistantMsgID detects message-boundary transitions.
-	lastAssistantMsgID   string
+	// most-recent assistant RECORD — interruptedMessageId is null ~1/3 of the
+	// time, so it can't be relied on. lastAssistantHadTool/lastCutTool* are
+	// re-derived from each assistant record's own content (NOT sticky across
+	// records sharing a message.id), so a text-only record following a tool_use
+	// record for the same message clears the cut-tool state.
 	lastAssistantHadTool bool
 	lastCutToolName      string
 	lastCutToolInput     map[string]interface{}
@@ -278,16 +279,10 @@ func (p *claudeTranscriptProcessor) handleAssistant(rec map[string]interface{}, 
 	msgID := stringField(msg, "id")
 	ts, _ := rec["timestamp"].(string)
 
-	// A new assistant message (re)sets the positional interrupt context: it is
-	// now the most-recent assistant record, and it means any pending interrupt
-	// was an abort with no redirect prompt — clear the pending back-link.
-	if msgID != "" && msgID != p.lastAssistantMsgID {
-		p.pendingInterruptID = ""
-		p.lastAssistantMsgID = msgID
-		p.lastAssistantHadTool = false
-		p.lastCutToolName = ""
-		p.lastCutToolInput = nil
-	}
+	// Any assistant activity clears a pending interrupt back-link: an assistant
+	// record standing between an interrupt and the next prompt means the
+	// interrupt was an abort with no redirect prompt following it.
+	p.pendingInterruptID = ""
 
 	var events []Event
 	if p.accum != nil && p.accum.msgID != msgID {
@@ -308,6 +303,16 @@ func (p *claudeTranscriptProcessor) handleAssistant(rec map[string]interface{}, 
 	if p.accum != nil && p.accum.msgID == msgID {
 		p.accum.updatedAt = time.Now()
 	}
+
+	// Re-derive the positional interrupt context from THIS record's own content.
+	// One API message is chunked across multiple records that share message.id;
+	// a tool_use record followed by a text-only record for the same id must leave
+	// the cut-tool state CLEARED, so an interrupt after the text record is
+	// classified "generation", not a stale "action". So track the most-recent
+	// RECORD's content, not sticky state keyed on message.id.
+	recordHadTool := false
+	var recordToolName string
+	var recordToolInput map[string]interface{}
 
 	content, _ := msg["content"].([]interface{})
 	for _, rawBlock := range content {
@@ -334,15 +339,22 @@ func (p *claudeTranscriptProcessor) handleAssistant(rec map[string]interface{}, 
 			if id != "" {
 				p.pendingTools[id] = claudePendingTool{name: stringField(block, "name"), input: input}
 			}
-			// Positional interrupt context: this message contains a tool call, so
-			// an interrupt line arriving next cut an ACTION. Record the tool so
-			// the interrupt event can name what was killed.
-			p.lastAssistantHadTool = true
-			p.lastCutToolName = stringField(block, "name")
-			p.lastCutToolInput = input
+			// This record contains a tool call, so an interrupt arriving next cut
+			// an ACTION. Record the tool so the interrupt event can name what was
+			// killed.
+			recordHadTool = true
+			recordToolName = stringField(block, "name")
+			recordToolInput = input
 		}
 		// thinking / other block types carry no event of their own.
 	}
+
+	// Reflect the most-recent assistant record: a tool_use record sets the
+	// cut-tool state; a text-only (or thinking-only) record clears it.
+	p.lastAssistantHadTool = recordHadTool
+	p.lastCutToolName = recordToolName
+	p.lastCutToolInput = recordToolInput
+
 	return events
 }
 
@@ -435,13 +447,16 @@ func (p *claudeTranscriptProcessor) handleUser(rec map[string]interface{}, line 
 			}
 			switch stringField(block, "type") {
 			case "tool_result":
-				// The "...for tool use" sentinel can land inside a tool_result
-				// block when a tool call was cut — catch it before pairing.
+				// A tool_result marks this as a synthetic (non-prompt) record —
+				// set the flag FIRST so the "...for tool use" sentinel path below
+				// can't fall through and also emit a stray prompt from a sibling
+				// text block. The sentinel can land inside a tool_result block when
+				// a tool call was cut — catch it before pairing.
+				hasToolResult = true
 				if variant, ok := interruptVariant(toolResultText(block)); ok {
 					interruptVar = variant
 					continue
 				}
-				hasToolResult = true
 				if ev, ok := p.resolveToolResult(rec, block, ts, line); ok {
 					events = append(events, ev)
 				}
@@ -482,11 +497,26 @@ func interruptVariant(text string) (string, bool) {
 	return v, ok
 }
 
-// toolResultText returns the string content of a tool_result block, or "" when
-// the content is not a plain string.
+// toolResultText returns the textual content of a tool_result block. Content is
+// either a plain string or an array of blocks (Claude Code writes the interrupt
+// sentinel in both shapes); for the array form the text of every type=="text"
+// block is concatenated. Returns "" for any other shape.
 func toolResultText(block map[string]interface{}) string {
-	if s, ok := block["content"].(string); ok {
-		return s
+	switch content := block["content"].(type) {
+	case string:
+		return content
+	case []interface{}:
+		var parts []string
+		for _, rawInner := range content {
+			inner, _ := rawInner.(map[string]interface{})
+			if inner == nil {
+				continue
+			}
+			if stringField(inner, "type") == "text" {
+				parts = append(parts, stringField(inner, "text"))
+			}
+		}
+		return strings.Join(parts, "\n")
 	}
 	return ""
 }
