@@ -6,24 +6,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
 )
-
-// taskCreateNumberRe pulls N out of TaskCreate's success response,
-// "Task #3 created successfully: <subject>".
-//
-// ANCHORED to the start of the response deliberately. An unanchored match also
-// fires on an error or diagnostic that merely QUOTES an earlier creation message
-// ("... unlike Task #7 created earlier ..."), which would record a stale number
-// for a call that actually FAILED. The number must come from this call's own
-// success line or not at all.
-//
-// N is the session's cumulative task ordinal — NOT the size of the current plan.
-// See the TaskCreate branch for why that distinction is load-bearing.
-var taskCreateNumberRe = regexp.MustCompile(`(?i)^\s*task\s+#(\d+)\s+created\s+successfully`)
 
 // newUUID generates a random UUID v4 using crypto/rand.
 func newUUID() string {
@@ -583,28 +569,42 @@ func intFromJSON(v interface{}) int {
 // normalizePostToolUseByTool converts a PostToolUse/postToolUse payload into a
 // rich, tool-specific Event. Shared between Claude Code and Cursor normalizers.
 // taskNumberFromResponse extracts the task number from a TaskCreate response.
-// A bare-string tool_response is folded into toolResponse["content"] upstream,
-// which is the shape Claude Code actually sends for this tool; the map form is
-// tolerated in case that ever changes. Reports ok=false when nothing parses, so
-// callers can omit the field instead of inventing a count.
+//
+// The hook delivers tool_response as a STRUCTURED map — for TaskCreate that is
+// {"task": {"id": "1", "subject": "..."}} — verified against real transcripts.
+// The prose "Task #1 created successfully: ..." exists only in the MODEL-facing
+// tool_result block and never reaches this normalizer, so parsing for it found
+// nothing and silently omitted the number on every real call. That is why this
+// reads the structure instead: a regex here was a fix that could not fire.
+//
+// `id` is a STRING ("1"), not a JSON number, so a float64-only type switch
+// yields a silent zero. Both shapes are accepted in case that changes.
+//
+// The value is the session's cumulative task ordinal, NOT a plan size — see the
+// TaskCreate branch. Reports ok=false when nothing parses, so callers omit the
+// field rather than invent a count.
 func taskNumberFromResponse(toolResponse map[string]interface{}) (int, bool) {
 	if toolResponse == nil {
 		return 0, false
 	}
-	content, ok := toolResponse["content"].(string)
+	task, ok := toolResponse["task"].(map[string]interface{})
 	if !ok {
-		if s, ok2 := toolResponse["result"].(string); ok2 {
-			content = s
-		} else {
-			return 0, false
-		}
-	}
-	m := taskCreateNumberRe.FindStringSubmatch(content)
-	if m == nil {
 		return 0, false
 	}
-	n, err := strconv.Atoi(m[1])
-	if err != nil || n <= 0 {
+	var n int
+	switch v := task["id"].(type) {
+	case string:
+		parsed, err := strconv.Atoi(strings.TrimSpace(v))
+		if err != nil {
+			return 0, false
+		}
+		n = parsed
+	case float64:
+		n = int(v)
+	default:
+		return 0, false
+	}
+	if n <= 0 {
 		return 0, false
 	}
 	return n, true

@@ -8,11 +8,16 @@ import "testing"
 // planning as much as ever.
 //
 // Every payload below is copied from a REAL Claude Code transcript under
-// ~/.claude/projects (a TaskCreate/TaskUpdate pair from one session, plus that
-// session's verbatim tool_response strings). They are not guesses at the
-// schema — the guessed shapes (`todos`/`tasks` arrays) all come back from the
-// real tool as InputValidationError, which is precisely the trap these tests
-// exist to prevent someone re-introducing.
+// ~/.claude/projects — including the tool_response shape, which is where the
+// first cut of this got it wrong. The hook delivers tool_response as a
+// STRUCTURED map ({"task":{"id":"1","subject":"..."}}); the prose "Task #1
+// created successfully: ..." lives only in the MODEL-facing tool_result block
+// and never reaches the normalizer. A fixture built from that prose passes
+// while the real thing silently returns nothing.
+//
+// The guessed INPUT shapes (`todos`/`tasks` arrays) likewise come back from the
+// real tool as InputValidationError. Both traps are the same mistake: asserting
+// a schema you assumed instead of one you read.
 
 func TestNormalizeClaudeCode_TaskCreateIsPlanning(t *testing.T) {
 	payload := map[string]interface{}{
@@ -23,7 +28,9 @@ func TestNormalizeClaudeCode_TaskCreateIsPlanning(t *testing.T) {
 			"description": "Create packages/config-cost (package.json deps zod+js-tiktoken, tsconfig extends base, vitest config) following packages/env conventions.",
 			"activeForm":  "Scaffolding @promptster/config-cost package",
 		},
-		"tool_response": "Task #1 created successfully: Scaffold @promptster/config-cost package",
+		"tool_response": map[string]interface{}{
+			"task": map[string]interface{}{"id": "1", "subject": "Scaffold @promptster/config-cost package"},
+		},
 	}
 
 	e, ok := normalizeClaudeCode(payload, "sess-1")
@@ -42,9 +49,10 @@ func TestNormalizeClaudeCode_TaskCreateIsPlanning(t *testing.T) {
 	}
 }
 
-// The only task number available lives in TaskCreate's response ("Task #N
-// created successfully"), since the tool creates one task per call and never
-// sends a list. If this stops resolving, decision capture goes quiet again.
+// The only task number available lives in TaskCreate's STRUCTURED response,
+// {"task": {"id": "6", ...}}, since the tool creates one task per call and never
+// sends a list. Note `id` is a STRING — a float64-only decode silently yields 0.
+// If this stops resolving, decision capture goes quiet again.
 // NOTE: 6 here is the session's cumulative ordinal, NOT "a 6-item plan".
 func TestNormalizeClaudeCode_TaskCreateOrdinalFromResponse(t *testing.T) {
 	payload := map[string]interface{}{
@@ -53,7 +61,9 @@ func TestNormalizeClaudeCode_TaskCreateOrdinalFromResponse(t *testing.T) {
 		"tool_input": map[string]interface{}{
 			"subject": "Public endpoint + seed playground org + cleanup",
 		},
-		"tool_response": "Task #6 created successfully: Public endpoint + seed playground org + cleanup",
+		"tool_response": map[string]interface{}{
+			"task": map[string]interface{}{"id": "6", "subject": "Public endpoint + seed playground org + cleanup"},
+		},
 	}
 
 	e, _ := normalizeClaudeCode(payload, "sess-1")
@@ -70,7 +80,7 @@ func TestNormalizeClaudeCode_TaskCreateOmitsOrdinalWhenUnparseable(t *testing.T)
 		"hook_event_name": "PostToolUse",
 		"tool_name":       "TaskCreate",
 		"tool_input":      map[string]interface{}{"subject": "Do the thing"},
-		"tool_response":   "something unexpected",
+		"tool_response":   map[string]interface{}{"error": "something unexpected"},
 	}
 
 	e, ok := normalizeClaudeCode(payload, "sess-1")
@@ -86,16 +96,16 @@ func TestNormalizeClaudeCode_TaskCreateOmitsOrdinalWhenUnparseable(t *testing.T)
 	}
 }
 
-// A FAILED TaskCreate whose error text quotes an earlier success line must not
-// harvest that stale number. Before the regex was anchored, "Task #7 created"
-// appearing anywhere in the response was enough — so a failure recorded an
-// ordinal and could fire a planning decision for a task that never existed.
+// A FAILED TaskCreate carries no `task` object, so no ordinal — even when its
+// error text quotes an earlier success line. This guards the original regex
+// approach from coming back: an unanchored "Task #7 created" match anywhere in
+// the response would record a stale ordinal for a task that never existed.
 func TestNormalizeClaudeCode_TaskCreateIgnoresQuotedNumberInErrorText(t *testing.T) {
 	payload := map[string]interface{}{
 		"hook_event_name": "PostToolUse",
 		"tool_name":       "TaskCreate",
 		"tool_input":      map[string]interface{}{"subject": "Do the thing"},
-		"tool_response":   "InputValidationError: subject conflicts with Task #7 created successfully earlier in this session",
+		"tool_response":   map[string]interface{}{"error": "InputValidationError: subject conflicts with Task #7 created successfully earlier in this session"},
 	}
 
 	e, ok := normalizeClaudeCode(payload, "sess-1")
@@ -130,8 +140,8 @@ func TestNormalizeClaudeCode_TaskUpdateIsPlanning(t *testing.T) {
 	if data["taskId"] != "1" || data["status"] != "in_progress" {
 		t.Fatalf("data = %#v", data)
 	}
-	// A status flip executes a plan, it does not define one; carrying an
-	// An ordinal here would let one update masquerade as an N-step plan.
+	// A status flip executes a plan, it does not define one. An ordinal here
+	// would let one update masquerade as an N-step plan.
 	if _, present := data["sessionTaskOrdinal"]; present {
 		t.Fatalf("TaskUpdate must not carry sessionTaskOrdinal, got %#v", data["sessionTaskOrdinal"])
 	}
