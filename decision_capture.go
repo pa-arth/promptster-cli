@@ -206,16 +206,24 @@ func detectDecisionCandidate(event Event) *decisionCandidate {
 
 	switch event.Kind {
 	case "planning":
+		// Two shapes reach here. Legacy TodoWrite (and the Codex path) carry the
+		// whole list in `todos`; the current Claude Code tools carry no list, so
+		// the normalizer resolves a running plan size into `itemCount`. Status
+		// flips (TaskUpdate) deliberately have neither and fall out below — they
+		// execute a plan rather than define one.
 		todoCount := 0
 		if todos, ok := data["todos"].([]interface{}); ok {
 			todoCount = len(todos)
+		}
+		if todoCount == 0 {
+			todoCount = intFromJSON(data["itemCount"])
 		}
 		if todoCount < 4 {
 			return nil
 		}
 		base.Title = "Defined a concrete implementation plan"
 		base.ChosenOption = fmt.Sprintf("Execute a %d-step implementation plan", todoCount)
-		base.Context = fmt.Sprintf("The agent wrote a TodoWrite plan with %d items before making code changes.", todoCount)
+		base.Context = fmt.Sprintf("The agent tracked a %d-item plan before making code changes.", todoCount)
 		base.CategoryHint = "planning"
 		base.Reason = "Multi-step planning usually reflects an execution strategy worth preserving."
 		return &base
