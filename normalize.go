@@ -12,10 +12,18 @@ import (
 	"time"
 )
 
-// taskCreateNumberRe pulls N out of TaskCreate's response line,
-// "Task #3 created successfully: <subject>". Claude Code numbers tasks
-// monotonically within a session, so N doubles as the running plan size.
-var taskCreateNumberRe = regexp.MustCompile(`(?i)task\s+#(\d+)\s+created`)
+// taskCreateNumberRe pulls N out of TaskCreate's success response,
+// "Task #3 created successfully: <subject>".
+//
+// ANCHORED to the start of the response deliberately. An unanchored match also
+// fires on an error or diagnostic that merely QUOTES an earlier creation message
+// ("... unlike Task #7 created earlier ..."), which would record a stale number
+// for a call that actually FAILED. The number must come from this call's own
+// success line or not at all.
+//
+// N is the session's cumulative task ordinal — NOT the size of the current plan.
+// See the TaskCreate branch for why that distinction is load-bearing.
+var taskCreateNumberRe = regexp.MustCompile(`(?i)^\s*task\s+#(\d+)\s+created\s+successfully`)
 
 // newUUID generates a random UUID v4 using crypto/rand.
 func newUUID() string {
@@ -748,10 +756,15 @@ func normalizePostToolUseByTool(toolName string, toolInput, toolResponse map[str
 	// transcripts — every `todos`/`tasks`-array variant in the wild is a model
 	// mis-call that came back as an InputValidationError.
 	//
-	// The plan size survives in TaskCreate's RESPONSE, which reads
-	// "Task #N created successfully: <subject>". That N is a per-session
-	// monotonic counter, so it IS the running plan size, and we recover it
-	// without making this normalizer stateful.
+	// TaskCreate's RESPONSE reads "Task #N created successfully: <subject>", and
+	// N is recoverable without making this normalizer stateful. But N is the
+	// session's CUMULATIVE task ordinal, NOT the size of the current plan: a
+	// session that plans A (5 tasks) and later plans B starts B at #6, so B's
+	// first task would read as a 6-item plan. Deleting tasks skews it the same
+	// way. So it is emitted as `sessionTaskOrdinal`, never as `itemCount` —
+	// only TodoWrite, which carried the actual list, can report a true plan size.
+	// Naming it `itemCount` would be exactly the bug this file exists to fix: a
+	// number that looks measured and isn't.
 	case toolName == "TodoWrite":
 		todos, _ := toolInput["todos"].([]interface{})
 		e := newEvent("planning", sessionID)
@@ -773,11 +786,12 @@ func normalizePostToolUseByTool(toolName string, toolInput, toolResponse map[str
 			"description": strPreview(description, 1000),
 			"activeForm":  strPreview(activeForm, 300),
 		}
-		// itemCount is the running plan size, not this call's task count. Absent
-		// rather than a guessed 1 when the response can't be parsed — a wrong
-		// count is worse than a missing one downstream.
+		// The session's cumulative task ordinal (see the note above) — NOT a plan
+		// size, and deliberately not named one. Absent rather than a guessed 1
+		// when the response can't be parsed: a wrong count is worse than a
+		// missing one downstream, where it becomes user-facing prose.
 		if n, ok := taskNumberFromResponse(toolResponse); ok {
-			data["itemCount"] = n
+			data["sessionTaskOrdinal"] = n
 		}
 		e := newEvent("planning", sessionID)
 		e.Data = data

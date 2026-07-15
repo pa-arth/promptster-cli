@@ -37,15 +37,16 @@ func TestNormalizeClaudeCode_TaskCreateIsPlanning(t *testing.T) {
 	if data["subject"] != "Scaffold @promptster/config-cost package" {
 		t.Fatalf("subject = %#v", data["subject"])
 	}
-	if data["itemCount"] != 1 {
-		t.Fatalf("itemCount = %#v, want 1", data["itemCount"])
+	if data["sessionTaskOrdinal"] != 1 {
+		t.Fatalf("sessionTaskOrdinal = %#v, want 1", data["sessionTaskOrdinal"])
 	}
 }
 
-// The running plan size lives only in TaskCreate's response ("Task #N created
-// successfully"), since the tool creates one task per call and never sends a
-// list. If this stops resolving, decision capture goes quiet again.
-func TestNormalizeClaudeCode_TaskCreateItemCountFromResponse(t *testing.T) {
+// The only task number available lives in TaskCreate's response ("Task #N
+// created successfully"), since the tool creates one task per call and never
+// sends a list. If this stops resolving, decision capture goes quiet again.
+// NOTE: 6 here is the session's cumulative ordinal, NOT "a 6-item plan".
+func TestNormalizeClaudeCode_TaskCreateOrdinalFromResponse(t *testing.T) {
 	payload := map[string]interface{}{
 		"hook_event_name": "PostToolUse",
 		"tool_name":       "TaskCreate",
@@ -57,14 +58,14 @@ func TestNormalizeClaudeCode_TaskCreateItemCountFromResponse(t *testing.T) {
 
 	e, _ := normalizeClaudeCode(payload, "sess-1")
 	data, _ := e.Data.(map[string]interface{})
-	if data["itemCount"] != 6 {
-		t.Fatalf("itemCount = %#v, want 6", data["itemCount"])
+	if data["sessionTaskOrdinal"] != 6 {
+		t.Fatalf("sessionTaskOrdinal = %#v, want 6", data["sessionTaskOrdinal"])
 	}
 }
 
-// An unparseable response must omit itemCount rather than invent one — a wrong
-// plan size is worse downstream than a missing one.
-func TestNormalizeClaudeCode_TaskCreateOmitsItemCountWhenUnparseable(t *testing.T) {
+// An unparseable response must omit the ordinal rather than invent one — a
+// wrong count is worse downstream than a missing one.
+func TestNormalizeClaudeCode_TaskCreateOmitsOrdinalWhenUnparseable(t *testing.T) {
 	payload := map[string]interface{}{
 		"hook_event_name": "PostToolUse",
 		"tool_name":       "TaskCreate",
@@ -80,8 +81,30 @@ func TestNormalizeClaudeCode_TaskCreateOmitsItemCountWhenUnparseable(t *testing.
 		t.Fatalf("kind = %q, want planning", e.Kind)
 	}
 	data, _ := e.Data.(map[string]interface{})
-	if _, present := data["itemCount"]; present {
-		t.Fatalf("itemCount should be absent, got %#v", data["itemCount"])
+	if _, present := data["sessionTaskOrdinal"]; present {
+		t.Fatalf("sessionTaskOrdinal should be absent, got %#v", data["sessionTaskOrdinal"])
+	}
+}
+
+// A FAILED TaskCreate whose error text quotes an earlier success line must not
+// harvest that stale number. Before the regex was anchored, "Task #7 created"
+// appearing anywhere in the response was enough — so a failure recorded an
+// ordinal and could fire a planning decision for a task that never existed.
+func TestNormalizeClaudeCode_TaskCreateIgnoresQuotedNumberInErrorText(t *testing.T) {
+	payload := map[string]interface{}{
+		"hook_event_name": "PostToolUse",
+		"tool_name":       "TaskCreate",
+		"tool_input":      map[string]interface{}{"subject": "Do the thing"},
+		"tool_response":   "InputValidationError: subject conflicts with Task #7 created successfully earlier in this session",
+	}
+
+	e, ok := normalizeClaudeCode(payload, "sess-1")
+	if !ok {
+		t.Fatal("normalizeClaudeCode returned false")
+	}
+	data, _ := e.Data.(map[string]interface{})
+	if v, present := data["sessionTaskOrdinal"]; present {
+		t.Fatalf("a failed TaskCreate must not harvest a quoted ordinal, got %#v", v)
 	}
 }
 
@@ -108,9 +131,9 @@ func TestNormalizeClaudeCode_TaskUpdateIsPlanning(t *testing.T) {
 		t.Fatalf("data = %#v", data)
 	}
 	// A status flip executes a plan, it does not define one; carrying an
-	// itemCount here would let one update masquerade as an N-step plan.
-	if _, present := data["itemCount"]; present {
-		t.Fatalf("TaskUpdate must not carry itemCount, got %#v", data["itemCount"])
+	// An ordinal here would let one update masquerade as an N-step plan.
+	if _, present := data["sessionTaskOrdinal"]; present {
+		t.Fatalf("TaskUpdate must not carry sessionTaskOrdinal, got %#v", data["sessionTaskOrdinal"])
 	}
 }
 
@@ -181,43 +204,66 @@ func TestNormalizeClaudeCode_TodoReadStillPlanningRead(t *testing.T) {
 }
 
 // The decision-capture end of the wire. The normalizer hands this map over
-// in-process, so itemCount arrives as a Go int, not a decoded float64 —
+// in-process, so the ordinal arrives as a Go int, not a decoded float64 —
 // resolving only float64 here would silently gate every candidate out.
+//
+// The copy must NOT claim a plan size off a session ordinal: 5 here means "the
+// 5th task created this session", which is not "a 5-item plan".
 func TestDetectDecisionCandidateForTaskCreatePlan(t *testing.T) {
 	event := newEvent("planning", "sess-1")
 	event.Data = map[string]interface{}{
-		"toolName":  "TaskCreate",
-		"subject":   "Tests: rubric-aware skip (worker) + drift sweep selection (api)",
+		"toolName":           "TaskCreate",
+		"subject":            "Tests: rubric-aware skip (worker) + drift sweep selection (api)",
+		"sessionTaskOrdinal": 5,
+	}
+
+	candidate := detectDecisionCandidate(event)
+	if candidate == nil {
+		t.Fatal("expected a candidate once the session has tracked 5 tasks")
+	}
+	if candidate.CategoryHint != "planning" {
+		t.Fatalf("category = %q", candidate.CategoryHint)
+	}
+	if candidate.ChosenOption != "Execute a multi-step implementation plan" {
+		t.Fatalf("chosenOption = %q", candidate.ChosenOption)
+	}
+	if want := "The agent had tracked 5 tasks in this session before making code changes."; candidate.Context != want {
+		t.Fatalf("context = %q, want %q", candidate.Context, want)
+	}
+}
+
+// A TodoWrite list IS a real plan size, so that copy may name it.
+func TestDetectDecisionCandidateForTodoWriteNamesRealPlanSize(t *testing.T) {
+	event := newEvent("planning", "sess-1")
+	event.Data = map[string]interface{}{
+		"toolName":  "TodoWrite",
+		"todos":     []interface{}{1, 2, 3, 4, 5},
 		"itemCount": 5,
 	}
 
 	candidate := detectDecisionCandidate(event)
 	if candidate == nil {
-		t.Fatal("expected a candidate for a 5-item plan")
-	}
-	if candidate.CategoryHint != "planning" {
-		t.Fatalf("category = %q", candidate.CategoryHint)
+		t.Fatal("expected a candidate for a 5-item TodoWrite plan")
 	}
 	if candidate.ChosenOption != "Execute a 5-step implementation plan" {
 		t.Fatalf("chosenOption = %q", candidate.ChosenOption)
 	}
-	// The copy must not name a tool that no longer exists.
 	if want := "The agent tracked a 5-item plan before making code changes."; candidate.Context != want {
 		t.Fatalf("context = %q, want %q", candidate.Context, want)
 	}
 }
 
-// Same map after a JSON round-trip: itemCount comes back as float64 and must
+// Same map after a JSON round-trip: the ordinal comes back as float64 and must
 // still resolve.
-func TestDetectDecisionCandidateForPlanItemCountAsFloat(t *testing.T) {
+func TestDetectDecisionCandidateForPlanOrdinalAsFloat(t *testing.T) {
 	event := newEvent("planning", "sess-1")
 	event.Data = map[string]interface{}{
-		"toolName":  "TaskCreate",
-		"itemCount": float64(4),
+		"toolName":           "TaskCreate",
+		"sessionTaskOrdinal": float64(4),
 	}
 
 	if candidate := detectDecisionCandidate(event); candidate == nil {
-		t.Fatal("expected a candidate when itemCount decodes as float64")
+		t.Fatal("expected a candidate when sessionTaskOrdinal decodes as float64")
 	}
 }
 
