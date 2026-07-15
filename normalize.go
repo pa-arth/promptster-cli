@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -543,16 +544,72 @@ func countLinesFromPatches(patches []interface{}) (added, removed int) {
 	return
 }
 
-// intFromJSON extracts an int from a JSON number (float64).
+// intFromJSON extracts an int from a numeric value. Decoded JSON gives float64,
+// but the same maps are also read in-process straight from the normalizer, where
+// a count is a plain int — returning 0 for those silently drops real values, so
+// both shapes are handled.
 func intFromJSON(v interface{}) int {
-	if f, ok := v.(float64); ok {
-		return int(f)
+	switch n := v.(type) {
+	case float64:
+		return int(n)
+	case float32:
+		return int(n)
+	case int:
+		return n
+	case int64:
+		return int(n)
+	case json.Number:
+		if i, err := n.Int64(); err == nil {
+			return int(i)
+		}
 	}
 	return 0
 }
 
 // normalizePostToolUseByTool converts a PostToolUse/postToolUse payload into a
 // rich, tool-specific Event. Shared between Claude Code and Cursor normalizers.
+// taskNumberFromResponse extracts the task number from a TaskCreate response.
+//
+// The hook delivers tool_response as a STRUCTURED map — for TaskCreate that is
+// {"task": {"id": "1", "subject": "..."}} — verified against real transcripts.
+// The prose "Task #1 created successfully: ..." exists only in the MODEL-facing
+// tool_result block and never reaches this normalizer, so parsing for it found
+// nothing and silently omitted the number on every real call. That is why this
+// reads the structure instead: a regex here was a fix that could not fire.
+//
+// `id` is a STRING ("1"), not a JSON number, so a float64-only type switch
+// yields a silent zero. Both shapes are accepted in case that changes.
+//
+// The value is the session's cumulative task ordinal, NOT a plan size — see the
+// TaskCreate branch. Reports ok=false when nothing parses, so callers omit the
+// field rather than invent a count.
+func taskNumberFromResponse(toolResponse map[string]interface{}) (int, bool) {
+	if toolResponse == nil {
+		return 0, false
+	}
+	task, ok := toolResponse["task"].(map[string]interface{})
+	if !ok {
+		return 0, false
+	}
+	var n int
+	switch v := task["id"].(type) {
+	case string:
+		parsed, err := strconv.Atoi(strings.TrimSpace(v))
+		if err != nil {
+			return 0, false
+		}
+		n = parsed
+	case float64:
+		n = int(v)
+	default:
+		return 0, false
+	}
+	if n <= 0 {
+		return 0, false
+	}
+	return n, true
+}
+
 func normalizePostToolUseByTool(toolName string, toolInput, toolResponse map[string]interface{}, sessionID, raw string) (Event, bool) {
 	switch {
 	case strings.Contains(toolName, "Edit") || toolName == "Write" || toolName == "StrReplace":
@@ -687,11 +744,75 @@ func normalizePostToolUseByTool(toolName string, toolInput, toolResponse map[str
 		e.RawPayload = raw
 		return e, true
 
+	// Claude Code renamed the todo tool: TodoWrite/TodoRead became
+	// TaskCreate/TaskUpdate/TaskList. TodoWrite stays matched for older clients
+	// still in the field — dropping it would blind us to those sessions.
+	//
+	// The shapes are NOT the same, and the difference matters. TodoWrite carried
+	// the WHOLE list on every call (`todos: [...]`), so one event knew the plan
+	// size. TaskCreate creates exactly ONE task per call and has no array at all
+	// (required `subject`, plus optional `description`/`activeForm`); TaskUpdate
+	// flips one task's status (`taskId` + `status`). Verified against real
+	// transcripts — every `todos`/`tasks`-array variant in the wild is a model
+	// mis-call that came back as an InputValidationError.
+	//
+	// TaskCreate's RESPONSE reads "Task #N created successfully: <subject>", and
+	// N is recoverable without making this normalizer stateful. But N is the
+	// session's CUMULATIVE task ordinal, NOT the size of the current plan: a
+	// session that plans A (5 tasks) and later plans B starts B at #6, so B's
+	// first task would read as a 6-item plan. Deleting tasks skews it the same
+	// way. So it is emitted as `sessionTaskOrdinal`, never as `itemCount` —
+	// only TodoWrite, which carried the actual list, can report a true plan size.
+	// Naming it `itemCount` would be exactly the bug this file exists to fix: a
+	// number that looks measured and isn't.
 	case toolName == "TodoWrite":
 		todos, _ := toolInput["todos"].([]interface{})
 		e := newEvent("planning", sessionID)
 		e.Data = map[string]interface{}{
-			"todos": todos,
+			"todos":     todos,
+			"itemCount": len(todos),
+			"toolName":  toolName,
+		}
+		e.RawPayload = raw
+		return e, true
+
+	case toolName == "TaskCreate":
+		subject, _ := toolInput["subject"].(string)
+		description, _ := toolInput["description"].(string)
+		activeForm, _ := toolInput["activeForm"].(string)
+		data := map[string]interface{}{
+			"toolName":    toolName,
+			"subject":     strPreview(subject, 300),
+			"description": strPreview(description, 1000),
+			"activeForm":  strPreview(activeForm, 300),
+		}
+		// The session's cumulative task ordinal (see the note above) — NOT a plan
+		// size, and deliberately not named one. Absent rather than a guessed 1
+		// when the response can't be parsed: a wrong count is worse than a
+		// missing one downstream, where it becomes user-facing prose.
+		if n, ok := taskNumberFromResponse(toolResponse); ok {
+			data["sessionTaskOrdinal"] = n
+		}
+		e := newEvent("planning", sessionID)
+		e.Data = data
+		e.RawPayload = raw
+		return e, true
+
+	case toolName == "TaskUpdate":
+		// A status flip is plan EXECUTION, not plan authoring, so it carries no
+		// itemCount: it must not read as "the agent planned N steps".
+		taskID := ""
+		if s, ok := toolInput["taskId"].(string); ok {
+			taskID = s
+		} else if v, ok := toolInput["taskId"].(float64); ok {
+			taskID = strconv.Itoa(int(v))
+		}
+		status, _ := toolInput["status"].(string)
+		e := newEvent("planning", sessionID)
+		e.Data = map[string]interface{}{
+			"toolName": toolName,
+			"taskId":   taskID,
+			"status":   status,
 		}
 		e.RawPayload = raw
 		return e, true
@@ -718,9 +839,13 @@ func normalizePostToolUseByTool(toolName string, toolInput, toolResponse map[str
 		e.RawPayload = raw
 		return e, true
 
-	case toolName == "TodoRead":
+	// TaskList is the read side of the rename (TodoRead's successor). It must NOT
+	// land on "planning": it observes the plan, it doesn't author one.
+	case toolName == "TodoRead" || toolName == "TaskList":
 		e := newEvent("planning_read", sessionID)
-		e.Data = map[string]interface{}{}
+		e.Data = map[string]interface{}{
+			"toolName": toolName,
+		}
 		e.RawPayload = raw
 		return e, true
 

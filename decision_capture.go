@@ -206,16 +206,40 @@ func detectDecisionCandidate(event Event) *decisionCandidate {
 
 	switch event.Kind {
 	case "planning":
-		todoCount := 0
+		// Two shapes reach here, and they do NOT mean the same thing — the copy
+		// below has to say which one it saw, because this text is read by a human.
+		//
+		//  - Legacy TodoWrite (and the Codex path) carry the whole list in
+		//    `todos`, so len() is a TRUE size for the plan as it currently stands.
+		//  - Current Claude Code tools carry no list. The normalizer recovers
+		//    `sessionTaskOrdinal` from TaskCreate's response — the session's
+		//    CUMULATIVE task number, which is NOT this plan's size (a session's
+		//    second plan starts partway up the counter). Saying "a 6-item plan"
+		//    off it would be a fabrication.
+		//
+		// Status flips (TaskUpdate) carry neither and fall out below — they
+		// execute a plan rather than define one.
+		planSize := 0
 		if todos, ok := data["todos"].([]interface{}); ok {
-			todoCount = len(todos)
+			planSize = len(todos)
 		}
-		if todoCount < 4 {
+		ordinal := 0
+		if planSize == 0 {
+			ordinal = intFromJSON(data["sessionTaskOrdinal"])
+		}
+		// Either signal clearing the bar means "the agent is tracking real
+		// multi-step work", which is the moment worth capturing.
+		if planSize < 4 && ordinal < 4 {
 			return nil
 		}
 		base.Title = "Defined a concrete implementation plan"
-		base.ChosenOption = fmt.Sprintf("Execute a %d-step implementation plan", todoCount)
-		base.Context = fmt.Sprintf("The agent wrote a TodoWrite plan with %d items before making code changes.", todoCount)
+		if planSize >= 4 {
+			base.ChosenOption = fmt.Sprintf("Execute a %d-step implementation plan", planSize)
+			base.Context = fmt.Sprintf("The agent tracked a %d-item plan before making code changes.", planSize)
+		} else {
+			base.ChosenOption = "Execute a multi-step implementation plan"
+			base.Context = fmt.Sprintf("The agent had tracked %d tasks in this session before making code changes.", ordinal)
+		}
 		base.CategoryHint = "planning"
 		base.Reason = "Multi-step planning usually reflects an execution strategy worth preserving."
 		return &base
