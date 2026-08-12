@@ -3,10 +3,17 @@ BINARY  := promptster
 DIST    := dist
 LDFLAGS := -ldflags="-s -w -X main.version=$(VERSION)"
 
-.PHONY: build install release clean
+.PHONY: build install release clean experiment
 
 build:
 	go build $(LDFLAGS) -o bin/$(BINARY) .
+
+# experiment builds the internal-fleet task-envelope harness (openspec
+# practice-effect-experiment, batch-0 task 0.1). Deliberately its own package and
+# its own binary: `build` and `release` above compile the root package alone, so
+# nothing in experiment/ can reach a candidate's install.
+experiment:
+	go build -o bin/$(BINARY)-experiment ./experiment
 
 install: build
 	cp bin/$(BINARY) /usr/local/bin/$(BINARY)
