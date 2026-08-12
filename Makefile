@@ -15,6 +15,20 @@ build:
 experiment:
 	go build -o bin/$(BINARY)-experiment ./experiment
 
+# experiment-install puts the binary at a STABLE path before hooks are wired to
+# it. install-hooks writes the running binary's resolved path into
+# settings.json, so installing from a worktree's bin/ would leave Claude Code
+# pointing at a path that disappears when the worktree is removed — mid-batch,
+# silently, and a silently dead C2 gate reads as perfect non-adherence.
+EXPERIMENT_BIN := $(HOME)/.promptster-experiment/bin/$(BINARY)-experiment
+
+experiment-install: experiment
+	mkdir -p $(dir $(EXPERIMENT_BIN))
+	cp bin/$(BINARY)-experiment $(EXPERIMENT_BIN)
+	@echo "installed $(EXPERIMENT_BIN)"
+	@echo "next:  $(EXPERIMENT_BIN) init --org <orgId>"
+	@echo "then:  $(EXPERIMENT_BIN) install-hooks --write ~/.claude/settings.json"
+
 install: build
 	cp bin/$(BINARY) /usr/local/bin/$(BINARY)
 

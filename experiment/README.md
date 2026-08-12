@@ -21,15 +21,29 @@ root package only; this is a separate `package main` under `experiment/`, built 
 
 ## Install
 
+`make experiment` only **builds** the binary. It does not touch `~/.claude` — wiring
+the hooks is an explicit step you run:
+
 ```bash
-make experiment                                    # builds bin/promptster-experiment
-bin/promptster-experiment init --org <orgId>       # engineer defaults to git user.email
-bin/promptster-experiment install-hooks            # prints the settings.json snippet
-bin/promptster-experiment install-hooks --write ~/.claude/settings.json
+make experiment-install                            # build + copy to a stable path
+EXP=~/.promptster-experiment/bin/promptster-experiment
+
+$EXP init --org <orgId>                            # engineer defaults to git user.email
+$EXP install-hooks                                 # prints the settings.json snippet
+$EXP install-hooks --write ~/.claude/settings.json # or writes it, with a .bak first
+# restart Claude Code sessions — hooks load at session start
 ```
 
-`install-hooks` registers three Claude Code hook points and is idempotent (it drops
-its own prior entries before appending, and backs the file up first).
+Use `make experiment-install`, not `bin/promptster-experiment`, before wiring hooks:
+`install-hooks` writes the **running binary's resolved path** into settings.json, so
+installing from a worktree's `bin/` leaves Claude Code pointing at a path that
+disappears when the worktree is removed — mid-batch, silently. A silently dead C2
+gate reads as perfect non-adherence.
+
+`install-hooks` registers three hook points (`SessionStart`, `PreCompact`,
+`UserPromptSubmit`) and is idempotent: it drops its own prior entries before
+appending, and backs the file up to `settings.json.promptster-experiment.bak`.
+Verify with `$EXP status`.
 
 ## Use
 
@@ -88,10 +102,17 @@ is recorded on every row as an analysis covariate.
 
 The position state is *the log itself*, so no counter can drift away from the rows.
 
-> **Cross-implementation agreement is UNVERIFIED.** The vectors in
-> `assign_test.go` are self-generated: they prove this implementation is stable,
-> not that it matches the backend's. The backend half is publishing shared test
-> vectors; assert against that file before batch 1's first real assignment.
+**Cross-implementation agreement is VERIFIED** (2026-08-12). `vectors_test.go`
+asserts this Go allocator against `testdata/experiment-block-vectors.json`, a
+verbatim copy of the backend's
+`apps/api/src/__tests__/__fixtures__/experiment-block-vectors.json`
+(PR #699, branch `feat/experiment-assignment-log`): 3 allocation keys × 12
+positions, all agreeing, plus a guard that the cell **declaration order** matches
+— the subtlest way the two sides could diverge while every seed byte still agrees.
+
+If that test goes red, stop assigning. It means the two halves disagree about what
+arm an engineer was shown, which is the one failure an assignment log cannot
+survive. Re-copy the fixture whenever the backend regenerates it.
 
 ## Assignment row — the wire contract with backend task 0.3
 

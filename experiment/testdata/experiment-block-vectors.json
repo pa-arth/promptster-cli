@@ -1,0 +1,85 @@
+{
+  "$doc": [
+    "Cross-implementation test vectors for the practice-effect experiment's block allocator.",
+    "The backend (TS, apps/api/src/lib/experiment-registry.ts) and the teams CLI (Go,",
+    "promptster-cli/experiment) both assert against THIS file rather than against each",
+    "other's prose. A mismatch here is the two halves disagreeing about what arm an",
+    "engineer was shown, which is the one failure the assignment log cannot survive.",
+    "Regenerate deliberately: changing a vector re-labels history."
+  ],
+  "algorithm": {
+    "allocationKey": "(experimentKey, orgId, engineerUserId, stratum)",
+    "position": "count of prior landed rows under the allocation key",
+    "block": "floor(position / cells.length)",
+    "slot": "position % cells.length",
+    "seed": "sha256(experimentKey NUL orgId NUL engineerUserId NUL stratum NUL decimal(block))",
+    "stream": "h_i = sha256(seed || uint32be(i)), i = 0,1,2,... concatenated, consumed 4 bytes at a time",
+    "shuffle": "Fisher-Yates over cells in DECLARATION order: for j = n-1 down to 1: k = uint32be(next4) % (j+1); swap",
+    "arm": "perm[slot]"
+  },
+  "vectors": [
+    {
+      "orgId": "org_3Frfl9gCeoFXgmMwJG3v3k9DKMj",
+      "engineerUserId": "user_paarth",
+      "stratum": "pa-arth/promptster-backend|feature",
+      "experimentKey": "batch1-context-mechanics",
+      "cells": ["c1off_c2off", "c1on_c2off", "c1off_c2on", "c1on_c2on"],
+      "arms": [
+        "c1on_c2on",
+        "c1on_c2off",
+        "c1off_c2on",
+        "c1off_c2off",
+        "c1on_c2on",
+        "c1off_c2on",
+        "c1on_c2off",
+        "c1off_c2off",
+        "c1off_c2on",
+        "c1on_c2off",
+        "c1off_c2off",
+        "c1on_c2on"
+      ]
+    },
+    {
+      "orgId": "org_3Frfl9gCeoFXgmMwJG3v3k9DKMj",
+      "engineerUserId": "user_paarth",
+      "stratum": "pa-arth/promptster-teams|fix",
+      "experimentKey": "batch1-context-mechanics",
+      "cells": ["c1off_c2off", "c1on_c2off", "c1off_c2on", "c1on_c2on"],
+      "arms": [
+        "c1off_c2off",
+        "c1on_c2off",
+        "c1off_c2on",
+        "c1on_c2on",
+        "c1on_c2off",
+        "c1off_c2off",
+        "c1off_c2on",
+        "c1on_c2on",
+        "c1off_c2off",
+        "c1off_c2on",
+        "c1on_c2on",
+        "c1on_c2off"
+      ]
+    },
+    {
+      "orgId": "org_opsai",
+      "engineerUserId": "user_alex",
+      "stratum": "opsai/api|analysis",
+      "experimentKey": "batch1-context-mechanics",
+      "cells": ["c1off_c2off", "c1on_c2off", "c1off_c2on", "c1on_c2on"],
+      "arms": [
+        "c1off_c2on",
+        "c1on_c2on",
+        "c1on_c2off",
+        "c1off_c2off",
+        "c1off_c2off",
+        "c1on_c2on",
+        "c1off_c2on",
+        "c1on_c2off",
+        "c1off_c2off",
+        "c1off_c2on",
+        "c1on_c2off",
+        "c1on_c2on"
+      ]
+    }
+  ]
+}
