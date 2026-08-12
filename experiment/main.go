@@ -160,6 +160,13 @@ func cmdOpen(args []string) int {
 	// becomes self-selection.
 	a, existed := findAssignment(rows, cfg, *task)
 	if !existed {
+		// Only on a FIRST open. Re-opening a task that already drew its arm must
+		// never fail: the draw is immutable, so refusing here would block work
+		// without protecting anything.
+		if err := checkRepoAttribution(*task, repoSlug); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			return 2
+		}
 		exclusion := ""
 		switch {
 		case taskClass == "ops":
