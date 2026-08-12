@@ -195,3 +195,57 @@ open on any error.
 - **C2**: `reanchor_accepted` in the same session as `gate_armed`, carrying
   `charLen` and the attempt count — so "complied on the 3rd try" stays visible
   instead of rounding to compliance.
+
+## Sync — getting the log off this laptop
+
+```
+init --key PSE-…          store the engineer key (0600), or export PROMPTSTER_ENGINEER_KEY
+sync --dry-run            show exactly what would be posted, post nothing
+sync                      POST assignments, then the adherence derived from them
+```
+
+Until a row reaches the server, the only copy of batch 1's assignment log is one
+JSONL file on one laptop. A pre-registered trial whose assignment record dies with
+a disk is not a trial, so `sync` is the thing that makes "assignment preceded the
+work" outlive this machine. It targets `POST /v1/teams/experiments/assignment` and
+`/adherence` (backend #699), authenticated with the **engineer** key (`PSE-`) in
+`X-API-Key` — a `PSO-` org capture key authenticates a *machine*, carries no
+engineer identity, and is refused here by name rather than left to a generic 401.
+
+**Sync state is not a flag on the row.** The assignment row is immutable, so its
+`synced` field can never become true; it stays false forever and nothing reads it.
+Receipts append to `sync-receipts.jsonl`, and "already synced" is derived from
+them. That log is also what stops a second `sync` from double-posting adherence —
+the adherence route is append-only with no idempotency key, and a double-posted
+observation inflates the number the batch-2 gate is read off.
+
+**A 4xx is a decision, not a hiccup.** `slot_taken`, `offline_draw_not_allowed`,
+`experiment_closed`, a rejected body — retrying the same row cannot change any of
+them, and mutating a row to get a different answer is the one thing that must
+never happen, so they are recorded as `refused` and left alone. Only 5xx and
+transport failures retry. An `arm_conflict` (or a 200 whose arm differs from the
+local row, which the verbatim-storage contract says is impossible) prints a loud
+block and stops: one authority per row, and reconciling by hand is the only
+correct move.
+
+**What the CLI is allowed to claim about adherence.** One observation per *armed
+gate*, never per event:
+
+| local events | posted |
+|---|---|
+| `gate_armed` → `reanchor_accepted` | `anchor_after_compact` = **followed** |
+| `gate_armed` → `gate_bypassed` | `anchor_after_compact` = **violated** |
+| `gate_armed`, unanswered, task closed | `anchor_after_compact` = **unknown** |
+| `gate_armed`, unanswered, task still open | nothing yet — it can still be answered |
+| `reanchor_rejected` | nothing, ever |
+
+A rejected draft is a keystroke, not a verdict. Batch 1's first task rejected two
+drafts before the third landed; posting the raw stream would have recorded three
+violations against behaviour that was fully compliant, and adherence would have
+read 40% for a 100% task. Dropping the unanswered-gate case would have been the
+opposite error, quietly inflating the same number — hence `unknown`, which the
+route treats as a first-class value.
+
+C1's `zero_topic_pivots` is **never** derived here. The pre-registration makes it
+hand-read on every C1-arm task (regexes misfire on long machine notifications), so
+it reaches the server from the audit pass with `source: hand-audit`.

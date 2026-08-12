@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -279,4 +280,31 @@ func runGit(dir string, args ...string) (string, error) {
 		return "", err
 	}
 	return strings.TrimSpace(string(out)), nil
+}
+
+// readJSONL streams a JSONL file line by line. A record that will not parse is
+// the caller's to skip: a corrupt line must never abort a read of the log, or
+// one bad row would hide every good one behind it.
+func readJSONL(path string, fn func(line []byte) error) error {
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	defer f.Close()
+
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for sc.Scan() {
+		line := bytes.TrimSpace(sc.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		if err := fn(line); err != nil {
+			return err
+		}
+	}
+	return sc.Err()
 }

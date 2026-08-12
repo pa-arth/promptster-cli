@@ -17,6 +17,11 @@ type Config struct {
 	// ExperimentKey is the backend's registered experiment identity and the
 	// first component of its idempotency key.
 	ExperimentKey string `json:"experimentKey"`
+	// EngineerKey is the PSE- key `sync` posts with. Optional: the env var
+	// PROMPTSTER_ENGINEER_KEY and the --key flag both work without it, and both
+	// beat it. Stored in a 0600 file, so it is exactly as protected as the rest
+	// of this directory and no more — do not put a key here on a shared machine.
+	EngineerKey string `json:"engineerKey,omitempty"`
 	// Enabled is the kill switch. Set false and every hook returns silently —
 	// the experiment can be stopped mid-flight without uninstalling hooks.
 	Enabled bool `json:"enabled"`

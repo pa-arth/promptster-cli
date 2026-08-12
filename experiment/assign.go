@@ -99,7 +99,12 @@ type Assignment struct {
 	ExclusionCode string   `json:"exclusionCode,omitempty"`
 	SpecVersion   string   `json:"specVersion"`
 	Envelope      Envelope `json:"envelope"`
-	Synced        bool     `json:"synced"`
+	// Synced is always false and stays false. It was written before sync existed
+	// and cannot become true, because the row is immutable and this package has
+	// no path that rewrites one. Sync state lives in its own append-only receipt
+	// log (sync-receipts.jsonl) and is derived by reading it; nothing should read
+	// this field. Kept only so rows already on disk still round-trip.
+	Synced bool `json:"synced"`
 }
 
 type Envelope struct {
