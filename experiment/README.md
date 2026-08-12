@@ -246,6 +246,17 @@ read 40% for a 100% task. Dropping the unanswered-gate case would have been the
 opposite error, quietly inflating the same number — hence `unknown`, which the
 route treats as a first-class value.
 
+**Everything here is scoped to the full assignment identity** (experiment, org,
+task) rather than the task key, because the state directory outlives the
+experiment: batch 2 runs under a different `experimentKey` against the same
+`~/.promptster-experiment`, and a task key may legitimately repeat. Keyed on the
+task alone, batch 1's receipt would mark batch 2's row already synced — silently,
+with `status` reporting success — and a foreign accept, bypass or close would
+resolve this batch's gates with another experiment's behaviour. For the same
+reason a gate is only closed out by a `task_close` that comes **after** it armed:
+a task can be closed and reopened, and yesterday's close must not answer today's
+gate.
+
 C1's `zero_topic_pivots` is **never** derived here. The pre-registration makes it
 hand-read on every C1-arm task (regexes misfire on long machine notifications), so
 it reaches the server from the audit pass with `source: hand-audit`.

@@ -100,11 +100,19 @@ type SyncReceipt struct {
 	Kind          string `json:"kind"` // assignment | adherence
 	SyncedAt      string `json:"syncedAt"`
 	ExperimentKey string `json:"experimentKey"`
+	OrgID         string `json:"orgId"`
 	TaskKey       string `json:"taskKey"`
 	// DedupeKey identifies the exact fact posted. The adherence route is
 	// append-only with no idempotency key of its own, so double-posting would
 	// double-count adherence — the thing the batch-2 gate is read off. This is
 	// what stops a second `sync` from doing that.
+	//
+	// It carries the FULL assignment identity (experiment, org, task), not just
+	// the task key. One state directory outlives one experiment: batch 2 runs
+	// under a different experimentKey against the same ~/.promptster-experiment,
+	// and a task key can legitimately repeat across experiments or orgs. Keyed on
+	// the task alone, batch 1's receipt would mark batch 2's row already settled
+	// and that row would never sync — silently, with `status` reporting success.
 	DedupeKey  string `json:"dedupeKey"`
 	HTTPStatus int    `json:"httpStatus"`
 	// Result: stored | already_assigned | conflict | refused | error.
@@ -140,8 +148,28 @@ func (r SyncReceipt) settled() bool {
 	return false
 }
 
+// identity is the assignment identity every key in this file is scoped by:
+// the backend's idempotency key minus the engineer, who is fixed by the API key.
+func identity(experimentKey, orgID, taskKey string) string {
+	return experimentKey + "|" + orgID + "|" + taskKey
+}
+
+// assignmentDedupeKey / adherenceDedupeKey — the two fact identities.
+func assignmentDedupeKey(r Assignment) string {
+	return identity(r.ExperimentKey, r.OrgID, r.TaskKey)
+}
+
+func adherenceDedupeKey(cfg Config, taskKey, complianceEvent, armedAt string) string {
+	return identity(cfg.ExperimentKey, cfg.OrgID, taskKey) + "|" + complianceEvent + "|" + armedAt
+}
+
 // syncState folds the receipt log into the two questions sync asks: is this fact
 // already settled, and what assignmentId did the server give this task?
+//
+// Both maps are keyed by full assignment identity rather than task key, for the
+// reason on SyncReceipt.DedupeKey: the state directory outlives the experiment,
+// and a stale task-keyed entry would either skip a row or hang a new experiment's
+// adherence off the previous experiment's assignmentId.
 type syncState struct {
 	settled     map[string]bool
 	assignments map[string]string
@@ -155,7 +183,7 @@ func foldReceipts(rs []SyncReceipt) syncState {
 			st.settled[r.Kind+"|"+r.DedupeKey] = true
 		}
 		if r.Kind == "assignment" && r.AssignmentID != "" {
-			st.assignments[r.TaskKey] = r.AssignmentID
+			st.assignments[identity(r.ExperimentKey, r.OrgID, r.TaskKey)] = r.AssignmentID
 		}
 		if r.Result == "conflict" {
 			st.conflicts = append(st.conflicts, r)
@@ -239,7 +267,7 @@ func cmdSync(args []string) int {
 			if !r.Eligible {
 				continue
 			}
-			if st.settled["assignment|"+r.TaskKey] {
+			if st.settled["assignment|"+assignmentDedupeKey(r)] {
 				continue
 			}
 			if *dry {
@@ -252,10 +280,10 @@ func cmdSync(args []string) int {
 				return 1
 			}
 			if rec.AssignmentID != "" {
-				st.assignments[r.TaskKey] = rec.AssignmentID
+				st.assignments[assignmentDedupeKey(r)] = rec.AssignmentID
 			}
 			if rec.Result == "stored" || rec.Result == "already_assigned" {
-				st.settled["assignment|"+r.TaskKey] = true
+				st.settled["assignment|"+assignmentDedupeKey(r)] = true
 				fmt.Printf("  assignment %-46s %s (%s)\n", r.TaskKey, rec.Result, rec.ServerArm)
 			} else {
 				failed++
@@ -280,7 +308,7 @@ func cmdSync(args []string) int {
 			// Adherence hangs off an assignment the server knows. Posting an
 			// observation for a task whose assignment never landed would 404, and
 			// retrying it every run is noise, so it waits for its assignment.
-			id := st.assignments[o.TaskKey]
+			id := st.assignments[identity(cfg.ExperimentKey, cfg.OrgID, o.TaskKey)]
 			if *dry {
 				after := ""
 				if id == "" {
@@ -332,7 +360,8 @@ func cmdSync(args []string) int {
 func postAssignment(base, key string, r Assignment) SyncReceipt {
 	rec := SyncReceipt{
 		SchemaVersion: schemaVersion, Kind: "assignment", SyncedAt: nowUTC(),
-		ExperimentKey: r.ExperimentKey, TaskKey: r.TaskKey, DedupeKey: r.TaskKey,
+		ExperimentKey: r.ExperimentKey, OrgID: r.OrgID, TaskKey: r.TaskKey,
+		DedupeKey: assignmentDedupeKey(r),
 	}
 	status, body, err := postJSON(base, key, "/v1/teams/experiments/assignment", r.syncPayload())
 	rec.HTTPStatus = status
@@ -390,7 +419,8 @@ func postAssignment(base, key string, r Assignment) SyncReceipt {
 func postAdherence(base, key string, cfg Config, assignmentID string, o adherenceObs) SyncReceipt {
 	rec := SyncReceipt{
 		SchemaVersion: schemaVersion, Kind: "adherence", SyncedAt: nowUTC(),
-		ExperimentKey: cfg.ExperimentKey, TaskKey: o.TaskKey, DedupeKey: o.DedupeKey,
+		ExperimentKey: cfg.ExperimentKey, OrgID: cfg.OrgID, TaskKey: o.TaskKey,
+		DedupeKey: o.DedupeKey,
 	}
 	payload := map[string]any{
 		"assignmentId":    assignmentID,
@@ -456,12 +486,21 @@ type adherenceObs struct {
 //     the CLI has no business asserting it. It reaches the server from the audit
 //     pass with source `hand-audit`, not from this code.
 func deriveAdherence(cfg Config, rows []Assignment) ([]adherenceObs, error) {
+	// The event log, like the state directory, outlives one experiment. Events are
+	// filtered to THIS experiment and org before anything is derived from them —
+	// a task key can repeat across experiments, and a foreign accept, bypass or
+	// close matched on task key alone would write someone else's behaviour into
+	// this batch's adherence, permanently (the table is append-only).
 	var events []Event
 	err := readJSONL(eventsPath(), func(line []byte) error {
 		var e Event
-		if json.Unmarshal(line, &e) == nil {
-			events = append(events, e)
+		if json.Unmarshal(line, &e) != nil {
+			return nil
 		}
+		if e.ExperimentKey != cfg.ExperimentKey || e.OrgID != cfg.OrgID {
+			return nil
+		}
+		events = append(events, e)
 		return nil
 	})
 	if err != nil {
@@ -475,11 +514,25 @@ func deriveAdherence(cfg Config, rows []Assignment) ([]adherenceObs, error) {
 		}
 	}
 
-	closedAt := map[string]string{}
+	// EVERY close, not the first. A task can be closed and reopened, and a gate
+	// armed after a reopen is answerable no matter how long ago the first close
+	// was — resolving it against a stale close would post `unknown` for a live
+	// gate and stamp it with a timestamp from before it existed. Only a close that
+	// comes AFTER the gate armed can close that gate out.
+	closes := map[string][]string{}
 	for _, e := range events {
-		if e.ComplianceEvent == "task_close" && closedAt[e.TaskKey] == "" {
-			closedAt[e.TaskKey] = e.ObservedAt
+		if e.ComplianceEvent == "task_close" {
+			closes[e.TaskKey] = append(closes[e.TaskKey], e.ObservedAt)
 		}
+	}
+	closeAfter := func(taskKey, armedAt string) string {
+		best := ""
+		for _, at := range closes[taskKey] {
+			if at > armedAt && (best == "" || at < best) {
+				best = at
+			}
+		}
+		return best
 	}
 
 	var out []adherenceObs
@@ -490,7 +543,7 @@ func deriveAdherence(cfg Config, rows []Assignment) ([]adherenceObs, error) {
 		obs := adherenceObs{
 			TaskKey:         g.TaskKey,
 			ComplianceEvent: "anchor_after_compact",
-			DedupeKey:       g.TaskKey + "|anchor_after_compact|" + g.ObservedAt,
+			DedupeKey:       adherenceDedupeKey(cfg, g.TaskKey, "anchor_after_compact", g.ObservedAt),
 			Detail:          map[string]any{"armedAt": g.ObservedAt, "sessionId": g.SessionID},
 		}
 		resolved := false
@@ -515,10 +568,11 @@ func deriveAdherence(cfg Config, rows []Assignment) ([]adherenceObs, error) {
 			}
 		}
 		if !resolved {
-			if closedAt[g.TaskKey] == "" {
+			closedAt := closeAfter(g.TaskKey, g.ObservedAt)
+			if closedAt == "" {
 				continue // still open, may still be answered
 			}
-			obs.Observed, obs.ObservedAt = "unknown", closedAt[g.TaskKey]
+			obs.Observed, obs.ObservedAt = "unknown", closedAt
 			obs.Detail["unanswered"] = true
 		}
 		out = append(out, obs)

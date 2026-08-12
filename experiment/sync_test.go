@@ -131,11 +131,14 @@ func TestDeriveAdherenceCountsGatesNotKeystrokes(t *testing.T) {
 		}
 		got[o.DedupeKey] = o.Observed
 	}
+	k := func(task, armedAt string) string {
+		return adherenceDedupeKey(cfg, task, "anchor_after_compact", armedAt)
+	}
 	want := map[string]string{
-		"repo/anchored|anchor_after_compact|2026-08-12T10:00:00Z":  "followed",
-		"repo/anchored|anchor_after_compact|2026-08-12T11:00:00Z":  "followed",
-		"repo/bypassed|anchor_after_compact|2026-08-12T10:00:00Z":  "violated",
-		"repo/abandoned|anchor_after_compact|2026-08-12T10:00:00Z": "unknown",
+		k("repo/anchored", "2026-08-12T10:00:00Z"):  "followed",
+		k("repo/anchored", "2026-08-12T11:00:00Z"):  "followed",
+		k("repo/bypassed", "2026-08-12T10:00:00Z"):  "violated",
+		k("repo/abandoned", "2026-08-12T10:00:00Z"): "unknown",
 	}
 	if len(got) != len(want) {
 		t.Fatalf("got %d observations, want %d: %v", len(got), len(want), got)
@@ -155,19 +158,58 @@ func TestDeriveAdherenceCountsGatesNotKeystrokes(t *testing.T) {
 }
 
 func TestSyncReceiptsPreventDoubleCounting(t *testing.T) {
+	cfg := syncTestCfg()
+	id := identity(cfg.ExperimentKey, cfg.OrgID, "repo/a")
 	st := foldReceipts([]SyncReceipt{
-		{Kind: "assignment", TaskKey: "repo/a", DedupeKey: "repo/a", Result: "stored", AssignmentID: "uuid-a"},
-		{Kind: "adherence", TaskKey: "repo/a", DedupeKey: "repo/a|anchor_after_compact|T1", Result: "stored"},
-		{Kind: "adherence", TaskKey: "repo/a", DedupeKey: "repo/a|anchor_after_compact|T2", Result: "error"},
+		{Kind: "assignment", ExperimentKey: cfg.ExperimentKey, OrgID: cfg.OrgID, TaskKey: "repo/a",
+			DedupeKey: id, Result: "stored", AssignmentID: "uuid-a"},
+		{Kind: "adherence", ExperimentKey: cfg.ExperimentKey, OrgID: cfg.OrgID, TaskKey: "repo/a",
+			DedupeKey: id + "|anchor_after_compact|T1", Result: "stored"},
+		{Kind: "adherence", ExperimentKey: cfg.ExperimentKey, OrgID: cfg.OrgID, TaskKey: "repo/a",
+			DedupeKey: id + "|anchor_after_compact|T2", Result: "error"},
 	})
-	if !st.settled["assignment|repo/a"] || st.assignments["repo/a"] != "uuid-a" {
+	if !st.settled["assignment|"+id] || st.assignments[id] != "uuid-a" {
 		t.Fatal("a stored assignment must be settled and carry its id forward")
 	}
-	if !st.settled["adherence|repo/a|anchor_after_compact|T1"] {
+	if !st.settled["adherence|"+id+"|anchor_after_compact|T1"] {
 		t.Fatal("a stored adherence row must never be posted twice — the route has no idempotency key")
 	}
-	if st.settled["adherence|repo/a|anchor_after_compact|T2"] {
+	if st.settled["adherence|"+id+"|anchor_after_compact|T2"] {
 		t.Fatal("a transient error must be retried, not treated as settled")
+	}
+}
+
+// TestSyncStateIsScopedToTheAssignmentIdentity: the state directory outlives the
+// experiment. Batch 2 runs under a different experimentKey in the same
+// ~/.promptster-experiment, and a task key may legitimately repeat. Keyed on the
+// task alone, batch 1's receipt marks batch 2's row settled and that row never
+// syncs — silently, with `status` reporting success.
+func TestSyncStateIsScopedToTheAssignmentIdentity(t *testing.T) {
+	old := SyncReceipt{
+		Kind: "assignment", ExperimentKey: "batch1-context-mechanics", OrgID: "org_test",
+		TaskKey: "repo/shared-name", Result: "stored", AssignmentID: "uuid-batch1",
+	}
+	old.DedupeKey = identity(old.ExperimentKey, old.OrgID, old.TaskKey)
+	st := foldReceipts([]SyncReceipt{old})
+
+	next := row("repo/shared-name", "c1on_c2off", true)
+	next.ExperimentKey = "batch2-encouragement"
+	if st.settled["assignment|"+assignmentDedupeKey(next)] {
+		t.Fatal("a receipt from another experiment must not settle this one's row")
+	}
+	if st.assignments[identity(next.ExperimentKey, next.OrgID, next.TaskKey)] == "uuid-batch1" {
+		t.Fatal("adherence must never hang off another experiment's assignmentId")
+	}
+
+	sameOrg := row("repo/shared-name", "c1on_c2off", true)
+	sameOrg.OrgID = "org_other"
+	if st.settled["assignment|"+assignmentDedupeKey(sameOrg)] {
+		t.Fatal("a receipt from another org must not settle this one's row")
+	}
+	// The row it really does describe is still settled.
+	same := row("repo/shared-name", "c1on_c2off", true)
+	if !st.settled["assignment|"+assignmentDedupeKey(same)] {
+		t.Fatal("the matching row must still be recognised as synced")
 	}
 }
 
@@ -268,5 +310,110 @@ func TestPostAdherenceSendsTheDeclaredShape(t *testing.T) {
 	}
 	if _, ok := sent["detail"].(map[string]any); !ok {
 		t.Fatalf("detail must be an object, the route's schema rejects a string: %v", sent["detail"])
+	}
+}
+
+// TestDeriveAdherenceIgnoresForeignEvents: the event log outlives the experiment
+// too. A task key can repeat across experiments or orgs, and a foreign accept,
+// bypass or close matched on task key alone would write another experiment's
+// behaviour into this batch's adherence — permanently, since the table is
+// append-only and adherence is what the batch-2 gate divides by.
+func TestDeriveAdherenceIgnoresForeignEvents(t *testing.T) {
+	t.Setenv("PROMPTSTER_EXPERIMENT_DIR", t.TempDir())
+	cfg := syncTestCfg()
+	rows := []Assignment{row("repo/shared-name", "c1off_c2on", true)}
+
+	ev := func(kind, experimentKey, orgID, at string) {
+		if err := appendJSONL(eventsPath(), Event{
+			SchemaVersion: schemaVersion, ComplianceEvent: kind, Source: "cli-hook",
+			ExperimentKey: experimentKey, OrgID: orgID, TaskKey: "repo/shared-name",
+			EngineerID: cfg.EngineerID, SessionID: "s1", ObservedAt: at,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// This experiment's gate, still unanswered and its task still open.
+	ev("gate_armed", cfg.ExperimentKey, cfg.OrgID, "2026-08-12T10:00:00Z")
+	// Another experiment's bypass and close on the same task key and session.
+	ev("gate_bypassed", "batch2-encouragement", cfg.OrgID, "2026-08-12T10:05:00Z")
+	ev("task_close", "batch2-encouragement", cfg.OrgID, "2026-08-12T11:00:00Z")
+	// Another org's, likewise.
+	ev("gate_bypassed", cfg.ExperimentKey, "org_other", "2026-08-12T10:06:00Z")
+
+	obs, err := deriveAdherence(cfg, rows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(obs) != 0 {
+		t.Fatalf("a foreign bypass/close must not resolve this gate, got %+v", obs)
+	}
+
+	// The same gate, once THIS experiment closes the task, is `unknown` — not the
+	// violation the foreign bypass would have made it.
+	ev("task_close", cfg.ExperimentKey, cfg.OrgID, "2026-08-12T12:00:00Z")
+	obs, err = deriveAdherence(cfg, rows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(obs) != 1 || obs[0].Observed != "unknown" {
+		t.Fatalf("want one unknown, got %+v", obs)
+	}
+	if obs[0].ObservedAt != "2026-08-12T12:00:00Z" {
+		t.Fatalf("must be stamped with this experiment's close, got %s", obs[0].ObservedAt)
+	}
+}
+
+// TestDeriveAdherenceHandlesCloseThenReopen: a task can be closed and reopened.
+// A gate armed after the reopen is answerable no matter how old the first close
+// is; resolving it against that stale close posts `unknown` for a live gate and
+// stamps it with a time from before the gate existed.
+func TestDeriveAdherenceHandlesCloseThenReopen(t *testing.T) {
+	t.Setenv("PROMPTSTER_EXPERIMENT_DIR", t.TempDir())
+	cfg := syncTestCfg()
+	rows := []Assignment{row("repo/reopened", "c1off_c2on", true)}
+
+	ev := func(kind, session, at string) {
+		if err := appendJSONL(eventsPath(), Event{
+			SchemaVersion: schemaVersion, ComplianceEvent: kind, Source: "cli-hook",
+			ExperimentKey: cfg.ExperimentKey, OrgID: cfg.OrgID, TaskKey: "repo/reopened",
+			EngineerID: cfg.EngineerID, SessionID: session, ObservedAt: at,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ev("gate_armed", "s1", "2026-08-12T10:00:00Z")
+	ev("reanchor_accepted", "s1", "2026-08-12T10:01:00Z")
+	ev("task_close", "s1", "2026-08-12T11:00:00Z")
+	// Reopened the next day; a new session compacts and arms a new gate.
+	ev("task_open", "s2", "2026-08-13T09:00:00Z")
+	ev("gate_armed", "s2", "2026-08-13T09:30:00Z")
+
+	obs, err := deriveAdherence(cfg, rows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(obs) != 1 || obs[0].Observed != "followed" {
+		t.Fatalf("the live post-reopen gate must not be closed out by yesterday's close, got %+v", obs)
+	}
+
+	// Once the reopened task closes, the second gate resolves against THAT close.
+	ev("task_close", "s2", "2026-08-13T12:00:00Z")
+	obs, err = deriveAdherence(cfg, rows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(obs) != 2 {
+		t.Fatalf("want both gates, got %+v", obs)
+	}
+	var second adherenceObs
+	for _, o := range obs {
+		if o.Detail["armedAt"] == "2026-08-13T09:30:00Z" {
+			second = o
+		}
+	}
+	if second.Observed != "unknown" || second.ObservedAt != "2026-08-13T12:00:00Z" {
+		t.Fatalf("the second gate must be unknown at the SECOND close, got %+v", second)
 	}
 }
