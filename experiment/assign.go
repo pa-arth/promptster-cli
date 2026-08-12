@@ -361,3 +361,39 @@ func validateTaskKey(k string) error {
 	}
 	return nil
 }
+
+// checkRepoAttribution refuses a task key whose repo segment contradicts the
+// repo the envelope is being opened in.
+//
+// This is not tidiness. The stratum is repo × class, so a wrong repo draws the
+// arm from the wrong permuted-block sequence — and the assignment log is
+// append-only, so nothing about it can be fixed afterwards. It happened once
+// for real (batch-1 prereg amendment A2): a promptster-backend task opened from
+// the promptster-teams checkout landed in the "teams|feature" stratum.
+//
+// It refuses rather than warns because a warning in a busy terminal is a
+// warning nobody reads, and the mistake is unfixable by the time anyone reads
+// the log. Both escapes produce a CORRECT row rather than suppressing the
+// check: pass --repo to state the repo explicitly, or drop the segment from the
+// key (a key with no "/" is not claiming a repo and is not checked).
+func checkRepoAttribution(taskKey, repoSlug string) error {
+	seg, _, found := strings.Cut(strings.TrimSpace(taskKey), "/")
+	if !found || seg == "" || repoSlug == "" {
+		return nil
+	}
+	name := repoSlug
+	if _, after, ok := strings.Cut(repoSlug, "/"); ok {
+		name = after
+	}
+	if strings.EqualFold(seg, name) {
+		return nil
+	}
+	return fmt.Errorf(
+		"task key %q names repo %q but this checkout is %q.\n"+
+			"  The stratum is repo × class, the arm is drawn from it, and the log is append-only —\n"+
+			"  a wrong repo here cannot be corrected later. Resolve it before opening:\n"+
+			"    --repo %-28s if the work really lands in %s\n"+
+			"    --task %-28s if it lands here\n"+
+			"  (a task key with no \"/\" claims no repo and is not checked)",
+		taskKey, seg, repoSlug, "<owner>/"+seg, seg, name+"/<slug>")
+}

@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -371,6 +372,52 @@ func TestRepoSlugFromURL(t *testing.T) {
 	for url, want := range cases {
 		if got := repoSlugFromURL(url); got != want {
 			t.Fatalf("%s -> %q, want %q", url, got, want)
+		}
+	}
+}
+
+// TestRepoAttributionGuard covers the real defect it exists for: batch-1
+// assignment "promptster-backend/metric-buckets-tier-r-producers" was opened
+// from the promptster-teams checkout and landed in the teams|feature stratum
+// (prereg amendment A2). The log is append-only, so the only place this can be
+// caught is before the row is written.
+func TestRepoAttributionGuard(t *testing.T) {
+	t.Run("the A2 row would now be refused", func(t *testing.T) {
+		err := checkRepoAttribution("promptster-backend/metric-buckets-tier-r-producers", "pa-arth/promptster-teams")
+		if err == nil {
+			t.Fatal("a backend task opened in the teams checkout must be refused")
+		}
+		// The message has to name both repos, or it cannot be acted on.
+		for _, want := range []string{"promptster-backend", "pa-arth/promptster-teams", "--repo"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("message must mention %q, got: %v", want, err)
+			}
+		}
+	})
+
+	ok := []struct{ key, slug string }{
+		{"promptster-teams/github-linear-join-dashboard", "pa-arth/promptster-teams"}, // the other real row
+		{"promptster-cli/experiment-envelope", "pa-arth/promptster-cli"},
+		{"PROMPTSTER-CLI/x", "pa-arth/promptster-cli"},     // repo names are case-insensitive
+		{"promptster-cli/a/b", "pa-arth/promptster-cli"},   // only the first segment is the repo
+		{"no-repo-claimed-here", "pa-arth/promptster-cli"}, // no "/" claims no repo — the escape hatch
+		{"promptster-backend/x", ""},                       // nothing to compare against
+		{"promptster-cli/x", "promptster-cli"},             // bare slug, no owner
+	}
+	for _, c := range ok {
+		if err := checkRepoAttribution(c.key, c.slug); err != nil {
+			t.Fatalf("(%q, %q) should pass: %v", c.key, c.slug, err)
+		}
+	}
+
+	bad := []struct{ key, slug string }{
+		{"promptster-backend/x", "pa-arth/promptster-teams"},
+		{"openspec/practice-effect", "pa-arth/promptster-cli"},
+		{"pa-arth/promptster-cli", "pa-arth/promptster-cli"}, // owner/name as the key: segment is the OWNER, not the repo
+	}
+	for _, c := range bad {
+		if err := checkRepoAttribution(c.key, c.slug); err == nil {
+			t.Fatalf("(%q, %q) should be refused", c.key, c.slug)
 		}
 	}
 }

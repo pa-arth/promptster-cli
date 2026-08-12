@@ -102,6 +102,19 @@ is recorded on every row as an analysis covariate.
 
 The position state is *the log itself*, so no counter can drift away from the rows.
 
+**`open` refuses a task key whose repo segment contradicts the checkout.** The
+stratum is repo × class, so the repo decides which permuted-block sequence the
+arm comes from — and the log is append-only, so nothing about a wrong one can be
+fixed afterwards. It went wrong once for real before the guard existed: a
+promptster-backend task opened from the promptster-teams checkout drew from
+`pa-arth/promptster-teams|feature` (batch-1 prereg amendment A2). It refuses
+rather than warns, because by the time anyone reads the log it is too late, and
+both escapes produce a correct row rather than silencing the check: pass
+`--repo <owner>/<name>` for the repo the work really lands in, or use a task key
+with no `/`, which claims no repo. Re-opening a task that already drew its arm is
+never blocked — that draw is immutable, so refusing would cost work and protect
+nothing.
+
 **Cross-implementation agreement is VERIFIED** (2026-08-12). `vectors_test.go`
 asserts this Go allocator against `testdata/experiment-block-vectors.json`, a
 verbatim copy of the backend's
