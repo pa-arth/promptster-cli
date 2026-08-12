@@ -47,6 +47,8 @@ func main() {
 		os.Exit(cmdLog(args))
 	case "sync-payload":
 		os.Exit(cmdSyncPayload(args))
+	case "sync":
+		os.Exit(cmdSync(args))
 	case "hook":
 		os.Exit(runHook(args))
 	case "install-hooks":
@@ -70,6 +72,8 @@ func usage() {
   close          [--task <key>] [--outcome merged|abandoned] [--pr <url>]
   status         show the open envelope and its arm
   log            [--events] [--json]
+  sync           [--key PSE-...] [--dry-run] [--only assignments|adherence]
+                 post unsynced assignment rows + derived adherence to the backend
   sync-payload   emit POST bodies for /v1/teams/experiments/assignment
   install-hooks  [--write <settings.json>]   (default: print the snippet)
   hook           session-start | pre-compact | user-prompt-submit  (stdin JSON)
@@ -85,6 +89,7 @@ func cmdInit(args []string) int {
 	org := fs.String("org", "", "org id (required)")
 	eng := fs.String("engineer", "", "engineer id (default: git config user.email)")
 	experiment := fs.String("experiment", defaultExperimentKey, "registered experiment key")
+	key := fs.String("key", "", "engineer key (PSE-...) for `sync`; stored 0600")
 	_ = fs.Parse(args)
 
 	if *org == "" {
@@ -96,6 +101,18 @@ func cmdInit(args []string) int {
 		engineer = defaultEngineerID()
 	}
 	cfg := Config{OrgID: *org, EngineerID: engineer, ExperimentKey: *experiment, Enabled: true}
+	// Keep an already-stored key when init is re-run to change something else —
+	// re-running init should not silently disarm sync.
+	if prev, err := loadConfig(); err == nil && prev.EngineerKey != "" {
+		cfg.EngineerKey = prev.EngineerKey
+	}
+	if *key != "" {
+		if !strings.HasPrefix(*key, "PSE-") {
+			fmt.Fprintln(os.Stderr, "error: --key must be an engineer key (PSE-...)")
+			return 2
+		}
+		cfg.EngineerKey = *key
+	}
 	if err := saveConfig(cfg); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
@@ -297,6 +314,11 @@ func cmdStatus(args []string) int {
 		fmt.Printf("open: %s (no assignment row found)\n", active.TaskKey)
 	}
 
+	// Synced-ness comes from the receipt log, never from the row: the row is
+	// immutable, so its `synced` field can never become true.
+	receipts, _ := readReceipts()
+	settled := foldReceipts(receipts).settled
+
 	counts := map[string]int{}
 	unsynced := 0
 	for _, r := range rows {
@@ -304,7 +326,7 @@ func cmdStatus(args []string) int {
 			continue
 		}
 		counts[armLabel(r.Arm)]++
-		if !r.Synced {
+		if r.Eligible && !settled["assignment|"+r.TaskKey] {
 			unsynced++
 		}
 	}
@@ -320,7 +342,7 @@ func cmdStatus(args []string) int {
 		}
 		fmt.Printf("assignments (%s): %s\n", cfg.ExperimentKey, strings.Join(parts, " "))
 		if unsynced > 0 {
-			fmt.Printf("%d row(s) not yet synced to the backend assignment log\n", unsynced)
+			fmt.Printf("%d row(s) not yet synced to the backend assignment log — run `sync`\n", unsynced)
 		}
 	}
 	return 0
@@ -368,7 +390,7 @@ func cmdLog(args []string) int {
 // them is committed to the server's log.
 func cmdSyncPayload(args []string) int {
 	fs := flag.NewFlagSet("sync-payload", flag.ExitOnError)
-	all := fs.Bool("all", false, "include rows already marked synced")
+	all := fs.Bool("all", false, "include rows already synced")
 	_ = fs.Parse(args)
 
 	cfg, err := loadConfig()
@@ -381,12 +403,19 @@ func cmdSyncPayload(args []string) int {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
 	}
+	receipts, err := readReceipts()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+	settled := foldReceipts(receipts).settled
+
 	enc := json.NewEncoder(os.Stdout)
 	for _, r := range rows {
 		if r.OrgID != cfg.OrgID || r.ExperimentKey != cfg.ExperimentKey {
 			continue
 		}
-		if r.Synced && !*all {
+		if settled["assignment|"+r.TaskKey] && !*all {
 			continue
 		}
 		if err := enc.Encode(r.syncPayload()); err != nil {
