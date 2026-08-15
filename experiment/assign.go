@@ -110,7 +110,12 @@ type Assignment struct {
 type Envelope struct {
 	OpenedAt string `json:"openedAt"`
 	RepoRoot string `json:"repoRoot"`
-	Title    string `json:"title,omitempty"`
+	// OpenedInRepo is the slug DETECTED from the opening checkout, kept beside
+	// the declared Repo that forms the stratum. When they differ the work was
+	// dispatched from a control checkout — legitimate, and the pair is what makes
+	// it auditable afterwards instead of a discrepancy someone finds by hand.
+	OpenedInRepo string `json:"openedInRepo,omitempty"`
+	Title        string `json:"title,omitempty"`
 }
 
 // syncPayload is the exact POST body for

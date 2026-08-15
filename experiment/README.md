@@ -48,7 +48,7 @@ Verify with `$EXP status`.
 ## Use
 
 ```bash
-# in the worktree where the task will be done
+# from anywhere — the envelope is global, see below
 promptster-experiment open --task promptster-cli/task-envelope --class feature \
     --size m --title "the one artifact this session ships"
 
@@ -58,6 +58,26 @@ promptster-experiment log             # assignments
 promptster-experiment log --events    # adherence
 promptster-experiment sync-payload    # POST bodies for the backend, once 0.3 lands
 ```
+
+**One envelope is open at a time, for every checkout at once.** It used to be one
+per repo root, on the theory that one worktree means one task. Batch 1 falsified
+that in two days: every envelope was opened from a single control checkout while
+the work ran in worktrees elsewhere, so they all collided on one key. Each `open`
+silently destroyed the previous pointer — one task was orphaned 43 minutes in and
+still reads "open" with no close — and the hooks, which resolve by hashing the
+SESSION's cwd, found nothing for the sessions actually doing the work: no C1
+contract, no C2 gate, treatment delivery keyed to the wrong thing entirely.
+
+So `open` now refuses to overwrite an open envelope. Close it first, or hand over
+with `--supersede`, which records a `task_superseded` event naming the orphan —
+the handover is allowed, its disappearance is not. Closing a task by `--task`
+while a different one is open leaves the open one alone.
+
+`--repo` still decides the stratum, and the stratum decides which permuted block
+the arm is drawn from. When it disagrees with the checkout — the normal case when
+dispatching from a control checkout — `open` says so and the row keeps both, as
+`repo` and `envelope.openedInRepo`. All seven of batch 1's rows had that
+disagreement and nothing recorded it.
 
 `--class ops` and `--short` (expected under 30 min) record an **exclusion row**
 rather than an assignment — C1's eligibility line excludes pure-ops sessions, and

@@ -115,20 +115,35 @@ func recordEvent(e Event) error {
 	return appendJSONL(eventsPath(), e)
 }
 
-// ActiveTask points a working directory at the task whose envelope is open
-// there. One pointer per repo root (a git worktree is its own root), which
-// matches one-worktree-per-task working style and keeps parallel sessions in
-// different worktrees from stealing each other's assignment.
+// ActiveTask names the ONE task whose envelope is currently open, for every
+// checkout at once.
+//
+// It used to be one pointer per repo root, keyed by sha256(repoRoot), on the
+// theory that one worktree means one task. Batch 1 falsified that: all seven
+// envelopes were opened from a single control checkout while the work ran in
+// worktrees under other repos, so all seven hashed to the SAME key. Two things
+// followed, and both corrupted the experiment rather than merely annoying
+// anyone. Each `open` silently destroyed the previous pointer — one envelope
+// was orphaned 43 minutes in and still reads "open" in the log with no close.
+// And the hooks resolve the artifact by hashing the SESSION's cwd, so a session
+// working the assigned task from its own worktree found no pointer at all: it
+// got no C1 contract and could not arm the C2 gate, which is treatment
+// delivery keyed to the wrong thing entirely.
+//
+// One global pointer matches how the work actually happens — a control checkout
+// dispatching into worktrees — and makes silent orphaning impossible by
+// construction, because there is exactly one slot and `open` refuses to
+// overwrite an occupied one.
+//
+// RepoRoot is retained as a record of where the envelope was opened FROM. It no
+// longer selects anything.
 type ActiveTask struct {
 	TaskKey  string `json:"taskKey"`
 	RepoRoot string `json:"repoRoot"`
 	OpenedAt string `json:"openedAt"`
 }
 
-func activeTaskPath(repoRoot string) string {
-	sum := sha256.Sum256([]byte(repoRoot))
-	return filepath.Join(tasksDir(), hex.EncodeToString(sum[:])[:16]+".json")
-}
+func activeTaskPath() string { return filepath.Join(tasksDir(), "active.json") }
 
 func writeActiveTask(t ActiveTask) error {
 	if err := os.MkdirAll(tasksDir(), 0o700); err != nil {
@@ -138,12 +153,12 @@ func writeActiveTask(t ActiveTask) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(activeTaskPath(t.RepoRoot), append(data, '\n'), 0o600)
+	return os.WriteFile(activeTaskPath(), append(data, '\n'), 0o600)
 }
 
-func readActiveTask(repoRoot string) (ActiveTask, bool) {
+func readActiveTask() (ActiveTask, bool) {
 	var t ActiveTask
-	data, err := os.ReadFile(activeTaskPath(repoRoot))
+	data, err := os.ReadFile(activeTaskPath())
 	if err != nil {
 		return t, false
 	}
@@ -153,7 +168,7 @@ func readActiveTask(repoRoot string) (ActiveTask, bool) {
 	return t, t.TaskKey != ""
 }
 
-func clearActiveTask(repoRoot string) { _ = os.Remove(activeTaskPath(repoRoot)) }
+func clearActiveTask() { _ = os.Remove(activeTaskPath()) }
 
 // GateState is C2's re-anchor gate for one Claude Code session.
 type GateState struct {

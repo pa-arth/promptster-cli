@@ -56,16 +56,18 @@ func emit(o hookOutput) {
 	fmt.Fprintln(os.Stdout, string(b))
 }
 
-// taskContext resolves the open task envelope for a hook's working directory,
-// plus its assignment. A session started somewhere with no open envelope is not
-// in the experiment at all — every hook returns silently. That is deliberate:
-// an unopened session must never be nudged, or the control condition rots.
-func taskContext(cfg Config, cwd string) (Assignment, bool) {
-	if cwd == "" {
-		cwd, _ = os.Getwd()
-	}
-	root := repoRootOf(cwd)
-	active, ok := readActiveTask(root)
+// taskContext resolves the open task envelope plus its assignment. With no
+// envelope open, a session is not in the experiment at all and every hook
+// returns silently — deliberately: an unopened session must never be nudged, or
+// the control condition rots.
+//
+// It resolves that envelope for a hook firing in ANY checkout, deliberately
+// ignoring the session's cwd: the envelope is global (see ActiveTask), because
+// the session doing the work is routinely not the session that opened the task.
+// Keying this on cwd is what stopped the treatment from reaching the sessions it
+// was assigned to in batch 1.
+func taskContext(cfg Config) (Assignment, bool) {
+	active, ok := readActiveTask()
 	if !ok {
 		return Assignment{}, false
 	}
@@ -114,7 +116,7 @@ func runHook(args []string) int {
 // (systemMessage) and the model (additionalContext), and arms C2's gate when
 // the session is starting up FROM a compaction.
 func hookSessionStart(cfg Config, p hookPayload) int {
-	a, ok := taskContext(cfg, p.CWD)
+	a, ok := taskContext(cfg)
 	if !ok || !a.Eligible {
 		return 0
 	}
@@ -158,7 +160,7 @@ func hookSessionStart(cfg Config, p hookPayload) int {
 // does NOT block compaction (exit 2 would): the treatment is the re-anchor
 // after compaction, not the prevention of compaction.
 func hookPreCompact(cfg Config, p hookPayload) int {
-	a, ok := taskContext(cfg, p.CWD)
+	a, ok := taskContext(cfg)
 	if !ok || !a.Eligible {
 		return 0
 	}
