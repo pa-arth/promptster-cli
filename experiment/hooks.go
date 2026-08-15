@@ -56,16 +56,26 @@ func emit(o hookOutput) {
 	fmt.Fprintln(os.Stdout, string(b))
 }
 
-// taskContext resolves the open task envelope for a hook's working directory,
-// plus its assignment. A session started somewhere with no open envelope is not
-// in the experiment at all — every hook returns silently. That is deliberate:
-// an unopened session must never be nudged, or the control condition rots.
+// taskContext resolves the open task envelope plus its assignment. With no
+// envelope open, a session is not in the experiment at all and every hook
+// returns silently — deliberately: an unopened session must never be nudged, or
+// the control condition rots.
+//
+// It resolves that envelope by MEMBERSHIP rather than by identity: a session is
+// in scope when it sits in a checkout of the task's declared repo, or in the
+// checkout the envelope was opened from. Both halves are needed and neither is
+// sufficient.
+//
+// Identity alone (hashing the session's cwd, as before PR #9) meant the session
+// actually doing the work — dispatched into a worktree under another repo —
+// found no envelope at all, so treatment never reached the tasks it was
+// assigned to. Serving EVERY session instead would swing the error the other
+// way: an unrelated session compacting anywhere on the machine would record a
+// `compaction` against the open task and, under C2, have its prompts gated for
+// work the envelope never covered. Over-attribution corrupts adherence exactly
+// as thoroughly as under-delivery, and it also blocks a stranger's prompt.
 func taskContext(cfg Config, cwd string) (Assignment, bool) {
-	if cwd == "" {
-		cwd, _ = os.Getwd()
-	}
-	root := repoRootOf(cwd)
-	active, ok := readActiveTask(root)
+	active, ok := readActiveTask()
 	if !ok {
 		return Assignment{}, false
 	}
@@ -73,7 +83,46 @@ func taskContext(cfg Config, cwd string) (Assignment, bool) {
 	if err != nil {
 		return Assignment{}, false
 	}
-	return findAssignment(rows, cfg, active.TaskKey)
+	a, found := findAssignment(rows, cfg, active.TaskKey)
+	if !found || !sessionInScope(cwd, active, a) {
+		return Assignment{}, false
+	}
+	return a, true
+}
+
+// sessionInScope decides whether a hook firing in cwd belongs to the open
+// envelope. Repo identity is compared on the NAME half of the slug, the same
+// normalization checkRepoAttribution uses, so a worktree that resolves its slug
+// from the primary .git directory rather than a remote still matches.
+func sessionInScope(cwd string, active ActiveTask, a Assignment) bool {
+	if cwd == "" {
+		cwd, _ = os.Getwd()
+	}
+	if cwd == "" {
+		// No cwd to judge by. Serve the envelope rather than silently withhold
+		// treatment: an unserved assigned session is the failure that ended
+		// batch 1, and it is invisible, where over-attribution at least shows up
+		// in the event log as a session in the wrong place.
+		return true
+	}
+	if active.RepoRoot != "" && repoRootOf(cwd) == active.RepoRoot {
+		return true // the checkout the envelope was opened from
+	}
+	return a.Repo != "" && sameRepoName(repoSlugOf(cwd), a.Repo)
+}
+
+// sameRepoName compares two repo slugs on the name after the owner, so
+// "pa-arth/promptster-backend", "promptster-backend", and a worktree whose slug
+// falls back to a directory name all agree.
+func sameRepoName(a, b string) bool {
+	name := func(s string) string {
+		if _, after, ok := strings.Cut(s, "/"); ok {
+			return after
+		}
+		return s
+	}
+	an, bn := name(strings.TrimSpace(a)), name(strings.TrimSpace(b))
+	return an != "" && strings.EqualFold(an, bn)
 }
 
 // runHook is the single entry point for every registered Claude Code hook.

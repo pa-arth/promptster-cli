@@ -130,6 +130,7 @@ func cmdOpen(args []string) int {
 	title := fs.String("title", "", "the one artifact this task ships")
 	repo := fs.String("repo", "", "repo slug owner/name (default: detected from cwd)")
 	short := fs.Bool("short", false, "task is expected to take under 30 minutes (excluded)")
+	supersede := fs.Bool("supersede", false, "close-less handover: orphan the currently open envelope and record it")
 	_ = fs.Parse(args)
 
 	cfg, err := loadConfig()
@@ -161,9 +162,14 @@ func cmdOpen(args []string) int {
 
 	cwd, _ := os.Getwd()
 	root := repoRootOf(cwd)
+	// `detected` is what the checkout says; `repoSlug` is what the stratum will
+	// be. --repo overrides the second and must never silence the first: the
+	// stratum decides which permuted block the arm is drawn from, so an
+	// unverifiable flag choosing it is an unverifiable arm.
+	detected := repoSlugOf(cwd)
 	repoSlug := *repo
 	if repoSlug == "" {
-		repoSlug = repoSlugOf(cwd)
+		repoSlug = detected
 	}
 
 	rows, err := readAssignments()
@@ -191,7 +197,7 @@ func cmdOpen(args []string) int {
 		case *short:
 			exclusion = "under_30m"
 		}
-		env := Envelope{OpenedAt: nowUTC(), RepoRoot: root, Title: truncate(*title, 200)}
+		env := Envelope{OpenedAt: nowUTC(), RepoRoot: root, OpenedInRepo: detected, Title: truncate(*title, 200)}
 		a = newAssignment(cfg, rows, *task, repoSlug, taskClass, sizeBand, env, exclusion, time.Now())
 		if err := appendJSONL(assignmentsPath(), a); err != nil {
 			fmt.Fprintf(os.Stderr, "error: writing assignment row: %v\n", err)
@@ -199,8 +205,55 @@ func cmdOpen(args []string) int {
 		}
 	}
 
-	if err := writeActiveTask(ActiveTask{TaskKey: a.TaskKey, RepoRoot: root, OpenedAt: nowUTC()}); err != nil {
+	// Opening from a control checkout while the work lands elsewhere is the
+	// normal way this fleet works, and the global envelope supports it. What is
+	// not acceptable is it happening INVISIBLY: batch 1 recorded seven rows whose
+	// stratum named one repo and whose envelope named another, and the divergence
+	// was only found by hand two days later. Say it out loud, and the row keeps it.
+	if detected != "" && !strings.EqualFold(repoSlug, detected) {
+		fmt.Printf("note: stratum repo is %s, opened from %s — recorded as envelope.openedInRepo\n",
+			repoSlug, detected)
+	}
+
+	// Claiming the slot is one atomic syscall, not a check followed by a write:
+	// with 5-10 sessions against one state directory, two opens interleaving
+	// between those two steps would both see a free slot and the loser would
+	// vanish without a task_superseded — the silent orphan, reintroduced by the
+	// code meant to prevent it.
+	want := ActiveTask{TaskKey: a.TaskKey, RepoRoot: root, OpenedAt: nowUTC()}
+	held, claimed, err := claimActiveTask(want)
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "warning: could not write active-task pointer: %v\n", err)
+	}
+	if err == nil && !claimed {
+		switch {
+		case held.TaskKey == a.TaskKey:
+			// A re-open of the task that is already open. Refresh, don't refuse.
+			if err := writeActiveTask(want); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: could not refresh active-task pointer: %v\n", err)
+			}
+		case !*supersede:
+			fmt.Fprintf(os.Stderr,
+				"error: %q is already open (since %s).\n"+
+					"  There is ONE envelope at a time, on purpose: the previous keying let each open\n"+
+					"  silently orphan the last, and an orphaned task reads afterwards as a task that was\n"+
+					"  never worked. Close it, or hand over explicitly:\n"+
+					"    promptster-experiment close --task %s --outcome merged|abandoned\n"+
+					"    promptster-experiment open --supersede …   (records the orphan, does not close it)\n",
+				held.TaskKey, held.OpenedAt, held.TaskKey)
+			return 2
+		default:
+			_ = recordEvent(Event{
+				ComplianceEvent: "task_superseded", OrgID: cfg.OrgID, EngineerID: cfg.EngineerID,
+				TaskKey: held.TaskKey, ExperimentKey: cfg.ExperimentKey, Source: "cli",
+				Detail: "superseded by " + a.TaskKey,
+			})
+			if err := writeActiveTask(want); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: could not write active-task pointer: %v\n", err)
+			}
+			fmt.Printf("note: %s left open and superseded by %s — recorded, still needs a close\n",
+				held.TaskKey, a.TaskKey)
+		}
 	}
 
 	event := "task_open"
@@ -252,14 +305,12 @@ func cmdClose(args []string) int {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
 	}
-	cwd, _ := os.Getwd()
-	root := repoRootOf(cwd)
+	active, hasActive := readActiveTask()
 
 	taskKey := *task
 	if taskKey == "" {
-		active, ok := readActiveTask(root)
-		if !ok {
-			fmt.Fprintln(os.Stderr, "error: no open task envelope here; pass --task")
+		if !hasActive {
+			fmt.Fprintln(os.Stderr, "error: no open task envelope; pass --task")
 			return 2
 		}
 		taskKey = active.TaskKey
@@ -280,7 +331,12 @@ func cmdClose(args []string) int {
 		TaskKey: a.TaskKey, AssignmentID: a.AssignmentID, Arm: a.Arm,
 		ExperimentKey: cfg.ExperimentKey, Source: "cli", Detail: detail,
 	})
-	clearActiveTask(root)
+	// Only the OPEN envelope's close retires the pointer. Closing an orphan by
+	// --task must not evict whatever is currently open — that would recreate the
+	// silent-orphan bug from the other end.
+	if hasActive && active.TaskKey == a.TaskKey {
+		clearActiveTask()
+	}
 	if detail != "" {
 		fmt.Printf("closed %s (arm %s) — %s\n", a.TaskKey, armLabel(a.Arm), detail)
 	} else {
@@ -301,15 +357,13 @@ func cmdStatus(args []string) int {
 	fmt.Printf("org %s · engineer %s · experiment %s · enabled=%v · spec %s\n",
 		cfg.OrgID, cfg.EngineerID, cfg.ExperimentKey, cfg.Enabled, TreatmentSpecVersion)
 
-	cwd, _ := os.Getwd()
-	root := repoRootOf(cwd)
 	rows, _ := readAssignments()
 
-	if active, ok := readActiveTask(root); !ok {
-		fmt.Printf("no open task envelope in %s\n", root)
+	if active, ok := readActiveTask(); !ok {
+		fmt.Println("no open task envelope")
 	} else if a, found := findAssignment(rows, cfg, active.TaskKey); found {
-		fmt.Printf("open: %s · arm %s · stratum %s · opened %s\n",
-			a.TaskKey, armLabel(a.Arm), a.Stratum, active.OpenedAt)
+		fmt.Printf("open: %s · arm %s · stratum %s · opened %s (from %s)\n",
+			a.TaskKey, armLabel(a.Arm), a.Stratum, active.OpenedAt, active.RepoRoot)
 	} else {
 		fmt.Printf("open: %s (no assignment row found)\n", active.TaskKey)
 	}

@@ -115,36 +115,96 @@ func recordEvent(e Event) error {
 	return appendJSONL(eventsPath(), e)
 }
 
-// ActiveTask points a working directory at the task whose envelope is open
-// there. One pointer per repo root (a git worktree is its own root), which
-// matches one-worktree-per-task working style and keeps parallel sessions in
-// different worktrees from stealing each other's assignment.
+// ActiveTask names the ONE task whose envelope is currently open, for every
+// checkout at once.
+//
+// It used to be one pointer per repo root, keyed by sha256(repoRoot), on the
+// theory that one worktree means one task. Batch 1 falsified that: all seven
+// envelopes were opened from a single control checkout while the work ran in
+// worktrees under other repos, so all seven hashed to the SAME key. Two things
+// followed, and both corrupted the experiment rather than merely annoying
+// anyone. Each `open` silently destroyed the previous pointer — one envelope
+// was orphaned 43 minutes in and still reads "open" in the log with no close.
+// And the hooks resolve the artifact by hashing the SESSION's cwd, so a session
+// working the assigned task from its own worktree found no pointer at all: it
+// got no C1 contract and could not arm the C2 gate, which is treatment
+// delivery keyed to the wrong thing entirely.
+//
+// One global pointer matches how the work actually happens — a control checkout
+// dispatching into worktrees — and makes silent orphaning impossible by
+// construction, because there is exactly one slot and `open` refuses to
+// overwrite an occupied one.
+//
+// RepoRoot is retained as a record of where the envelope was opened FROM. It no
+// longer selects anything.
 type ActiveTask struct {
 	TaskKey  string `json:"taskKey"`
 	RepoRoot string `json:"repoRoot"`
 	OpenedAt string `json:"openedAt"`
 }
 
-func activeTaskPath(repoRoot string) string {
-	sum := sha256.Sum256([]byte(repoRoot))
-	return filepath.Join(tasksDir(), hex.EncodeToString(sum[:])[:16]+".json")
+func activeTaskPath() string { return filepath.Join(tasksDir(), "active.json") }
+
+func marshalActiveTask(t ActiveTask) ([]byte, error) {
+	data, err := json.MarshalIndent(t, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return append(data, '\n'), nil
 }
 
 func writeActiveTask(t ActiveTask) error {
 	if err := os.MkdirAll(tasksDir(), 0o700); err != nil {
 		return err
 	}
-	data, err := json.MarshalIndent(t, "", "  ")
+	data, err := marshalActiveTask(t)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(activeTaskPath(t.RepoRoot), append(data, '\n'), 0o600)
+	return os.WriteFile(activeTaskPath(), data, 0o600)
 }
 
-func readActiveTask(repoRoot string) (ActiveTask, bool) {
-	var t ActiveTask
-	data, err := os.ReadFile(activeTaskPath(repoRoot))
+// claimActiveTask takes the single envelope slot ATOMICALLY, returning the
+// occupant when one already holds it. Checking occupancy and then writing are
+// two syscalls, and this fleet runs 5-10 sessions against the same state
+// directory: two `open`s interleaving between the check and the write would both
+// believe the slot was free and the loser would be orphaned silently, which is
+// the exact defect this file exists to make impossible. O_EXCL makes the claim
+// the same syscall as the check.
+func claimActiveTask(t ActiveTask) (ActiveTask, bool, error) {
+	if err := os.MkdirAll(tasksDir(), 0o700); err != nil {
+		return ActiveTask{}, false, err
+	}
+	data, err := marshalActiveTask(t)
 	if err != nil {
+		return ActiveTask{}, false, err
+	}
+	f, err := os.OpenFile(activeTaskPath(), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		if os.IsExist(err) {
+			held, ok := readActiveTask()
+			if ok {
+				return held, false, nil
+			}
+			// A slot holding an unreadable or empty pointer is not an envelope.
+			return ActiveTask{}, true, writeActiveTask(t)
+		}
+		return ActiveTask{}, false, err
+	}
+	defer f.Close()
+	if _, err := f.Write(data); err != nil {
+		return ActiveTask{}, false, err
+	}
+	return t, true, nil
+}
+
+func readActiveTask() (ActiveTask, bool) {
+	var t ActiveTask
+	data, err := os.ReadFile(activeTaskPath())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return adoptLegacyActiveTask()
+		}
 		return t, false
 	}
 	if err := json.Unmarshal(data, &t); err != nil {
@@ -153,7 +213,51 @@ func readActiveTask(repoRoot string) (ActiveTask, bool) {
 	return t, t.TaskKey != ""
 }
 
-func clearActiveTask(repoRoot string) { _ = os.Remove(activeTaskPath(repoRoot)) }
+// adoptLegacyActiveTask migrates a pointer written by the pre-PR-#9 binary,
+// which keyed the file sha256(repoRoot)[:16]. Without this, upgrading mid-task
+// makes the open envelope vanish: hooks stop delivering treatment and the next
+// `open` sees a free slot and orphans it — the upgrade would reproduce the bug
+// it ships the fix for. The newest legacy pointer wins (they were overwriting
+// each other anyway) and the rest are cleared, so this runs at most once.
+func adoptLegacyActiveTask() (ActiveTask, bool) {
+	entries, err := os.ReadDir(tasksDir())
+	if err != nil {
+		return ActiveTask{}, false
+	}
+	var newest ActiveTask
+	var found bool
+	var stale []string
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") || e.Name() == "active.json" {
+			continue
+		}
+		p := filepath.Join(tasksDir(), e.Name())
+		stale = append(stale, p)
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		var t ActiveTask
+		if err := json.Unmarshal(data, &t); err != nil || t.TaskKey == "" {
+			continue
+		}
+		if !found || t.OpenedAt > newest.OpenedAt {
+			newest, found = t, true
+		}
+	}
+	if !found {
+		return ActiveTask{}, false
+	}
+	if err := writeActiveTask(newest); err != nil {
+		return newest, true
+	}
+	for _, p := range stale {
+		_ = os.Remove(p)
+	}
+	return newest, true
+}
+
+func clearActiveTask() { _ = os.Remove(activeTaskPath()) }
 
 // GateState is C2's re-anchor gate for one Claude Code session.
 type GateState struct {
