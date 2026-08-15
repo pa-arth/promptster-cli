@@ -2,9 +2,12 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -54,7 +57,12 @@ func TestTreatmentReachesASessionInAnotherCheckout(t *testing.T) {
 	withTempRoot(t)
 	cfg, a, openedIn := seedTask(t, CellC1)
 
-	elsewhere := t.TempDir() // a different repo entirely, as a worktree would be
+	// A worktree of the task's declared repo ("o/r"), at a path the envelope
+	// knows nothing about — exactly the dispatch pattern batch 1 ran on.
+	elsewhere := filepath.Join(t.TempDir(), "r")
+	if err := os.MkdirAll(elsewhere, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	if elsewhere == openedIn {
 		t.Fatal("test setup: the two roots must differ")
 	}
@@ -82,8 +90,12 @@ func TestGateArmsFromAnotherCheckout(t *testing.T) {
 	withTempRoot(t)
 	cfg, a, _ := seedTask(t, CellC2)
 
+	far := filepath.Join(t.TempDir(), "r") // another worktree of the same repo
+	if err := os.MkdirAll(far, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	if code := hookPreCompact(cfg, hookPayload{
-		SessionID: "sess-far", CWD: t.TempDir(), Trigger: "auto",
+		SessionID: "sess-far", CWD: far, Trigger: "auto",
 	}); code != 0 {
 		t.Fatalf("hook returned %d", code)
 	}
@@ -97,6 +109,138 @@ func TestGateArmsFromAnotherCheckout(t *testing.T) {
 	}
 	if !hasEvent(readEventKinds(t), "compaction") {
 		t.Fatal("compaction not recorded")
+	}
+}
+
+// TestUnrelatedSessionIsNotAttributedToTheOpenTask is the mirror of the two
+// tests above, and the reason the envelope resolves by MEMBERSHIP rather than
+// simply being global. A session in an unrelated repo must get no artifact, no
+// gate, and — most importantly — must not have its compaction recorded against
+// somebody else's task. Over-attribution corrupts adherence exactly as
+// thoroughly as under-delivery, and under C2 it would gate a stranger's prompt.
+func TestUnrelatedSessionIsNotAttributedToTheOpenTask(t *testing.T) {
+	withTempRoot(t)
+	cfg, _, _ := seedTask(t, CellC1C2)
+
+	stranger := filepath.Join(t.TempDir(), "some-other-repo")
+	if err := os.MkdirAll(stranger, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	out := captureStdout(t, func() {
+		if code := hookSessionStart(cfg, hookPayload{
+			SessionID: "sess-stranger", CWD: stranger, Source: "startup",
+		}); code != 0 {
+			t.Fatalf("hook returned %d", code)
+		}
+	})
+	if out != "" {
+		t.Fatalf("unrelated session was served the treatment: %q", out)
+	}
+
+	if code := hookPreCompact(cfg, hookPayload{
+		SessionID: "sess-stranger", CWD: stranger, Trigger: "auto",
+	}); code != 0 {
+		t.Fatalf("pre-compact returned %d", code)
+	}
+	if kinds := readEventKinds(t); hasEvent(kinds, "compaction") || hasEvent(kinds, "artifact_shown") {
+		t.Fatalf("unrelated session's activity was attributed to the open task: %v", kinds)
+	}
+	if g, ok := readGate("sess-stranger"); ok && g.Armed {
+		t.Fatal("unrelated session had C2's gate armed against it")
+	}
+}
+
+// TestLegacyPointerIsAdoptedOnUpgrade covers the upgrade path. A pointer written
+// by the pre-#9 binary lives under sha256(repoRoot)[:16].json; if the new binary
+// ignored it, upgrading mid-task would make the open envelope vanish — hooks
+// stop delivering and the next open sees a free slot and orphans it. The upgrade
+// would reproduce the very bug it ships the fix for.
+func TestLegacyPointerIsAdoptedOnUpgrade(t *testing.T) {
+	withTempRoot(t)
+	if err := os.MkdirAll(tasksDir(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	legacy := ActiveTask{TaskKey: "o/legacy", RepoRoot: "/some/root", OpenedAt: "2026-08-14T00:00:00Z"}
+	older := ActiveTask{TaskKey: "o/older", RepoRoot: "/other/root", OpenedAt: "2026-08-10T00:00:00Z"}
+	for name, v := range map[string]ActiveTask{"aaaaaaaaaaaaaaaa.json": older, "bbbbbbbbbbbbbbbb.json": legacy} {
+		data, err := marshalActiveTask(v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(tasksDir(), name), data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, ok := readActiveTask()
+	if !ok {
+		t.Fatal("legacy pointer was not adopted; the open envelope would vanish on upgrade")
+	}
+	if got.TaskKey != "o/legacy" {
+		t.Fatalf("adopted %q, want the newest legacy pointer o/legacy", got.TaskKey)
+	}
+
+	// Adoption is a migration, not a lasting compatibility shim.
+	entries, err := os.ReadDir(tasksDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "active.json" {
+		t.Fatalf("legacy files survived adoption: %d entries", len(entries))
+	}
+}
+
+// TestClaimActiveTaskIsAtomic pins the fix for the check-then-write race. The
+// occupancy test and the write must be one syscall, or two concurrent opens both
+// see a free slot and the loser is orphaned with no task_superseded — which is
+// the defect this whole file exists to prevent, reintroduced by its own fix.
+func TestClaimActiveTaskIsAtomic(t *testing.T) {
+	withTempRoot(t)
+
+	// Sequential first: the contract. A refused claim reports the occupant and
+	// leaves the slot alone.
+	if _, claimed, err := claimActiveTask(
+		ActiveTask{TaskKey: "o/first", RepoRoot: "/a", OpenedAt: nowUTC()}); err != nil || !claimed {
+		t.Fatalf("first claim: claimed=%v err=%v", claimed, err)
+	}
+	held, claimed, err := claimActiveTask(
+		ActiveTask{TaskKey: "o/second", RepoRoot: "/b", OpenedAt: nowUTC()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed || held.TaskKey != "o/first" {
+		t.Fatalf("second claim: claimed=%v held=%q", claimed, held.TaskKey)
+	}
+	if got, _ := readActiveTask(); got.TaskKey != "o/first" {
+		t.Fatalf("a refused claim mutated the slot: %+v", got)
+	}
+
+	// Then the race itself, which is the whole point and which a sequential test
+	// cannot see: a check followed by a write passes this contract and still
+	// loses a task when two opens interleave.
+	clearActiveTask()
+	const racers = 16
+	var wg sync.WaitGroup
+	var wins atomic.Int32
+	start := make(chan struct{})
+	for i := range racers {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			if _, ok, err := claimActiveTask(ActiveTask{
+				TaskKey: fmt.Sprintf("o/racer-%d", i), RepoRoot: "/r", OpenedAt: nowUTC(),
+			}); err == nil && ok {
+				wins.Add(1)
+			}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	if got := wins.Load(); got != 1 {
+		t.Fatalf("%d concurrent claims won the single slot; exactly one may, or the losers are orphaned silently", got)
 	}
 }
 

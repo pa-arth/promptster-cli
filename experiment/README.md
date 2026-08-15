@@ -68,10 +68,23 @@ still reads "open" with no close — and the hooks, which resolve by hashing the
 SESSION's cwd, found nothing for the sessions actually doing the work: no C1
 contract, no C2 gate, treatment delivery keyed to the wrong thing entirely.
 
-So `open` now refuses to overwrite an open envelope. Close it first, or hand over
-with `--supersede`, which records a `task_superseded` event naming the orphan —
-the handover is allowed, its disappearance is not. Closing a task by `--task`
-while a different one is open leaves the open one alone.
+So `open` now refuses to overwrite an open envelope — atomically, via `O_EXCL`,
+because a check followed by a write is not a guard when 5-10 sessions share one
+state directory. Close it first, or hand over with `--supersede`, which records a
+`task_superseded` event naming the orphan — the handover is allowed, its
+disappearance is not. Closing a task by `--task` while a different one is open
+leaves the open one alone.
+
+Global does **not** mean every session is in the experiment. A hook is served
+only when its cwd is a checkout of the task's declared repo, or the checkout the
+envelope was opened from. Serving everyone would swap under-delivery for
+over-attribution: an unrelated session compacting elsewhere on the machine would
+record a `compaction` against the open task and, under C2, have its prompts
+gated for work the envelope never covered.
+
+Upgrading across this change adopts a pointer left by the old binary (the newest
+one, if several) and clears the rest, so an envelope open at upgrade time does
+not vanish into exactly the bug being fixed.
 
 `--repo` still decides the stratum, and the stratum decides which permuted block
 the arm is drawn from. When it disagrees with the checkout — the normal case when

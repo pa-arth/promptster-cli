@@ -145,27 +145,116 @@ type ActiveTask struct {
 
 func activeTaskPath() string { return filepath.Join(tasksDir(), "active.json") }
 
+func marshalActiveTask(t ActiveTask) ([]byte, error) {
+	data, err := json.MarshalIndent(t, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return append(data, '\n'), nil
+}
+
 func writeActiveTask(t ActiveTask) error {
 	if err := os.MkdirAll(tasksDir(), 0o700); err != nil {
 		return err
 	}
-	data, err := json.MarshalIndent(t, "", "  ")
+	data, err := marshalActiveTask(t)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(activeTaskPath(), append(data, '\n'), 0o600)
+	return os.WriteFile(activeTaskPath(), data, 0o600)
+}
+
+// claimActiveTask takes the single envelope slot ATOMICALLY, returning the
+// occupant when one already holds it. Checking occupancy and then writing are
+// two syscalls, and this fleet runs 5-10 sessions against the same state
+// directory: two `open`s interleaving between the check and the write would both
+// believe the slot was free and the loser would be orphaned silently, which is
+// the exact defect this file exists to make impossible. O_EXCL makes the claim
+// the same syscall as the check.
+func claimActiveTask(t ActiveTask) (ActiveTask, bool, error) {
+	if err := os.MkdirAll(tasksDir(), 0o700); err != nil {
+		return ActiveTask{}, false, err
+	}
+	data, err := marshalActiveTask(t)
+	if err != nil {
+		return ActiveTask{}, false, err
+	}
+	f, err := os.OpenFile(activeTaskPath(), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		if os.IsExist(err) {
+			held, ok := readActiveTask()
+			if ok {
+				return held, false, nil
+			}
+			// A slot holding an unreadable or empty pointer is not an envelope.
+			return ActiveTask{}, true, writeActiveTask(t)
+		}
+		return ActiveTask{}, false, err
+	}
+	defer f.Close()
+	if _, err := f.Write(data); err != nil {
+		return ActiveTask{}, false, err
+	}
+	return t, true, nil
 }
 
 func readActiveTask() (ActiveTask, bool) {
 	var t ActiveTask
 	data, err := os.ReadFile(activeTaskPath())
 	if err != nil {
+		if os.IsNotExist(err) {
+			return adoptLegacyActiveTask()
+		}
 		return t, false
 	}
 	if err := json.Unmarshal(data, &t); err != nil {
 		return t, false
 	}
 	return t, t.TaskKey != ""
+}
+
+// adoptLegacyActiveTask migrates a pointer written by the pre-PR-#9 binary,
+// which keyed the file sha256(repoRoot)[:16]. Without this, upgrading mid-task
+// makes the open envelope vanish: hooks stop delivering treatment and the next
+// `open` sees a free slot and orphans it — the upgrade would reproduce the bug
+// it ships the fix for. The newest legacy pointer wins (they were overwriting
+// each other anyway) and the rest are cleared, so this runs at most once.
+func adoptLegacyActiveTask() (ActiveTask, bool) {
+	entries, err := os.ReadDir(tasksDir())
+	if err != nil {
+		return ActiveTask{}, false
+	}
+	var newest ActiveTask
+	var found bool
+	var stale []string
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") || e.Name() == "active.json" {
+			continue
+		}
+		p := filepath.Join(tasksDir(), e.Name())
+		stale = append(stale, p)
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		var t ActiveTask
+		if err := json.Unmarshal(data, &t); err != nil || t.TaskKey == "" {
+			continue
+		}
+		if !found || t.OpenedAt > newest.OpenedAt {
+			newest, found = t, true
+		}
+	}
+	if !found {
+		return ActiveTask{}, false
+	}
+	if err := writeActiveTask(newest); err != nil {
+		return newest, true
+	}
+	for _, p := range stale {
+		_ = os.Remove(p)
+	}
+	return newest, true
 }
 
 func clearActiveTask() { _ = os.Remove(activeTaskPath()) }

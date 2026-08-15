@@ -215,8 +215,24 @@ func cmdOpen(args []string) int {
 			repoSlug, detected)
 	}
 
-	if active, ok := readActiveTask(); ok && active.TaskKey != a.TaskKey {
-		if !*supersede {
+	// Claiming the slot is one atomic syscall, not a check followed by a write:
+	// with 5-10 sessions against one state directory, two opens interleaving
+	// between those two steps would both see a free slot and the loser would
+	// vanish without a task_superseded — the silent orphan, reintroduced by the
+	// code meant to prevent it.
+	want := ActiveTask{TaskKey: a.TaskKey, RepoRoot: root, OpenedAt: nowUTC()}
+	held, claimed, err := claimActiveTask(want)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not write active-task pointer: %v\n", err)
+	}
+	if err == nil && !claimed {
+		switch {
+		case held.TaskKey == a.TaskKey:
+			// A re-open of the task that is already open. Refresh, don't refuse.
+			if err := writeActiveTask(want); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: could not refresh active-task pointer: %v\n", err)
+			}
+		case !*supersede:
 			fmt.Fprintf(os.Stderr,
 				"error: %q is already open (since %s).\n"+
 					"  There is ONE envelope at a time, on purpose: the previous keying let each open\n"+
@@ -224,20 +240,20 @@ func cmdOpen(args []string) int {
 					"  never worked. Close it, or hand over explicitly:\n"+
 					"    promptster-experiment close --task %s --outcome merged|abandoned\n"+
 					"    promptster-experiment open --supersede …   (records the orphan, does not close it)\n",
-				active.TaskKey, active.OpenedAt, active.TaskKey)
+				held.TaskKey, held.OpenedAt, held.TaskKey)
 			return 2
+		default:
+			_ = recordEvent(Event{
+				ComplianceEvent: "task_superseded", OrgID: cfg.OrgID, EngineerID: cfg.EngineerID,
+				TaskKey: held.TaskKey, ExperimentKey: cfg.ExperimentKey, Source: "cli",
+				Detail: "superseded by " + a.TaskKey,
+			})
+			if err := writeActiveTask(want); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: could not write active-task pointer: %v\n", err)
+			}
+			fmt.Printf("note: %s left open and superseded by %s — recorded, still needs a close\n",
+				held.TaskKey, a.TaskKey)
 		}
-		_ = recordEvent(Event{
-			ComplianceEvent: "task_superseded", OrgID: cfg.OrgID, EngineerID: cfg.EngineerID,
-			TaskKey: active.TaskKey, ExperimentKey: cfg.ExperimentKey, Source: "cli",
-			Detail: "superseded by " + a.TaskKey,
-		})
-		fmt.Printf("note: %s left open and superseded by %s — recorded, still needs a close\n",
-			active.TaskKey, a.TaskKey)
-	}
-
-	if err := writeActiveTask(ActiveTask{TaskKey: a.TaskKey, RepoRoot: root, OpenedAt: nowUTC()}); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: could not write active-task pointer: %v\n", err)
 	}
 
 	event := "task_open"
