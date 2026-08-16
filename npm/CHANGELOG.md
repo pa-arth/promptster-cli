@@ -1,5 +1,19 @@
 # CLI Changelog
 
+## 1.6.0 - 2026-08-16
+
+- feat(tools): Codex- and Cursor-only assessments now work end to end. Early preflight used to hard-require the `claude` binary before the assessment's tools were even known, so a candidate assigned Codex or Cursor was blocked by a tool they were never asked to use. Preflight now checks only the selected tools, warns and drops any that are missing, and hard-fails only when none are usable; Cursor is detected via a PATH shim or its macOS app bundle. Missing run/test toolchain binaries are advisory, never a gate
+- feat(tools): warnings, `doctor`, and the brief all name the tool the candidate is actually using. The "already running — restart it" warning and the proxy-skip step follow the active tools instead of assuming Claude Code, and `promptster doctor` gained Codex-binary, Cursor-editor, and Cursor-hooks checks while scoping its Claude checks to Claude assessments. The brief's time bar carries a tool chip ("Claude Code · Codex CLI") with a matching Logistics row, and omits it cleanly on older sessions
+- feat(redeem): when a recruiter turns on BYO-subscription for an assessment, the candidate no longer has to know to pass `--byo-subscription`. `promptster redeem` stores the recruiter-set auth mode with the session and `promptster start` activates the BYO path from it — the flag still works, and either source turns it on
+- feat(capture): interrupts are captured. Pressing ESC or Ctrl+C to stop Claude mid-turn says something real about how a candidate steers, and it left no trace in the record before this
+- fix(capture): the `planning` signal came back from the dead. Claude Code renamed TodoWrite/TodoRead to TaskCreate/TaskUpdate/TaskList, and because a rename doesn't throw, the normalizer went on matching only the old names and silently recorded nothing — TodoWrite=0 against TaskUpdate=43 and TaskCreate=25 across three days of real transcripts. The new tools aren't shape-compatible with the old ones and are now handled on their own terms, with `TaskList` recorded as a read
+
+Internal only, and deliberately not part of the candidate CLI: the fleet
+practice-effect experiment harness (`promptster-experiment` — its own package and
+its own binary, excluded from `make build` and the release cross-compile) gained
+task envelopes with pre-work arm assignment, backend sync for the assignment log,
+and a fix for envelopes that resolved by checkout rather than by assignment.
+
 ## 1.5.0 - 2026-06-15
 
 - feat(brief): `promptster brief` now opens a live, structured brief in its own terminal window by default, so the task stays on-screen beside the candidate's editor instead of scrolling away. The viewer is a scrollable Bubbletea TUI with a sticky header, a live countdown + color-coded progress bar, and per-phase cards — fed by a new structured brief (scenario, codebase orientation, ordered phases, evaluation dimensions, ground rules, deliverables) threaded through from the backend. `--here` keeps it in the current terminal, `--plain` prints once for piped/no-TTY use, `--json` emits machine-readable output, and `--demo` previews the viewer without a live session
