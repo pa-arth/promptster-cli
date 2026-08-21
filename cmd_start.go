@@ -40,6 +40,7 @@ func cmdStart(args []string) {
 	verbose := fs.Bool("verbose", false, "Print every step as it happens (for debugging setup)")
 	toolsFlag := fs.String("tools", "", "AI tool(s) to instrument: claude|codex|cursor|all or a comma list (skips the interactive prompt)")
 	byoFlag := fs.Bool("byo-subscription", false, "Use your own Claude/OpenAI subscription: skip the Promptster proxy; capture via transcripts, cost estimated from transcript token usage")
+	noEditorExt := fs.Bool("no-editor-extension", false, "Skip installing the Promptster editor extension into VS Code/Cursor (the session records that editor attention capture was unavailable)")
 	fs.Parse(args) //nolint:errcheck
 	startVerbose = *verbose
 
@@ -484,6 +485,19 @@ func cmdStart(args []string) {
 		}
 	}
 
+	// Editor attention capture ────────────────────────────────────────────────
+	// Installing the extension that records which files the CANDIDATE opened, as
+	// opposed to which files the agent read. Deliberately here, beside the editor
+	// detection above, and deliberately NOT a numbered step: it is best-effort.
+	//
+	// Non-fatal, without exception. A candidate working in vim, on a locked-down
+	// machine, or behind an editor CLI that will not cooperate finishes the
+	// assessment exactly as before. What changes is that the session then says
+	// capture was unavailable, so a reviewer never reads that silence as a
+	// candidate who opened no files.
+	editorCapture := installEditorExtension(!*noEditorExt)
+	printEditorCaptureLine(editorCapture)
+
 	// [6/7] Save session + verify setup ───────────────────────────────────────
 	startStep(6, 7, "Verifying setup...")
 	session.StartedAt = time.Now().UTC()
@@ -496,6 +510,11 @@ func cmdStart(args []string) {
 		os.Exit(1)
 	}
 	endStep(6, 7, "Verifying setup", "")
+
+	// Record editor-capture availability on the session. Best-effort delivery,
+	// but not optional information: absence-of-capture and absence-of-behaviour
+	// are different states and only one of them is about the candidate.
+	recordEditorCapture(&session, editorCapture)
 
 	// Device continuity check — fire-and-forget
 	if session.SessionToken != "" {

@@ -348,6 +348,15 @@ func cmdDoctor() {
 	})
 	fmt.Println()
 
+	// Editor attention capture — installed, activated, and capturing.
+	// Deliberately before Connectivity: all three of these are local facts, and
+	// a candidate reading this list wants the local ones together.
+	workspaceForEditor := ""
+	if sessionErr == nil {
+		workspaceForEditor = session.TaskRoot
+	}
+	doctorEditorExtension(workspaceForEditor)
+
 	fmt.Println("Connectivity")
 	check("API reachable", func() (string, string) {
 		if err := apiHealth(); err != nil {

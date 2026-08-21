@@ -47,3 +47,34 @@ $(DIST):
 
 clean:
 	rm -rf bin dist
+
+# Embed a new promptster-vscode extension build.
+#
+# The .vsix is embedded rather than downloaded: an assessment must not depend on
+# a release host being reachable at the moment a candidate begins. Its checksum
+# is pinned in vsix/embedded.go and asserted against the bytes by a test, so the
+# recorded checksum is a fact about this commit rather than a claim about it.
+#
+#   make embed-vsix VSIX=../promptster-vscode/dist-vsix/promptster-0.3.0.vsix
+#
+# Build that artifact with promptster-vscode/scripts/build-vsix.sh, which is
+# reproducible — check out the tag, rebuild, and you get the same bytes.
+.PHONY: embed-vsix
+embed-vsix:
+	@test -n "$(VSIX)" || (echo "usage: make embed-vsix VSIX=<path to .vsix>" >&2; exit 1)
+	@test -f "$(VSIX)" || (echo "no such file: $(VSIX)" >&2; exit 1)
+	@version=$$(basename "$(VSIX)" .vsix | sed 's/^promptster-//'); \
+	sha=$$(shasum -a 256 "$(VSIX)" | cut -d' ' -f1); \
+	old=$$(ls vsix/*.vsix 2>/dev/null || true); \
+	rm -f $$old; \
+	cp "$(VSIX)" "vsix/promptster-$$version.vsix"; \
+	sed -i.bak -E \
+	  -e "s|//go:embed promptster-.*\.vsix|//go:embed promptster-$$version.vsix|" \
+	  -e "s|Version = \"[^\"]*\"|Version = \"$$version\"|" \
+	  -e "s|SourceTag = \"[^\"]*\"|SourceTag = \"v$$version\"|" \
+	  -e "s|SHA256 = \"[^\"]*\"|SHA256 = \"$$sha\"|" \
+	  vsix/embedded.go; \
+	rm -f vsix/embedded.go.bak; \
+	echo "embedded promptster-$$version.vsix"; \
+	echo "  sha256 $$sha"
+	@go test ./vsix/
