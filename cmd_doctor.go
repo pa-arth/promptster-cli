@@ -23,7 +23,9 @@ func cmdDoctor() {
 	// default) so a fresh machine still gets a meaningful environment check.
 	claudeRelevant := sessionErr != nil || hasTool(session.Tools, toolClaude)
 	codexRelevant := codexProxyConfigured() || (sessionErr == nil && hasTool(session.Tools, toolCodex))
-	cursorRelevant := sessionErr == nil && hasTool(session.Tools, toolCursor)
+	// Cursor used to be a third relevant tool here. openspec
+	// changes/employer-supplied-model-key retired it as a selectable tool, so
+	// there is no Cursor binary check and no Cursor hooks section any more.
 
 	fmt.Println("Promptster Doctor")
 	fmt.Println(strings.Repeat("─", 44))
@@ -62,17 +64,6 @@ func cmdDoctor() {
 				return "", "codex not found in PATH\n    Fix: " + toolInstallHint(toolCodex)
 			}
 			return p, ""
-		})
-	}
-	if cursorRelevant {
-		check("cursor editor", func() (string, string) {
-			if !cursorInstalled() {
-				return "", "Cursor not detected\n    Fix: " + toolInstallHint(toolCursor)
-			}
-			if p, err := exec.LookPath("cursor"); err == nil {
-				return p, ""
-			}
-			return "app detected (cursor CLI not on PATH — open Cursor manually)", ""
 		})
 	}
 	check("promptster binary installed", func() (string, string) {
@@ -304,25 +295,6 @@ func cmdDoctor() {
 					"\n    Fix: re-run promptster start, or source it in the current shell:\n      source " + shellPath
 			}
 			return strings.Join(sourced, ", "), ""
-		})
-		fmt.Println()
-	}
-
-	if cursorRelevant && sessionErr == nil && session.TaskRoot != "" {
-		fmt.Println("Cursor hooks")
-		cursorPath := cursorHooksPath(session.TaskRoot)
-		check("Cursor hooks file", func() (string, string) {
-			cfg, err := readSettings(cursorPath)
-			if err != nil {
-				if os.IsNotExist(err) {
-					return "", "missing: " + cursorPath + "\n    Fix: run promptster start --tools cursor"
-				}
-				return "", "invalid JSON at " + cursorPath + ": " + err.Error() + "\n    Fix: re-run promptster start"
-			}
-			if !isCursorHookConfigured(cfg) {
-				return "", "Promptster hooks not registered in " + cursorPath + "\n    Fix: re-run promptster start"
-			}
-			return cursorPath, ""
 		})
 		fmt.Println()
 	}

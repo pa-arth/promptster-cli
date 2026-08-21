@@ -10,15 +10,32 @@ import (
 )
 
 // AI tool identifiers Promptster can instrument.
+//
+// Cursor was a third member until openspec changes/employer-supplied-model-key.
+// It routes Agent/Edit model traffic through its own backend, so a key the
+// hiring team supplies can be neither used nor metered on it — which made a
+// Cursor assessment candidate-pays by construction, the one arrangement this
+// product no longer offers. Cursor remains a perfectly good editor to work in;
+// it is not an instrumented agent.
 const (
 	toolClaude = "claude"
 	toolCodex  = "codex"
-	toolCursor = "cursor"
 )
+
+// retiredToolCursor is kept as a RECOGNISED token, not deleted.
+//
+// The distinction it preserves is the whole point: "cursor" is a tool we know
+// about and no longer offer, which is a different fact from a typo or a token
+// from a newer server. Collapsing the two would send a cursor-only assessment
+// down the unknown-token path, and that path deliberately falls back to the
+// full tool set — silently converting "this assessment runs on Cursor" into
+// "this assessment runs on Claude Code and Codex", on the candidate's machine,
+// with nobody told.
+const retiredToolCursor = "cursor"
 
 // allTools is the canonical ordering used when "all" is selected and when
 // rendering labels, so output is deterministic regardless of input order.
-var allTools = []string{toolClaude, toolCodex, toolCursor}
+var allTools = []string{toolClaude, toolCodex}
 
 // normalizeToolToken maps a single user-supplied token to a canonical tool id,
 // or "" if unrecognized.
@@ -28,16 +45,26 @@ func normalizeToolToken(tok string) string {
 		return toolClaude
 	case toolCodex, "codex-cli", "codexcli":
 		return toolCodex
-	case toolCursor, "cursor-cli", "cursorcli":
-		return toolCursor
 	default:
 		return ""
 	}
 }
 
+// isRetiredToolToken reports whether tok names a tool Promptster used to
+// instrument and no longer does. Separate from normalizeToolToken so callers can
+// tell "retired" from "unrecognised" and say something true about each.
+func isRetiredToolToken(tok string) bool {
+	switch strings.ToLower(strings.TrimSpace(tok)) {
+	case retiredToolCursor, "cursor-cli", "cursorcli":
+		return true
+	default:
+		return false
+	}
+}
+
 // parseToolsFlag converts the --tools flag value into a normalized tool list.
-// Accepts a single tool ("claude"/"codex"/"cursor"), a comma-separated list
-// ("claude,cursor"), "all" (every tool), or "both" (claude+codex, kept for
+// Accepts a single tool ("claude"/"codex"), a comma-separated list
+// ("claude,codex"), "all" (every tool), or "both" (claude+codex, kept for
 // back-compat with the codex rollout). Returns nil for an empty/unrecognized
 // value so the caller can fall back to the interactive menu.
 func parseToolsFlag(v string) []string {
@@ -87,18 +114,45 @@ func hasTool(tools []string, tool string) bool {
 }
 
 // resolveAllowedTools normalizes the recruiter-chosen allowed set into canonical
-// tool ids in the canonical order, dropping unknown/duplicate entries. An
-// empty/nil input (older server that doesn't send allowedTools) falls back to
-// all three tools, preserving the pre-allowedTools behavior.
-func resolveAllowedTools(allowed []string) []string {
-	if len(allowed) == 0 {
-		return append([]string(nil), allTools...)
+// tool ids in the canonical order, dropping unknown/duplicate entries.
+//
+// It returns the resolved set and whether the assessment is RETIRED-ONLY: the
+// recruiter named tools, every one of them is a tool we no longer instrument,
+// and the resolved set is therefore empty. That is not the same as "unknown
+// tokens" and must not be treated as it.
+//
+// THE THREE EMPTY CASES ARE THREE DIFFERENT FACTS.
+//
+//   - `allowed == nil` — the server never sent the field (pre-allowedTools
+//     server). Unconstrained; fall back to every tool, as before.
+//   - `allowed` names only tokens we do not recognise — a newer server naming a
+//     tool this CLI predates. Fall back to every tool rather than locking the
+//     candidate out over a version skew.
+//   - `allowed` names only RETIRED tools — a cursor-only assessment. Return
+//     EMPTY. Falling back here would take an assessment the recruiter configured
+//     for Cursor and silently run it on Claude Code and Codex instead, on the
+//     candidate's machine, billed to the org, with nobody told. The candidate
+//     gets an explicit stop and the recruiter gets told to fix the assessment.
+//
+// A non-nil, genuinely empty `allowed` is the server having filtered a retired
+// tool out before sending, which is the same fact as the third case.
+func resolveAllowedTools(allowed []string) (tools []string, retiredOnly bool) {
+	if allowed == nil {
+		return append([]string(nil), allTools...), false
 	}
 	seen := map[string]bool{}
+	sawRetired := false
+	sawUnknown := false
 	for _, a := range allowed {
 		if t := normalizeToolToken(a); t != "" {
 			seen[t] = true
+			continue
 		}
+		if isRetiredToolToken(a) {
+			sawRetired = true
+			continue
+		}
+		sawUnknown = true
 	}
 	var ordered []string
 	for _, t := range allTools {
@@ -106,12 +160,19 @@ func resolveAllowedTools(allowed []string) []string {
 			ordered = append(ordered, t)
 		}
 	}
-	if len(ordered) == 0 {
-		// allowedTools contained only unknown tokens — treat as unconstrained
-		// rather than locking the candidate out entirely.
-		return append([]string(nil), allTools...)
+	if len(ordered) > 0 {
+		return ordered, false
 	}
-	return ordered
+	// Nothing usable resolved. A server that sent an explicitly empty list, or a
+	// list of nothing but retired tools, is telling us this assessment has no
+	// instrumented agent — say so. Only an unrecognised-token skew falls back.
+	if sawRetired || len(allowed) == 0 {
+		return nil, true
+	}
+	if sawUnknown {
+		return append([]string(nil), allTools...), false
+	}
+	return nil, true
 }
 
 // intersectTools returns the elements of tools that are also in allowed,
@@ -129,8 +190,11 @@ func intersectTools(tools, allowed []string) []string {
 // selectTools resolves which AI tools to install hooks for, constrained to the
 // recruiter-chosen allowed set.
 //
-//   - allowed is normalized to the canonical {claude,codex,cursor} subset; an
-//     empty/nil allowed falls back to all three (older server, unconstrained).
+//   - allowed is normalized to the canonical {claude,codex} subset; a nil
+//     allowed falls back to both (older server, unconstrained).
+//   - An assessment whose allowed set is nothing but RETIRED tools stops here
+//     with an explanation. See resolveAllowedTools for why that case must not
+//     fall back.
 //   - If toolsFlag is set (non-interactive / CI), it is parsed and INTERSECTED
 //     with the allowed set: tools the recruiter didn't allow are dropped with a
 //     warning; a fully-disjoint request errors out (returns nil after printing
@@ -142,10 +206,33 @@ func intersectTools(tools, allowed []string) []string {
 // Returns nil when the candidate's --tools request shares nothing with the
 // allowed set — the caller treats that as a fatal selection error.
 func selectTools(toolsFlag string, allowed []string) []string {
-	allowedSet := resolveAllowedTools(allowed)
+	allowedSet, retiredOnly := resolveAllowedTools(allowed)
 
 	warn := lipgloss.NewStyle().Foreground(cWarnText).Bold(true)
 	dim := lipgloss.NewStyle().Foreground(cDim)
+
+	if retiredOnly {
+		// Say what is true and who can fix it. The candidate cannot: allowed_tools
+		// is the recruiter's setting, and there is no flag that overrides it.
+		fmt.Fprintf(os.Stderr, "error: this assessment has no instrumented AI tool configured.\n")
+		fmt.Fprintf(os.Stderr, "  It was set up for Cursor, which Promptster no longer instruments — Cursor\n")
+		fmt.Fprintf(os.Stderr, "  routes model traffic through its own backend, so the hiring team's key\n")
+		fmt.Fprintf(os.Stderr, "  cannot be used or metered on it.\n\n")
+		fmt.Fprintf(os.Stderr, "  You have done nothing wrong and there is nothing to retry. Ask the person\n")
+		fmt.Fprintf(os.Stderr, "  who sent you this assessment to switch it to Claude Code or Codex.\n")
+		return nil
+	}
+
+	// A candidate whose instructions still say `--tools cursor` gets told, rather
+	// than silently dropped into the menu as if they had asked for nothing.
+	for _, part := range strings.Split(toolsFlag, ",") {
+		if isRetiredToolToken(part) {
+			fmt.Printf("  %s %s\n",
+				warn.Render("!"),
+				warn.Render("Cursor is no longer instrumented by Promptster — ignoring it. You can still work in Cursor as your editor."))
+			break
+		}
+	}
 
 	if parsed := parseToolsFlag(toolsFlag); parsed != nil {
 		// Warn about any requested tool the recruiter didn't allow, then drop it.
@@ -216,8 +303,6 @@ func toolBaseName(tool string) string {
 		return "Claude Code"
 	case toolCodex:
 		return "Codex CLI"
-	case toolCursor:
-		return "Cursor"
 	default:
 		return tool
 	}
@@ -226,7 +311,7 @@ func toolBaseName(tool string) string {
 // toolBetaSuffix returns "(beta)" for the newer integrations, "" otherwise.
 func toolBetaSuffix(tool string) string {
 	switch tool {
-	case toolCodex, toolCursor:
+	case toolCodex:
 		return "(beta)"
 	default:
 		return ""
@@ -241,8 +326,6 @@ func toolDisplayName(tool string) string {
 		return "Claude Code"
 	case toolCodex:
 		return "Codex CLI (beta)"
-	case toolCursor:
-		return "Cursor (beta)"
 	default:
 		return tool
 	}

@@ -38,8 +38,19 @@ func cmdStart(args []string) {
 	workspaceFlag := fs.String("workspace", "", "Workspace path (skip interactive prompt)")
 	restart := fs.Bool("restart", false, "Offer to kill running editors so they reload hooks")
 	verbose := fs.Bool("verbose", false, "Print every step as it happens (for debugging setup)")
-	toolsFlag := fs.String("tools", "", "AI tool(s) to instrument: claude|codex|cursor|all or a comma list (skips the interactive prompt)")
-	byoFlag := fs.Bool("byo-subscription", false, "Use your own Claude/OpenAI subscription: skip the Promptster proxy; capture via transcripts, cost estimated from transcript token usage")
+	toolsFlag := fs.String("tools", "", "AI tool(s) to instrument: claude|codex|all or a comma list (skips the interactive prompt)")
+	// RETIRED, and still ACCEPTED rather than removed.
+	//
+	// The hiring team supplies model access now, so there is nothing for this to
+	// turn on. But flag.ExitOnError means an unrecognised flag kills the process,
+	// and the candidate who passes this is following an instruction someone gave
+	// them — a hard exit at the start of a timed assessment is the worst possible
+	// way to deliver news that is, for them, good. So it parses, it explains, and
+	// startup continues on the employer's key.
+	byoFlag := fs.Bool("byo-subscription", false, "Retired — assessments run on model access the hiring team supplies. Accepted and ignored.")
+	// Cursor named here is the EDITOR, and that is the one Cursor claim this
+	// change leaves standing: the extension installs into whatever editor the
+	// candidate uses. What is retired is Cursor as an instrumented AGENT.
 	noEditorExt := fs.Bool("no-editor-extension", false, "Skip installing the Promptster editor extension into VS Code/Cursor (the session records that editor attention capture was unavailable)")
 	fs.Parse(args) //nolint:errcheck
 	startVerbose = *verbose
@@ -306,35 +317,27 @@ func cmdStart(args []string) {
 	warnMissingProjectTools(resolveBrief(session))
 	useClaude := hasTool(tools, toolClaude)
 	useCodex := hasTool(tools, toolCodex)
-	useCursor := hasTool(tools, toolCursor)
 	verbosef("instrumenting tools: %s", toolsLabel(tools))
 
-	// BYO-subscription mode: the candidate's own Claude Max / OpenAI plan
-	// supplies model access. No proxy wiring at all — Claude Code capture
-	// moves to the transcript watcher (which also carries the per-request
-	// token usage the proxy would otherwise meter), codex capture is already
-	// rollout-JSONL-based, and hooks stay installed as the fallback channel.
+	// Candidate-supplied model access is retired: the hiring team supplies the
+	// key, it is metered at the proxy, and the candidate's own paid subscription
+	// is never spent on being evaluated. See openspec
+	// changes/employer-supplied-model-key.
 	//
-	// Triggered by the --byo-subscription flag OR by the assessment's own
-	// auth mode (session.AuthMode, set from the redeem response) so a recruiter
-	// can flip BYO from the dashboard without the candidate passing the flag.
-	if *byoFlag || session.AuthMode == "byo-subscription" {
-		session.AuthMode = "byo-subscription"
-		if useClaude {
-			session.CaptureMode = "transcript"
-		}
-	}
-
-	// Tool-specific notes about how credentials are supplied. Cursor is
-	// candidate-BYO-subscription (Promptster supplies no key); Claude Code and
-	// Codex share ONE proxy-backed AI budget, so using both doesn't double it.
+	// Transcript capture is NOT retired with it. It moved from being BYO's only
+	// channel to being the fallback rail for everyone: it is armed below when the
+	// proxy smoke test fails, because that is exactly the condition it exists to
+	// cover — proxy traffic unavailable, so nothing would be captured at all.
 	noteLabel := lipgloss.NewStyle().Foreground(lipgloss.Color("#38bdf8")).Bold(true)
 	noteText := lipgloss.NewStyle().Foreground(cBody)
-	if useCursor {
+	if *byoFlag {
 		fmt.Println()
 		fmt.Printf("  %s %s\n", noteLabel.Render("Note:"),
-			noteText.Render("Cursor uses your OWN Cursor subscription — Promptster does not supply a Cursor key."))
+			noteText.Render("--byo-subscription is retired. This assessment runs on model access the hiring team supplies — your own Claude/OpenAI subscription is not used and not billed."))
 	}
+
+	// Claude Code and Codex share ONE proxy-backed AI budget, so using both
+	// doesn't double it.
 	if useClaude && useCodex {
 		fmt.Println()
 		fmt.Printf("  %s %s\n", noteLabel.Render("Note:"),
@@ -348,15 +351,13 @@ func cmdStart(args []string) {
 		verbosef("hook events: %s", strings.Join(claudeHookPointNames, ", "))
 		hookErr = configureHooks(hookRoot)
 	}
-	// Cursor captures via project-level .cursor/hooks.json (its hooks fire live
-	// in the IDE Agent). No proxy — Cursor forces Agent/Edit model traffic
-	// through its own backend, so BYOK metering is architecturally impossible;
-	// Cursor is candidate-BYO-subscription, capture-only.
-	if hookErr == nil && useCursor {
-		verbosef("writing Cursor hooks to %s", cursorHooksPath(hookRoot))
-		verbosef("cursor hook events: %s", strings.Join(cursorHookPointNames, ", "))
-		hookErr = configureCursorHooks(hookRoot)
-	}
+	// Cursor's hooks used to be written here. Cursor forces Agent/Edit model
+	// traffic through its own backend, so a key the hiring team supplies can be
+	// neither used nor metered on it — which made Cursor candidate-pays by
+	// construction, the one thing this product no longer does. It is not an
+	// instrumented tool any more. Candidates may still work in Cursor as their
+	// editor; the assessment is instrumented through Claude Code or Codex.
+	// See openspec changes/employer-supplied-model-key.
 	if hookErr != nil {
 		endStepWarn(4, 7, "Configuring hooks", hookErr.Error())
 	} else {
@@ -381,18 +382,9 @@ func cmdStart(args []string) {
 	// ANTHROPIC_BASE_URL + an apiKeyHelper into the workspace settings.
 	// (Codex BYOK proxy wiring is handled separately; see codex_proxy.go.)
 	proxyURL := apiURL() + "/v1/proxy/anthropic"
-	if useClaude && session.AuthMode != "byo-subscription" {
+	if useClaude {
 		verbosef("setting ANTHROPIC_BASE_URL=%s + apiKeyHelper in %s", proxyURL, claudeProjectSettingsPath(hookRoot))
 		configureProxyEnv(hookRoot, proxyURL, session.SessionToken)
-	} else if useClaude {
-		// BYO subscription: make sure no proxy wiring from a previous managed
-		// session lingers in this workspace — a stale apiKeyHelper out-ranks
-		// the candidate's subscription OAuth and would silently re-route
-		// traffic to the proxy.
-		verbosef("BYO subscription: removing any apiKeyHelper/ANTHROPIC_BASE_URL from %s", claudeProjectSettingsPath(hookRoot))
-		if err := removeClaudeProxyConfig(hookRoot); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: could not clean proxy config: %v\n", err)
-		}
 	}
 
 	// Codex BYOK proxy — route codex's Responses-API traffic through Promptster
@@ -402,7 +394,7 @@ func cmdStart(args []string) {
 	// is idempotent and records prior state for an exact revert on done/abort.
 	// The credential is NOT written to the file — it rides PROMPTSTER_PROXY_TOKEN,
 	// exported PWD-gated by the shell hook from the 0600 session.json.
-	if useCodex && session.AuthMode != "byo-subscription" {
+	if useCodex {
 		codexProxyURL := apiURL() + "/v1/proxy/openai/v1"
 		verbosef("configuring codex model_provider=%s base_url=%s in %s", codexProxyProviderID, codexProxyURL, codexConfigPath())
 		if err := configureCodexProxy(codexProxyURL); err != nil {
@@ -421,27 +413,38 @@ func cmdStart(args []string) {
 	// [5/7] Smoke-test the proxy so auth/network failures surface here
 	// rather than on the candidate's first Claude Code prompt. Only meaningful
 	// when Claude Code is instrumented (codex routes through its own proxy).
-	if session.AuthMode == "byo-subscription" {
-		startStep(5, 7, "Testing Claude API proxy...")
-		endStep(5, 7, "Testing Claude API proxy", "skipped (BYO subscription)")
-		fmt.Println()
-		noteLabelByo := lipgloss.NewStyle().Foreground(lipgloss.Color("#38bdf8")).Bold(true)
-		noteTextByo := lipgloss.NewStyle().Foreground(cBody)
-		fmt.Printf("  %s %s\n", noteLabelByo.Render("Note:"),
-			noteTextByo.Render("BYO subscription mode — your own Claude/OpenAI plan is billed. Cost shown to reviewers is estimated from transcript token usage."))
-	} else if useClaude {
+	//
+	// A FAILURE HERE ARMS TRANSCRIPT CAPTURE, and that is the whole reason
+	// transcript capture survives the retirement of BYO.
+	//
+	// It used to be BYO's private channel — the only way to see a session that
+	// deliberately bypassed the proxy. With BYO gone, the condition it answers is
+	// the accidental version of the same thing: the proxy is unreachable, or the
+	// token is missing, so proxy traffic will not be captured and the reviewer
+	// would get a session with nothing in it. Reading the transcript is strictly
+	// better than reading nothing, and it carries the per-request token usage
+	// too, so cost degrades to estimated rather than to absent.
+	//
+	// Set BEFORE saveSession below, so the watcher started later in this run and
+	// the hook suppression in cmd_hook.go both see it.
+	if useClaude {
 		startStep(5, 7, "Testing Claude API proxy...")
 		if session.SessionToken == "" {
 			endStepWarn(5, 7, "Testing Claude API proxy", "no session token")
+			session.CaptureMode = "transcript"
 		} else if smokeErr := smokeTestProxy(proxyURL, session.SessionToken); smokeErr != nil {
 			endStepWarn(5, 7, "Testing Claude API proxy", smokeErr.Error())
 			printProxySmokeTestFailure(smokeErr)
+			session.CaptureMode = "transcript"
 		} else {
 			endStep(5, 7, "Testing Claude API proxy", "ready")
 		}
+		if session.CaptureMode == "transcript" {
+			verbosef("proxy unavailable: arming transcript capture as the fallback rail")
+		}
 	} else {
 		// No Claude Code in this session — the Claude proxy smoke test doesn't
-		// apply. Codex routes through its own proxy; Cursor is BYO with no proxy.
+		// apply. Codex routes through its own proxy.
 		startStep(5, 7, "Testing Claude API proxy...")
 		endStep(5, 7, "Testing Claude API proxy", "skipped (no Claude Code in this session)")
 	}
@@ -586,7 +589,7 @@ func cmdStart(args []string) {
 		fmt.Printf("    %s %s\n", stepNumStyle.Render("1."), infoText.Render("cd into your workspace (shown above)"))
 	}
 	// The launch command + reminder copy adapt to which tool(s) were chosen.
-	launchCmd, launchDesc, toolNoun := nextStepLaunch(useClaude, useCodex, useCursor)
+	launchCmd, launchDesc, toolNoun := nextStepLaunch(useClaude, useCodex)
 	fmt.Printf("    %s %s  %s\n",
 		stepNumStyle.Render("2."),
 		codeText.Render(launchCmd),
@@ -631,9 +634,8 @@ func cmdStart(args []string) {
 
 // nextStepLaunch returns the launch command, its description, and the tool
 // noun used in the "open from this workspace" reminder, adapting to whichever
-// tool(s) the candidate selected. Cursor launches via `cursor .` (opens the
-// folder in the Cursor IDE) rather than a headless CLI command.
-func nextStepLaunch(useClaude, useCodex, useCursor bool) (cmd, desc, noun string) {
+// tool(s) the candidate selected.
+func nextStepLaunch(useClaude, useCodex bool) (cmd, desc, noun string) {
 	type launch struct{ cmd, noun string }
 	var sel []launch
 	if useClaude {
@@ -641,9 +643,6 @@ func nextStepLaunch(useClaude, useCodex, useCursor bool) (cmd, desc, noun string
 	}
 	if useCodex {
 		sel = append(sel, launch{"codex", "Codex"})
-	}
-	if useCursor {
-		sel = append(sel, launch{"cursor .", "Cursor"})
 	}
 	if len(sel) == 0 {
 		return "claude", "— opens Claude Code in this workspace", "Claude Code"
