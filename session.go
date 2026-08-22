@@ -65,24 +65,27 @@ type Session struct {
 	// OSS issue ID — used for CI test lookup
 	IssueID string `json:"issueId,omitempty"`
 	// Tools lists the AI coding tools instrumented for this session
-	// ("claude", "codex", and/or "cursor"), chosen at start. Drives which
+	// ("claude" and/or "codex"), chosen at start. Drives which
 	// hooks/watchers are configured and torn down. Empty = legacy session
 	// (treat as claude).
 	Tools []string `json:"tools,omitempty"`
-	// AllowedTools is the recruiter-chosen subset of {claude,codex,cursor} the
+	// AllowedTools is the recruiter-chosen subset of {claude,codex} the
 	// candidate may instrument, mirrored from the redeem response so `start` can
 	// constrain tool selection. Empty/nil = unconstrained (older server) →
 	// fall back to all tools.
 	AllowedTools []string `json:"allowedTools,omitempty"`
-	// AuthMode records how model credentials are supplied:
-	//   ""/"managed"       — Promptster proxy bills the org key (default)
-	//   "byo-subscription" — candidate's own Claude/OpenAI subscription; no
-	//                        proxy wiring, cost is ESTIMATED from transcripts
+	// AuthMode records how model credentials are supplied. There is now only one
+	// answer — ""/"managed", the proxy billing the hiring team's key. It is kept
+	// as a RECORD of what the server said, not as a switch: nothing in the CLI
+	// branches on it any more. See openspec changes/employer-supplied-model-key.
 	AuthMode string `json:"authMode,omitempty"`
 	// CaptureMode selects the Claude Code capture channel:
 	//   ""/"hooks"   — hook-driven capture (default)
 	//   "transcript" — claude-watch tails the transcript JSONL; hooks fall
 	//                  back only when the watcher is unhealthy
+	//
+	// "transcript" is no longer a configuration. It is armed at start when the
+	// proxy smoke test fails, i.e. when proxy capture would produce nothing.
 	CaptureMode string `json:"captureMode,omitempty"`
 }
 
@@ -185,8 +188,8 @@ func cleanupPromptsterState(taskRoot string) {
 	if taskRoot != "" {
 		_ = os.Remove(filepath.Join(taskRoot, ".claude", "settings.local.json"))
 		removeExplainCommand(taskRoot)
-		// Cursor hooks: restore the candidate's pre-existing .cursor/hooks.json
-		// (if we backed one up) or remove the file we created.
-		removeCursorHooks(taskRoot)
+		// A Cursor hooks teardown used to live here. Promptster no longer writes
+		// .cursor/hooks.json at all (openspec changes/employer-supplied-model-key),
+		// so there is nothing of ours left in the candidate's workspace to restore.
 	}
 }

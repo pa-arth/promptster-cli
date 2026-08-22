@@ -23,7 +23,16 @@ func cmdDoctor() {
 	// default) so a fresh machine still gets a meaningful environment check.
 	claudeRelevant := sessionErr != nil || hasTool(session.Tools, toolClaude)
 	codexRelevant := codexProxyConfigured() || (sessionErr == nil && hasTool(session.Tools, toolCodex))
-	cursorRelevant := sessionErr == nil && hasTool(session.Tools, toolCursor)
+	// Cursor used to be a third relevant tool here. openspec
+	// changes/employer-supplied-model-key retired it as a selectable tool, so
+	// there is no Cursor binary check and no Cursor hooks section any more.
+	//
+	// One case still needs saying out loud: a session.json written by an OLDER
+	// CLI can name a retired tool. Reporting nothing there is the wrong silence —
+	// the candidate would see a doctor that never mentions the tool their
+	// instructions told them to use. Reported below as a stated fact, not a
+	// failure: nothing is broken on this machine.
+	retiredInSession := sessionErr == nil && hasRetiredTool(session.Tools, session.AllowedTools)
 
 	fmt.Println("Promptster Doctor")
 	fmt.Println(strings.Repeat("─", 44))
@@ -64,15 +73,14 @@ func cmdDoctor() {
 			return p, ""
 		})
 	}
-	if cursorRelevant {
-		check("cursor editor", func() (string, string) {
-			if !cursorInstalled() {
-				return "", "Cursor not detected\n    Fix: " + toolInstallHint(toolCursor)
-			}
-			if p, err := exec.LookPath("cursor"); err == nil {
-				return p, ""
-			}
-			return "app detected (cursor CLI not on PATH — open Cursor manually)", ""
+	if retiredInSession {
+		check("cursor (retired)", func() (string, string) {
+			return "", "this session names Cursor, which Promptster no longer instruments\n" +
+				"    Cursor routes model traffic through its own backend, so the hiring\n" +
+				"    team's key cannot be used or metered on it. Nothing is wrong with\n" +
+				"    your machine.\n" +
+				"    Fix: ask whoever sent you this assessment to switch it to Claude Code\n" +
+				"    or Codex. You can still use Cursor as your editor."
 		})
 	}
 	check("promptster binary installed", func() (string, string) {
@@ -308,25 +316,6 @@ func cmdDoctor() {
 		fmt.Println()
 	}
 
-	if cursorRelevant && sessionErr == nil && session.TaskRoot != "" {
-		fmt.Println("Cursor hooks")
-		cursorPath := cursorHooksPath(session.TaskRoot)
-		check("Cursor hooks file", func() (string, string) {
-			cfg, err := readSettings(cursorPath)
-			if err != nil {
-				if os.IsNotExist(err) {
-					return "", "missing: " + cursorPath + "\n    Fix: run promptster start --tools cursor"
-				}
-				return "", "invalid JSON at " + cursorPath + ": " + err.Error() + "\n    Fix: re-run promptster start"
-			}
-			if !isCursorHookConfigured(cfg) {
-				return "", "Promptster hooks not registered in " + cursorPath + "\n    Fix: re-run promptster start"
-			}
-			return cursorPath, ""
-		})
-		fmt.Println()
-	}
-
 	fmt.Println("Legacy cleanup")
 	check("Claude global hooks clean", func() (string, string) {
 		userSettingsPath := claudeUserSettingsPath()
@@ -438,4 +427,20 @@ func check(label string, fn func() (info string, problem string)) {
 		}
 		fmt.Println()
 	}
+}
+
+// hasRetiredTool reports whether either tool list names a tool Promptster used to
+// instrument and no longer does. Both lists are checked because they answer
+// different questions — Tools is what this run selected, AllowedTools is what the
+// recruiter configured — and a session written by an older CLI can carry a
+// retired name in either one.
+func hasRetiredTool(selected, allowed []string) bool {
+	for _, list := range [][]string{selected, allowed} {
+		for _, t := range list {
+			if isRetiredToolToken(t) {
+				return true
+			}
+		}
+	}
+	return false
 }

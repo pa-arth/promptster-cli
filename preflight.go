@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"runtime"
 	"strings"
 
@@ -20,9 +19,9 @@ type toolCheck struct {
 
 func preflightChecks() {
 	// Only git is universally required here. The AI coding tool binary
-	// (claude/codex/cursor) is checked later, after tool selection, against the
-	// tool(s) the candidate actually picks — see ensureToolBinaries. Requiring
-	// `claude` here would lock out Codex- or Cursor-only assessments.
+	// (claude/codex) is checked later, after tool selection, against the tool(s)
+	// the candidate actually picks — see ensureToolBinaries. Requiring `claude`
+	// here would lock out Codex-only assessments.
 	checks := []toolCheck{
 		{
 			name:        "git",
@@ -151,8 +150,6 @@ func toolBinaryName(tool string) string {
 		return "claude"
 	case toolCodex:
 		return "codex"
-	case toolCursor:
-		return "cursor"
 	default:
 		return tool
 	}
@@ -165,42 +162,21 @@ func toolInstallHint(tool string) string {
 		return claudeInstallHint()
 	case toolCodex:
 		return "npm install -g @openai/codex\n  Or visit: https://github.com/openai/codex"
-	case toolCursor:
-		return "Install Cursor from https://cursor.com, then run\n  \"Shell Command: Install 'cursor' command in PATH\" from the command palette"
 	default:
 		return ""
 	}
 }
 
-// cursorInstalled reports whether Cursor appears to be present. Cursor's hooks
-// fire from the IDE itself, so the `cursor` PATH shim (an optional convenience
-// the user installs from the command palette) is not required for capture — we
-// also accept the macOS app bundle as evidence the editor is there.
-func cursorInstalled() bool {
-	if _, err := exec.LookPath("cursor"); err == nil {
-		return true
-	}
-	if runtime.GOOS == "darwin" {
-		candidates := []string{"/Applications/Cursor.app"}
-		if home, err := os.UserHomeDir(); err == nil {
-			candidates = append(candidates, filepath.Join(home, "Applications", "Cursor.app"))
-		}
-		for _, p := range candidates {
-			if _, err := os.Stat(p); err == nil {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// toolInstalled reports whether a selected tool can actually be used. Claude and
-// Codex are headless CLIs Promptster drives directly, so they need their binary
-// on PATH. Cursor is detected via cursorInstalled (shim or app bundle).
+// toolInstalled reports whether a selected tool can actually be used. Both
+// instrumented tools are headless CLIs Promptster drives directly, so they need
+// their binary on PATH.
+//
+// The Cursor special case that used to live here — accept the macOS app bundle,
+// because Cursor's hooks fire from the IDE and the PATH shim is optional — went
+// with Cursor itself. Whether the candidate has Cursor installed is no longer
+// Promptster's business: they may use it as their editor, and nothing about that
+// is instrumented or checked.
 func toolInstalled(tool string) bool {
-	if tool == toolCursor {
-		return cursorInstalled()
-	}
 	_, err := exec.LookPath(toolBinaryName(tool))
 	return err == nil
 }
@@ -220,14 +196,6 @@ func resolveUsableTools(tools []string) []string {
 	for _, t := range tools {
 		if toolInstalled(t) {
 			usable = append(usable, t)
-			// Cursor app present but the launch shim isn't: hooks still fire, but
-			// `cursor .` won't — tell the candidate to open the app manually.
-			if t == toolCursor {
-				if _, err := exec.LookPath("cursor"); err != nil {
-					fmt.Printf("\n  %s %s\n", warnStyle.Render("!"),
-						dimStyle.Render("Cursor's `cursor` command isn't on PATH — open the Cursor app manually (hooks still capture it)."))
-				}
-			}
 			continue
 		}
 		fmt.Printf("\n  %s %s not found %s\n", warnStyle.Render("!"), toolBaseName(t), dimStyle.Render("(skipping — install it to use it)"))

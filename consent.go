@@ -17,7 +17,7 @@ const fallbackTosURL = "https://promptster.ai/legal/terms"
 
 var fallbackDisclosure = ConsentDisclosure{
 	Captures: []string{
-		"Prompts you send to AI coding tools (Claude Code, Cursor)",
+		"Prompts you send to AI coding tools (Claude Code, Codex)",
 		"AI tool calls and responses",
 		"Code changes and file edits in the assessment workspace (unified diffs)",
 		"Terminal commands and exit codes run in the workspace",

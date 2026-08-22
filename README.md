@@ -2,7 +2,7 @@
 
 The session recorder behind [Promptster](https://promptster.ai) — it sets up a
 candidate's assessment environment on their own machine, clones the assessment
-repository, installs capture hooks for AI coding tools (Claude Code, Cursor,
+repository, installs capture hooks for AI coding tools (Claude Code,
 Codex CLI), and streams the working session (prompts, tool calls, file diffs,
 terminal commands, decisions) to a Promptster-compatible backend for replay
 and review.
@@ -11,7 +11,7 @@ It is a single static Go binary. Candidates run two commands:
 
 ```bash
 promptster start PST-XXXX-XXXX   # consent → clone repo → install hooks → start capture
-# ... work normally in Claude Code / Cursor / Codex ...
+# ... work normally in Claude Code / Codex ...
 promptster done                  # run verification, upload the workspace, submit
 ```
 
@@ -97,8 +97,8 @@ implement them.
 
 ## What gets captured
 
-Hooks are installed per-workspace for Claude Code (`.claude/settings.local.json`),
-Cursor (`.cursor/hooks.json`), and Codex (rollout transcript tailing), plus an
+Hooks are installed per-workspace for Claude Code (`.claude/settings.local.json`)
+and Codex (rollout transcript tailing), plus an
 opt-in shell hook for human terminal commands. Events are normalized to a
 common schema (`prompt`, `file_diff`, `command`, `ai_response`, `tool_intent`,
 `decision_event`, …) before upload. Candidates see a full disclosure and must

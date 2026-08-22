@@ -3,7 +3,7 @@
 # qa-e2e.sh — sandboxed end-to-end QA for promptster-cli, per AI tool.
 #
 # Runs the REAL `promptster start` flow (hooks, proxy config, watchers) plus a
-# live capture check and `doctor`/`brief`, for any of claude|codex|cursor — all
+# live capture check and `doctor`/`brief`, for either of claude|codex — all
 # inside a throwaway sandbox so your real ~/.zshrc, ~/.promptster, ~/.codex and
 # ~/.claude are never touched and no network mutation happens.
 #
@@ -18,14 +18,14 @@
 # redemption is needed. We NEVER pass --restart (that could kill a running editor).
 #
 # Usage:
-#   scripts/qa-e2e.sh [cursor|codex|claude|all]   (default: all)
+#   scripts/qa-e2e.sh [codex|claude|all]   (default: all)
 #
 # Exit code is non-zero if any assertion fails.
 
 set -uo pipefail
 
 TOOLS="${1:-all}"
-[ "$TOOLS" = "all" ] && TOOLS="cursor codex claude"
+[ "$TOOLS" = "all" ] && TOOLS="codex claude"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -74,12 +74,6 @@ JSON
 
   # per-tool setup + capture
   case "$tool" in
-    cursor)
-      grep -q "promptster hook" "$SBX/ws/.cursor/hooks.json" 2>/dev/null \
-        && pass ".cursor/hooks.json written" || fail "cursor hooks.json"
-      echo '{"hook_event_name":"beforeSubmitPrompt","cursor_version":"2.6.14","prompt":"qa prompt","conversation_id":"c1","generation_id":"g1","model":"default"}' \
-        | run hook cursor >/dev/null 2>&1
-      ;;
     claude)
       grep -q "promptster hook" "$SBX/ws/.claude/settings.local.json" 2>/dev/null \
         && pass ".claude/settings.local.json hooks written" || fail "claude hooks"
@@ -111,8 +105,6 @@ RJ
   # doctor is tool-aware: shows this tool, hides the others' sections
   run doctor > "$SBX/doctor.out" 2>&1; strip < "$SBX/doctor.out" > "$SBX/doctor.txt"
   case "$tool" in
-    cursor) grep -q "cursor editor" "$SBX/doctor.txt" && ! grep -q "claude binary" "$SBX/doctor.txt" \
-              && pass "doctor: cursor-aware (no claude binary check)" || fail "doctor cursor-aware" ;;
     codex)  grep -q "codex binary" "$SBX/doctor.txt" && ! grep -q "Claude hooks" "$SBX/doctor.txt" \
               && pass "doctor: codex-aware (no Claude hooks section)" || fail "doctor codex-aware" ;;
     claude) grep -q "claude binary" "$SBX/doctor.txt" && grep -q "Claude hooks" "$SBX/doctor.txt" \

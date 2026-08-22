@@ -77,15 +77,15 @@ type RedeemResponse struct {
 	// TosAccepted is true when the candidate already accepted the ToS via the
 	// web flow. When true, the CLI skips the inline consent prompt.
 	TosAccepted bool `json:"tosAccepted"`
-	// AllowedTools is the recruiter-chosen subset of {claude,codex,cursor} the
+	// AllowedTools is the recruiter-chosen subset of {claude,codex} the
 	// candidate is permitted to instrument for this assessment. Empty/nil means
 	// the server didn't send it (older API) — the CLI falls back to all tools.
 	AllowedTools []string `json:"allowedTools"`
-	// AuthMode is the recruiter-chosen credential mode for this assessment.
-	// "byo-subscription" means the candidate runs Claude/Codex on their OWN
-	// subscription (no Promptster proxy, transcript-based capture); "managed"
-	// (or empty, for older APIs) means the default proxy path. Lets the recruiter
-	// flip BYO from the dashboard so the candidate needn't pass --byo-subscription.
+	// AuthMode is the credential mode the server reports for this assessment.
+	// The server now only ever sends "managed" (older APIs send nothing), and the
+	// CLI does not branch on it — the retired "byo-subscription" value is neither
+	// produced nor honoured. Kept so an older server's value round-trips into
+	// session.json rather than being dropped on the floor.
 	AuthMode string `json:"authMode,omitempty"`
 }
 
