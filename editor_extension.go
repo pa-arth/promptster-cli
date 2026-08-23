@@ -19,10 +19,18 @@ import (
 //
 // The extension records which files the CANDIDATE opened and for how long. That
 // is the one thing no other rail captures: agent file reads are already covered
-// on every rail (cursor_hooks.go, the Claude Code hooks), and the signal only
-// means something as a difference — files the human opened that the agent never
-// read, files the agent edited that the human never opened, dwell before the
-// first prompt.
+// on the rails this product instruments — the Claude Code hooks and the Codex
+// normalizer — and the signal only means something as a difference: files the
+// human opened that the agent never read, files the agent edited that the human
+// never opened, dwell before the first prompt.
+//
+// This used to cite `cursor_hooks.go` as one of those rails. There is no such
+// file in THIS repo — it lives in promptster-teams-cli, a different product —
+// and Cursor is not a rail here at all: `tool_select.go`'s allTools is
+// {claude, codex}, Cursor having been retired by
+// openspec changes/employer-supplied-model-key. A comment naming a sibling
+// repo's file as if it were local is the same failure as a capability map
+// grounded in the wrong repo; name the repo, or do not name the file.
 //
 // Two properties this file exists to hold:
 //
