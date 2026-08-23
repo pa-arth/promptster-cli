@@ -244,6 +244,68 @@ func TestClaimActiveTaskIsAtomic(t *testing.T) {
 	}
 }
 
+// TestClaimActiveTaskRecoversACorruptSlotExactlyOnce pins the branch the link(2)
+// publish made reachable-for-the-right-reason. Before it, a slot could be found
+// empty for TWO different reasons — a crashed writer, or a live writer between
+// its exclusive create and its write — and the recovery branch could not tell
+// them apart, so a racer arriving mid-claim "recovered" into a second winner.
+//
+// Publishing a fully-written temp file with link(2) makes the zero-byte state
+// unreachable, which is what lets recovery mean genuine corruption only. This
+// asserts both halves: a corrupt pointer is still recovered rather than wedging
+// the fleet forever, and concurrent racers against one still produce exactly one
+// winner rather than each clearing and claiming in turn.
+func TestClaimActiveTaskRecoversACorruptSlotExactlyOnce(t *testing.T) {
+	withTempRoot(t)
+
+	// Sequential: a truncated pointer is not an envelope, and must not wedge.
+	if err := os.MkdirAll(tasksDir(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(activeTaskPath(), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, claimed, err := claimActiveTask(
+		ActiveTask{TaskKey: "o/after-corrupt", RepoRoot: "/a", OpenedAt: nowUTC()}); err != nil || !claimed {
+		t.Fatalf("a corrupt slot must be recoverable: claimed=%v err=%v", claimed, err)
+	}
+	if got, _ := readActiveTask(); got.TaskKey != "o/after-corrupt" {
+		t.Fatalf("recovery left the slot at %+v", got)
+	}
+
+	// Concurrent, against a corrupt slot: still exactly one winner. Bounding the
+	// retry is what holds this — unbounded retries let every racer clear and
+	// re-claim, reintroducing the double-winner through the recovery path.
+	if err := os.WriteFile(activeTaskPath(), []byte("{ truncated"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	const racers = 16
+	var wg sync.WaitGroup
+	var wins atomic.Int32
+	start := make(chan struct{})
+	for i := range racers {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			if _, ok, err := claimActiveTask(ActiveTask{
+				TaskKey: fmt.Sprintf("o/corrupt-racer-%d", i), RepoRoot: "/r", OpenedAt: nowUTC(),
+			}); err == nil && ok {
+				wins.Add(1)
+			}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	if got := wins.Load(); got != 1 {
+		t.Fatalf("%d claims won a corrupt slot; recovery must not become a second way to double-claim", got)
+	}
+	if _, ok := readActiveTask(); !ok {
+		t.Fatal("the winner's pointer is unreadable; link(2) must only ever publish a complete file")
+	}
+}
+
 // TestActiveTaskIsOneGlobalSlot pins the property the fix rests on. If this
 // ever becomes per-directory again, every test above can pass while the
 // treatment is still routed by cwd.
