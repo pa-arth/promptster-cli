@@ -50,7 +50,14 @@ func smokeTestProxy(proxyURL, sessionToken string) error {
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		return nil
 	}
+	return proxyHTTPError(resp)
+}
 
+// proxyHTTPError renders a non-2xx proxy response as a short human-readable
+// error. Shared by both provider smoke tests: the Anthropic proxy returns
+// {"error":{...}} and the OpenAI one {"type":"error","error":{...}}, so reading
+// `.error.message` covers both, with the raw body as the fallback.
+func proxyHTTPError(resp *http.Response) error {
 	bodyBytes, _ := io.ReadAll(resp.Body)
 	var parsed struct {
 		Error struct {

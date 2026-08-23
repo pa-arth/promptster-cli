@@ -394,8 +394,8 @@ func cmdStart(args []string) {
 	// is idempotent and records prior state for an exact revert on done/abort.
 	// The credential is NOT written to the file — it rides PROMPTSTER_PROXY_TOKEN,
 	// exported PWD-gated by the shell hook from the 0600 session.json.
+	codexProxyURL := apiURL() + "/v1/proxy/openai/v1"
 	if useCodex {
-		codexProxyURL := apiURL() + "/v1/proxy/openai/v1"
 		verbosef("configuring codex model_provider=%s base_url=%s in %s", codexProxyProviderID, codexProxyURL, codexConfigPath())
 		if err := configureCodexProxy(codexProxyURL); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: could not configure Codex proxy: %v\n", err)
@@ -410,11 +410,19 @@ func cmdStart(args []string) {
 	// proxy reachability + token validity via a direct HTTP call, not Claude
 	// Code's runtime auth resolution, so it cannot see a shell-exported token).
 
-	// [5/7] Smoke-test the proxy so auth/network failures surface here
-	// rather than on the candidate's first Claude Code prompt. Only meaningful
-	// when Claude Code is instrumented (codex routes through its own proxy).
+	// [5/7] Smoke-test every proxy this session will actually use, so auth,
+	// network, and key-resolution failures surface here rather than on the
+	// candidate's first prompt.
 	//
-	// A FAILURE HERE ARMS TRANSCRIPT CAPTURE, and that is the whole reason
+	// EVERY INSTRUMENTED TOOL GETS CHECKED, not just Claude Code. Codex used to
+	// print "skipped (no Claude Code in this session)" here and go unverified,
+	// which inverted the point of the step — codex has no other preflight, so a
+	// codex-only session was the one flying blind. It also kept a broken key
+	// invisible: the proxy bumps org_openai_keys.auth_failure_count only when a
+	// request reaches it, so a rejected hiring-team key read as healthy in the
+	// dashboard until a candidate hit it mid-assessment. See codex_auth_check.go.
+	//
+	// A CLAUDE FAILURE HERE ARMS TRANSCRIPT CAPTURE, and that is the whole reason
 	// transcript capture survives the retirement of BYO.
 	//
 	// It used to be BYO's private channel — the only way to see a session that
@@ -425,28 +433,61 @@ func cmdStart(args []string) {
 	// better than reading nothing, and it carries the per-request token usage
 	// too, so cost degrades to estimated rather than to absent.
 	//
+	// A CODEX FAILURE DOES NOT, because codex capture never rode the proxy in the
+	// first place — the rollout-JSONL watcher records the session either way. The
+	// thing that breaks is the candidate's model access, not our visibility.
+	//
 	// Set BEFORE saveSession below, so the watcher started later in this run and
 	// the hook suppression in cmd_hook.go both see it.
-	if useClaude {
-		startStep(5, 7, "Testing Claude API proxy...")
-		if session.SessionToken == "" {
-			endStepWarn(5, 7, "Testing Claude API proxy", "no session token")
+	stepLabel := "Testing Claude API proxy"
+	switch {
+	case useClaude && useCodex:
+		stepLabel = "Testing model proxies"
+	case useCodex:
+		stepLabel = "Testing Codex API proxy"
+	}
+	startStep(5, 7, stepLabel+"...")
+
+	if session.SessionToken == "" {
+		endStepWarn(5, 7, stepLabel, "no session token")
+		// Only Claude capture rides the proxy. Codex is captured by tailing its
+		// rollout JSONL, so it needs no fallback rail.
+		if useClaude {
 			session.CaptureMode = "transcript"
-		} else if smokeErr := smokeTestProxy(proxyURL, session.SessionToken); smokeErr != nil {
-			endStepWarn(5, 7, "Testing Claude API proxy", smokeErr.Error())
-			printProxySmokeTestFailure(smokeErr)
-			session.CaptureMode = "transcript"
-		} else {
-			endStep(5, 7, "Testing Claude API proxy", "ready")
-		}
-		if session.CaptureMode == "transcript" {
-			verbosef("proxy unavailable: arming transcript capture as the fallback rail")
 		}
 	} else {
-		// No Claude Code in this session — the Claude proxy smoke test doesn't
-		// apply. Codex routes through its own proxy.
-		startStep(5, 7, "Testing Claude API proxy...")
-		endStep(5, 7, "Testing Claude API proxy", "skipped (no Claude Code in this session)")
+		var notes []string
+		failed := false
+		if useClaude {
+			if smokeErr := smokeTestProxy(proxyURL, session.SessionToken); smokeErr != nil {
+				failed = true
+				notes = append(notes, "Claude: "+smokeErr.Error())
+				printProxySmokeTestFailure(smokeErr)
+				session.CaptureMode = "transcript"
+			} else {
+				notes = append(notes, "Claude ready")
+			}
+		}
+		if useCodex {
+			if smokeErr := smokeTestCodexProxy(codexProxyURL, session.SessionToken); smokeErr != nil {
+				failed = true
+				notes = append(notes, "Codex: "+smokeErr.Error())
+				printCodexProxySmokeTestFailure(smokeErr)
+				// Deliberately NOT arming transcript capture: codex capture does
+				// not ride the proxy, so the session is still recorded. What is
+				// broken here is the candidate's model access, not our visibility.
+			} else {
+				notes = append(notes, "Codex ready")
+			}
+		}
+		if failed {
+			endStepWarn(5, 7, stepLabel, strings.Join(notes, "; "))
+		} else {
+			endStep(5, 7, stepLabel, "ready")
+		}
+	}
+	if session.CaptureMode == "transcript" {
+		verbosef("proxy unavailable: arming transcript capture as the fallback rail")
 	}
 
 	// Detect running editors and prompt for restart if needed ─────────────────

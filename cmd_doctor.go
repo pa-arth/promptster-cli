@@ -158,6 +158,19 @@ func cmdDoctor() {
 				}
 				return "yes", ""
 			})
+			// Same reasoning as the Claude check above, and the reason this file
+			// needed one at all: every other Codex check here reads local config,
+			// so doctor reported all-green on sessions whose org OpenAI key had
+			// been dead for months. See codex_auth_check.go.
+			check("Codex model reachable through proxy", func() (string, string) {
+				if blocked := proxyProbeBlocker(session); blocked != "" {
+					return "skipped (" + blocked + " — see above)", ""
+				}
+				if err := smokeTestCodexProxy(apiURL()+"/v1/proxy/openai/v1", session.SessionToken); err != nil {
+					return "", err.Error() + "\n    Fix: if the key was rejected or the budget is spent, contact the recruiter"
+				}
+				return "yes", ""
+			})
 		}
 		check("Stray OpenAI/Codex auth in shell", func() (string, string) {
 			var found []string
@@ -212,6 +225,18 @@ func cmdDoctor() {
 					return "yes (no local TTL)", ""
 				}
 				return fmt.Sprintf("yes (expires in %s)", time.Until(session.ExpiresAt).Round(time.Minute)), ""
+			})
+			// Everything above is local: config wired, token present, not expired.
+			// None of it can see a hiring-team key that the provider rejects, which
+			// is the failure candidates actually hit. Spend a few tokens and ask.
+			check("Claude model reachable through proxy", func() (string, string) {
+				if blocked := proxyProbeBlocker(session); blocked != "" {
+					return "skipped (" + blocked + " — see above)", ""
+				}
+				if err := smokeTestProxy(apiURL()+"/v1/proxy/anthropic", session.SessionToken); err != nil {
+					return "", err.Error() + "\n    Fix: if the key was rejected or the budget is spent, contact the recruiter"
+				}
+				return "yes", ""
 			})
 		}
 		check("Workspace pointer", func() (string, string) {
@@ -412,6 +437,28 @@ func rcPathsForDisplay(paths []string, home string) []string {
 
 // check prints a single doctor item. fn returns (info, problem); if problem
 // is non-empty the item is marked as failed and the problem text is printed.
+// proxyProbeBlocker reports why a live proxy call would be meaningless right
+// now, or "" when it is worth making.
+//
+// The checks that precede each probe already diagnose a missing token and an
+// expired session precisely, and they name the right fix: re-run `promptster
+// start`. Probing anyway produces one of two wrong answers. If the backend
+// rejects the stale token the probe prints "contact the recruiter", which sends
+// the candidate chasing a key problem they do not have. If it does NOT reject it
+// — and neither proxy checks expires_at, only candidate_keys.status, so an
+// expired-but-still-active key sails through — the probe prints a green "model
+// reachable" directly beneath "session expired", telling the candidate the
+// broken thing is fine. Skip instead, and let the check above own the diagnosis.
+func proxyProbeBlocker(session Session) string {
+	if strings.TrimSpace(session.SessionToken) == "" {
+		return "no session token"
+	}
+	if !session.ExpiresAt.IsZero() && time.Now().After(session.ExpiresAt) {
+		return "session expired"
+	}
+	return ""
+}
+
 func check(label string, fn func() (info string, problem string)) {
 	info, problem := fn()
 	if problem == "" {
