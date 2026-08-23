@@ -32,12 +32,19 @@ type strandedWork struct {
 	Dirty  int    // uncommitted entries
 	Ahead  int    // commits not reachable from the base ref
 	Branch string
+	// AheadUnknown is set when the commit comparison could not be run at all.
+	// Reporting "0 commits" in that case is how committed work goes missing, so
+	// an unknown is treated as a positive rather than as a zero.
+	AheadUnknown bool
 }
 
 func (s strandedWork) summary() string {
 	parts := []string{}
 	if s.Ahead > 0 {
 		parts = append(parts, fmt.Sprintf("%d commit(s) beyond the assessment base", s.Ahead))
+	}
+	if s.AheadUnknown {
+		parts = append(parts, "commits that could not be compared to the assessment base")
 	}
 	if s.Dirty > 0 {
 		parts = append(parts, fmt.Sprintf("%d uncommitted change(s)", s.Dirty))
@@ -50,8 +57,9 @@ func (s strandedWork) summary() string {
 
 // detectStrandedWork returns checkouts under (or linked to) taskRoot that carry
 // work, excluding taskRoot itself. baseRef is the assessment's pinned commit; an
-// empty baseRef falls back to taskRoot's HEAD.
-func detectStrandedWork(taskRoot, baseRef string) []strandedWork {
+// empty baseRef falls back to taskRoot's HEAD. repoURL is the assessment repo,
+// used to recognise a nested checkout as a copy of it.
+func detectStrandedWork(taskRoot, baseRef, repoURL string) []strandedWork {
 	if taskRoot == "" || !isGitRepository(taskRoot) {
 		return nil
 	}
@@ -66,6 +74,8 @@ func detectStrandedWork(taskRoot, baseRef string) []strandedWork {
 	seen := map[string]bool{rootAbs: true}
 	var found []strandedWork
 
+	// Linked worktrees need no identity check: `git worktree list` run inside
+	// taskRoot only ever names worktrees of taskRoot's own repository.
 	for _, p := range linkedWorktreePaths(taskRoot) {
 		if seen[p] {
 			continue
@@ -75,16 +85,68 @@ func detectStrandedWork(taskRoot, baseRef string) []strandedWork {
 			found = append(found, w)
 		}
 	}
+	// Nested checkouts are a different story. A workspace can be any directory
+	// the candidate chose, so it may well contain repositories that have nothing
+	// to do with the assessment. Blocking `done` on someone's unrelated dirty
+	// side project would strand a valid submission, so only checkouts that are
+	// demonstrably copies of the assessment repo count.
 	for _, p := range nestedRepoPaths(rootAbs) {
 		if seen[p] {
 			continue
 		}
 		seen[p] = true
+		if !isAssessmentCheckout(p, baseRef, repoURL) {
+			continue
+		}
 		if w, ok := inspectCheckout(p, "nested clone", baseRef); ok {
 			found = append(found, w)
 		}
 	}
 	return found
+}
+
+// isAssessmentCheckout reports whether path is a copy of the assessment repo,
+// by either of two independent signals: it holds the pinned base commit, or its
+// origin points at the same place. Either alone is enough — a shallow clone has
+// the remote but not the object, and a clone made from the local workspace has
+// the object but not the remote.
+func isAssessmentCheckout(path, baseRef, repoURL string) bool {
+	if hasCommit(path, baseRef) {
+		return true
+	}
+	if strings.TrimSpace(repoURL) == "" {
+		return false
+	}
+	out, err := runCommand(path, "git", "remote", "get-url", "origin")
+	if err != nil {
+		return false
+	}
+	return normalizeRepoURL(string(out)) == normalizeRepoURL(repoURL)
+}
+
+func hasCommit(path, rev string) bool {
+	if strings.TrimSpace(rev) == "" {
+		return false
+	}
+	_, err := runCommand(path, "git", "rev-parse", "--verify", "--quiet", strings.TrimSpace(rev)+"^{commit}")
+	return err == nil
+}
+
+// normalizeRepoURL reduces the forms git accepts for the same remote —
+// https://host/org/repo.git, git@host:org/repo, ssh://git@host/org/repo/ — to a
+// single comparable host/org/repo string.
+func normalizeRepoURL(raw string) string {
+	s := strings.TrimSpace(raw)
+	if i := strings.Index(s, "://"); i >= 0 {
+		s = s[i+3:]
+	}
+	if at := strings.LastIndex(s, "@"); at >= 0 {
+		s = s[at+1:]
+	}
+	s = strings.Replace(s, ":", "/", 1)
+	s = strings.TrimSuffix(s, "/")
+	s = strings.TrimSuffix(s, ".git")
+	return strings.ToLower(strings.TrimSuffix(s, "/"))
 }
 
 func linkedWorktreePaths(taskRoot string) []string {
@@ -157,18 +219,51 @@ func inspectCheckout(path, kind, baseRef string) (strandedWork, bool) {
 			}
 		}
 	}
-	if baseRef != "" {
-		if out, err := runCommand(path, "git", "rev-list", "--count", baseRef+"..HEAD"); err == nil {
-			w.Ahead, _ = strconv.Atoi(strings.TrimSpace(string(out)))
-		}
-	}
+	w.Ahead, w.AheadUnknown = commitsBeyondBase(path, baseRef)
+
 	if out, err := runCommand(path, "git", "rev-parse", "--abbrev-ref", "HEAD"); err == nil {
 		w.Branch = strings.TrimSpace(string(out))
 	}
-	if w.Dirty == 0 && w.Ahead == 0 {
+	if w.Dirty == 0 && w.Ahead == 0 && !w.AheadUnknown {
 		return strandedWork{}, false
 	}
 	return w, true
+}
+
+// commitsBeyondBase counts commits in path that are not part of the assessment
+// base, returning (count, unknown). The unknown flag matters: a candidate who
+// committed everything in a shallow clone has Dirty == 0, so treating a failed
+// comparison as "zero commits" would discard the checkout and submit the
+// pristine workspace — precisely the loss this file exists to prevent.
+func commitsBeyondBase(path, baseRef string) (int, bool) {
+	// An unborn HEAD genuinely has no commits; that is a known zero, not an
+	// unknown, and must not be reported as stranded work.
+	if !hasCommit(path, "HEAD") {
+		return 0, false
+	}
+	if hasCommit(path, baseRef) {
+		out, err := runCommand(path, "git", "rev-list", "--count", strings.TrimSpace(baseRef)+"..HEAD")
+		if err != nil {
+			return 0, true
+		}
+		n, err := strconv.Atoi(strings.TrimSpace(string(out)))
+		if err != nil {
+			return 0, true
+		}
+		return n, false
+	}
+	// The base object is missing — a shallow or partial clone. Fall back to
+	// commits that no remote-tracking ref can reach, which is what the candidate
+	// wrote locally.
+	out, err := runCommand(path, "git", "rev-list", "--count", "HEAD", "--not", "--remotes")
+	if err != nil {
+		return 0, true
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil {
+		return 0, true
+	}
+	return n, false
 }
 
 func absPath(p string) string {
@@ -203,8 +298,15 @@ func reportStrandedWork(taskRoot string, found []strandedWork) {
 	fmt.Fprintln(os.Stderr, "  To fix, move the work into the workspace and re-run `promptster done`:")
 	if len(found) > 0 {
 		fmt.Fprintf(os.Stderr, "    cd %s\n", taskRoot)
-		fmt.Fprintf(os.Stderr, "    git checkout %s -- .   # if the work is on a branch here\n", strings.TrimSpace(found[0].Branch))
-		fmt.Fprintln(os.Stderr, "    # or copy the changed files across by hand, then re-run done")
+		// A nested clone is usually on a detached HEAD, where `git checkout HEAD`
+		// would be a no-op that looks like it worked. Only name a branch when
+		// there is a real one to name.
+		if b := strings.TrimSpace(found[0].Branch); b != "" && b != "HEAD" {
+			fmt.Fprintf(os.Stderr, "    git checkout %s -- .   # if the work is on that branch here\n", b)
+		}
+		fmt.Fprintf(os.Stderr, "    # or copy the changed files across, e.g.\n")
+		fmt.Fprintf(os.Stderr, "    #   rsync -a --exclude .git %s/ %s/\n", strings.TrimRight(found[0].Path, "/"), strings.TrimRight(taskRoot, "/"))
+		fmt.Fprintln(os.Stderr, "    # then re-run `promptster done`")
 	}
 	fmt.Fprintln(os.Stderr, bar)
 	fmt.Fprintln(os.Stderr)

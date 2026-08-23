@@ -148,7 +148,7 @@ func submitWorkspaceCode(session Session, autoSubmit bool) bool {
 	// by following setupInstructions). Those are opposite outcomes and must not
 	// look identical, so go looking before accepting the empty result.
 	if diff == "" {
-		if stranded := detectStrandedWork(taskRoot, session.RepoCommit); len(stranded) > 0 {
+		if stranded := detectStrandedWork(taskRoot, session.RepoCommit, session.RepoURL); len(stranded) > 0 {
 			reportStrandedWork(taskRoot, stranded)
 			if !autoSubmit {
 				return false
