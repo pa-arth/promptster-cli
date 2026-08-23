@@ -1,0 +1,38 @@
+# Catches a broken `npm install -g @promptster/cli` on the pull request that
+# breaks it, not at tag time. release.yml runs the same gate as a publish
+# blocker; this one runs it while the change is still reviewable.
+name: Packaging
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  install-check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+
+      - name: Build all platform binaries
+        run: node npm/scripts/build.js
+
+      - name: Verify packaged binaries
+        run: node npm/scripts/check-binaries.js
+
+      - name: Verify the packed tarball installs a runnable promptster
+        run: node npm/scripts/check-install.js

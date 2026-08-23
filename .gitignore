@@ -1,7 +1,10 @@
 promptster
 promptster-cli
-bin/
-dist/
+# Anchored, NOT `bin/`: an unanchored pattern also matched npm/bin/, which is
+# how the npm package's `bin` shim went missing from the published tarball
+# for every release up to v1.7.0 without anyone getting a warning.
+/bin/
+/dist/
 npm/binaries/
 node_modules/
 .DS_Store

@@ -20,7 +20,8 @@
   },
   "scripts": {
     "build": "node scripts/build.js",
-    "prepublishOnly": "node scripts/build.js && node scripts/check-binaries.js"
+    "check": "node scripts/check-binaries.js && node scripts/check-install.js",
+    "prepublishOnly": "node scripts/build.js && node scripts/check-binaries.js && node scripts/check-install.js"
   },
   "files": [
     "bin/",
