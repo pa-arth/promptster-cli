@@ -57,6 +57,12 @@ jobs:
       - name: Verify packaged binaries
         run: node npm/scripts/check-binaries.js
 
+      # Blocks the publish by RUNNING the tarball rather than reading its file
+      # list. v1.7.0 passed check-binaries.js and still installed no
+      # `promptster` command at all, because the bin shim was absent.
+      - name: Verify the packed tarball installs a runnable promptster
+        run: node npm/scripts/check-install.js
+
       # Idempotent: skip if this version is already on npm, so a re-run of a
       # failed release (e.g. after a downstream step failed) doesn't die here.
       - name: Publish to npm
