@@ -247,9 +247,47 @@ func shellRCPathsForCleanup() []string {
 	}
 }
 
+// systemShellInitPaths are the container/system-wide shell init files a hosted
+// image can pre-wire (openspec §1.4 bakes the source line into the image).
+var systemShellInitPaths = []string{
+	"/etc/bash.bashrc",
+	"/etc/bashrc",
+	"/etc/zsh/zshrc",
+	"/etc/zshrc",
+	"/etc/profile",
+	"/etc/profile.d/promptster.sh",
+}
+
+// systemShellInitSourcesHook reports whether a system-wide init file already
+// sources our hook, so the per-user RC injection would be a duplicate.
+//
+// This is a MEASUREMENT, not an assumption about the lane. "The hosted image
+// sources it" is a claim about an image built in another repo on another
+// schedule; skipping the injection because the lane is hosted would silently
+// drop terminal capture the day that image ships without the line. Skipping
+// because the line is demonstrably there cannot.
+func systemShellInitSourcesHook() bool {
+	for _, p := range systemShellInitPaths {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		if strings.Contains(string(data), shellHookMarker) {
+			return true
+		}
+	}
+	return false
+}
+
 // installShellHook writes the shell hook script and injects a source line
 // into the user's shell RC file(s) so it auto-activates in every new shell.
 func installShellHook() (sourceCmd string, err error) {
+	return installShellHookWithRC(true)
+}
+
+// installShellHookWithRC writes the hook script and, when injectRC is true,
+// injects the source line into the user's RC files.
+func installShellHookWithRC(injectRC bool) (sourceCmd string, err error) {
 	p := shellHookPath()
 	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
 		return "", fmt.Errorf("mkdir: %w", err)
@@ -263,6 +301,10 @@ func installShellHook() (sourceCmd string, err error) {
 	// the RC line silently no-ops instead of printing an error every shell
 	// start. `.` is POSIX-portable (works in dash/bash/zsh); `source` is not.
 	sourceCmd = fmt.Sprintf(`[ -r "%s" ] && . "%s"`, p, p)
+
+	if !injectRC {
+		return sourceCmd, nil
+	}
 
 	// Inject into shell RC files
 	snippet := fmt.Sprintf("%s\n%s\n%s\n", shellHookMarker, sourceCmd, shellHookMarkerEnd)

@@ -173,7 +173,8 @@ func printUsage() {
 	fmt.Print(`Usage: promptster <command> [flags]
 
 Commands:
-  start <key>                  Redeem key, configure hooks, and start assessment
+  start [key]                  Redeem key, configure hooks, and start assessment
+                               (prompts for the key when one isn't given)
   redeem <key>                 Validate key, accept terms, save session (standalone)
   done                         Submit your assessment when finished
   abort [--reason X]           Discard the current session + tear down hooks (no submit)
@@ -194,11 +195,17 @@ Aliases:
 Flags for start:
   --accept-tos      Accept terms of service non-interactively (scripted use)
   --workspace PATH  Use PATH as workspace directory (skip interactive prompt)
+  --adopt           Use the checkout that is already here instead of cloning one
+                    (defaults ON inside a GitHub Codespace; --adopt=false forces a clone)
   --restart         Offer to restart running editors so they reload hooks
   --verbose         Print each sub-step (paths, API URL, hook events) for debugging
 
 Flags for done:
   --auto            Auto-submit mode (skip pending-decision check)
+
+Flags for abort:
+  --delete-codespace  Delete the GitHub Codespace too (hosted lane; off by default —
+                      abort uploads nothing, so the box holds the only copy)
 
 Flags for redeem:
   --accept-tos      Accept terms of service non-interactively (scripted use)

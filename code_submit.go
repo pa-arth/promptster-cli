@@ -114,14 +114,20 @@ func submitWorkspaceCode(session Session, autoSubmit bool) bool {
 	// commit.gpgsign=true or a repo pre-commit hook would otherwise fail this
 	// silently. The diff below does NOT depend on this commit succeeding —
 	// it diffs the working tree directly — so a failure here is non-fatal.
-	if _, err := runCommand(taskRoot,
-		"git",
-		"-c", "user.name=Promptster Candidate",
-		"-c", "user.email=candidate@promptster.local",
-		"-c", "commit.gpgsign=false",
-		"commit", "--allow-empty", "--no-verify", "-m", "fix: assessment submission",
-	); err != nil {
-		fmt.Fprintf(os.Stderr, "  warning: git commit failed (continuing — diff is taken from working tree): %v\n", err)
+	//
+	// NOT RUN ON THE HOSTED LANE, and that is a privacy mechanism rather than a
+	// tidy-up (design.md §2). The candidate has read-only access to the mirror,
+	// and GitHub creates a PUBLIC FORK under their account when a commit is made
+	// from such a codespace — a repo named after the assessment problem, on their
+	// profile, disclosing their job search to their current employer. Suppressing
+	// our own commit is the one half of that we control.
+	//
+	// It costs nothing because the commit was already best-effort by design:
+	// `git ls-files` reads the INDEX (after `git add -A` above) and `git diff
+	// <base>` compares the WORKING TREE to the base, so neither the bundle nor
+	// the diff has ever depended on a commit existing.
+	if !recordSubmissionCommit(session, taskRoot) {
+		fmt.Printf("  %s Capturing your working tree (no commit needed on this lane)...\n", dim.Render("●"))
 	}
 
 	// Unified diff: compare the *working tree* (== index after `git add -A`)
@@ -130,11 +136,12 @@ func submitWorkspaceCode(session Session, autoSubmit bool) bool {
 	// Falls back to HEAD~1 when there's no recorded base (BYO repos) and
 	// HEAD~1 is reachable (skipped in --depth 1 clones).
 	var diff string
-	if session.RepoCommit != "" {
-		diffArgs := append([]string{"diff", session.RepoCommit}, gitExcludePathspecs(taskRoot)...)
+	base := diffBaseFor(session)
+	if base != "" {
+		diffArgs := append([]string{"diff", base}, gitExcludePathspecs(taskRoot)...)
 		diffOut, err := runCommand(taskRoot, "git", diffArgs...)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "  warning: diff against %s failed: %v\n", session.RepoCommit, err)
+			fmt.Fprintf(os.Stderr, "  warning: diff against %s failed: %v\n", base, err)
 		} else {
 			diff = string(diffOut)
 		}
@@ -164,7 +171,7 @@ func submitWorkspaceCode(session Session, autoSubmit bool) bool {
 
 	// Build the tarball.
 	fmt.Printf("  %s Bundling workspace...\n", dim.Render("●"))
-	bundle, err := bundleWorkspace(taskRoot, session.RepoCommit)
+	bundle, err := bundleWorkspace(taskRoot, base)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "  error: %v\n", err)
 		return false
@@ -195,7 +202,7 @@ func submitWorkspaceCode(session Session, autoSubmit bool) bool {
 		Diff:         string(redactBytes([]byte(diff))),
 		FileTree:     bundle.FileTree,
 		RepoURL:      session.RepoURL,
-		BaseSha:      session.RepoCommit,
+		BaseSha:      base,
 		BundleKey:    urlResp.ObjectKey,
 		BundleSize:   bundle.Size,
 		BundleSHA256: bundle.SHA256Hex,
@@ -246,4 +253,23 @@ func apiSubmitCode(token string, payload submitCodePayload) error {
 		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	return nil
+}
+
+// recordSubmissionCommit makes the audit-trail commit, and reports whether it
+// was attempted at all. Returns false on the hosted lane, where the commit is
+// deliberately not made — see the comment at its call site.
+func recordSubmissionCommit(session Session, taskRoot string) bool {
+	if hostedLaneActive(session) {
+		return false
+	}
+	if _, err := runCommand(taskRoot,
+		"git",
+		"-c", "user.name=Promptster Candidate",
+		"-c", "user.email=candidate@promptster.local",
+		"-c", "commit.gpgsign=false",
+		"commit", "--allow-empty", "--no-verify", "-m", "fix: assessment submission",
+	); err != nil {
+		fmt.Fprintf(os.Stderr, "  warning: git commit failed (continuing — diff is taken from working tree): %v\n", err)
+	}
+	return true
 }

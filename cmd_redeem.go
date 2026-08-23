@@ -74,6 +74,7 @@ func cmdRedeem(args []string) {
 		RepoCommit:        resp.RepoCommit,
 		RepoSubdir:        resp.RepoSubdir,
 		SetupInstructions: resp.SetupInstructions,
+		ExpectedTreeSha:   resp.ExpectedTreeSha,
 		TimeLimitMinutes:  resp.TimeLimitMinutes,
 		IssueID:           resp.IssueID,
 		AllowedTools:      resp.AllowedTools,

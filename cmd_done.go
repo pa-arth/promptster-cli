@@ -47,6 +47,7 @@ func cmdDone(args []string) {
 	// succeed before we mark the session complete — otherwise the candidate
 	// thinks they shipped but no code reached us. Treat any failure path as
 	// fatal and bail before /complete is called.
+	uploadConfirmed := false
 	if session.TaskRoot != "" && session.SessionToken != "" {
 		if !submitWorkspaceCode(session, *autoSubmit) {
 			fmt.Fprintln(os.Stderr)
@@ -54,6 +55,7 @@ func cmdDone(args []string) {
 			fmt.Fprintln(os.Stderr, "  Fix the issue above and retry `promptster done --auto`.")
 			os.Exit(1)
 		}
+		uploadConfirmed = true
 	}
 
 	fmt.Println("Submitting your assessment...")
@@ -106,12 +108,27 @@ func cmdDone(args []string) {
 	fmt.Println()
 	fmt.Println("Thank you for completing the assessment.")
 	fmt.Println(dim.Render("Your results will be available shortly."))
-	if session.TaskRoot != "" {
+	hosted := hostedLaneActive(session)
+	if session.TaskRoot != "" && !hosted {
 		fmt.Printf("\n%s %s\n",
 			dim.Render("You can safely delete your workspace when you're done:"),
 			lipgloss.NewStyle().Foreground(lipgloss.Color("14")).Render(session.TaskRoot))
 	}
-	printShellProxyEnvClearHint()
+	if !hosted {
+		// Suppressed on the hosted lane: this warns that a PERSONAL shell has been
+		// left carrying assessment proxy env, and there is no personal shell in a
+		// disposable VM that is about to be deleted. Everything it protects —
+		// the marker fences, the sidecar state, revertCodexProxy above — still runs.
+		printShellProxyEnvClearHint()
+	}
+
+	// LAST, and only now. Deleting the codespace tears down the process printing
+	// this, so nothing may follow it, and it is gated on an upload that actually
+	// succeeded: `submitWorkspaceCode` returning true and `/complete` returning.
+	// Deleting a box whose work never reached us destroys the only copy.
+	if hosted && uploadConfirmed && inCodespace() {
+		printCodespaceWindDown(deleteHostingCodespace())
+	}
 }
 
 // copyToClipboard copies text to the system clipboard. Returns true on success.
