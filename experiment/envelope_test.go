@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // The tests in this file all target the same class of defect, found by hand on
@@ -241,6 +242,133 @@ func TestClaimActiveTaskIsAtomic(t *testing.T) {
 
 	if got := wins.Load(); got != 1 {
 		t.Fatalf("%d concurrent claims won the single slot; exactly one may, or the losers are orphaned silently", got)
+	}
+}
+
+// TestClaimActiveTaskRecoversACorruptSlotExactlyOnce pins the branch the link(2)
+// publish made reachable-for-the-right-reason. Before it, a slot could be found
+// empty for TWO different reasons — a crashed writer, or a live writer between
+// its exclusive create and its write — and the recovery branch could not tell
+// them apart, so a racer arriving mid-claim "recovered" into a second winner.
+//
+// Publishing a fully-written temp file with link(2) makes the zero-byte state
+// unreachable, which is what lets recovery mean genuine corruption only. This
+// asserts both halves: a corrupt pointer is still recovered rather than wedging
+// the fleet forever, and concurrent racers against one still produce exactly one
+// winner rather than each clearing and claiming in turn.
+func TestClaimActiveTaskRecoversACorruptSlotExactlyOnce(t *testing.T) {
+	withTempRoot(t)
+
+	// Sequential: a truncated pointer is not an envelope, and must not wedge.
+	if err := os.MkdirAll(tasksDir(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(activeTaskPath(), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, claimed, err := claimActiveTask(
+		ActiveTask{TaskKey: "o/after-corrupt", RepoRoot: "/a", OpenedAt: nowUTC()}); err != nil || !claimed {
+		t.Fatalf("a corrupt slot must be recoverable: claimed=%v err=%v", claimed, err)
+	}
+	if got, _ := readActiveTask(); got.TaskKey != "o/after-corrupt" {
+		t.Fatalf("recovery left the slot at %+v", got)
+	}
+
+	// Concurrent, against a corrupt slot: still exactly one winner. Bounding the
+	// retry is what holds this — unbounded retries let every racer clear and
+	// re-claim, reintroducing the double-winner through the recovery path.
+	if err := os.WriteFile(activeTaskPath(), []byte("{ truncated"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	const racers = 16
+	var wg sync.WaitGroup
+	var wins atomic.Int32
+	start := make(chan struct{})
+	for i := range racers {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			if _, ok, err := claimActiveTask(ActiveTask{
+				TaskKey: fmt.Sprintf("o/corrupt-racer-%d", i), RepoRoot: "/r", OpenedAt: nowUTC(),
+			}); err == nil && ok {
+				wins.Add(1)
+			}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	if got := wins.Load(); got != 1 {
+		t.Fatalf("%d claims won a corrupt slot; recovery must not become a second way to double-claim", got)
+	}
+	if _, ok := readActiveTask(); !ok {
+		t.Fatal("the winner's pointer is unreadable; link(2) must only ever publish a complete file")
+	}
+}
+
+// TestClaimActiveTaskReclaimsAnOrphanedRecoveryMarker covers the process that
+// was killed mid-recovery. The marker makes recovery exclusive; without an age
+// check it also makes a dead process able to wedge every later claim, and the
+// caller treats a claim error as a warning and carries on WITHOUT an envelope —
+// so a stuck marker reads downstream as a task nobody ever worked.
+func TestClaimActiveTaskReclaimsAnOrphanedRecoveryMarker(t *testing.T) {
+	withTempRoot(t)
+	if err := os.MkdirAll(tasksDir(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(activeTaskPath(), []byte("{ truncated"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(recoverMarkerPath(), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	orphaned := time.Now().Add(-10 * recoverMarkerStale)
+	if err := os.Chtimes(recoverMarkerPath(), orphaned, orphaned); err != nil {
+		t.Fatal(err)
+	}
+
+	got, claimed, err := claimActiveTask(
+		ActiveTask{TaskKey: "o/after-orphan", RepoRoot: "/a", OpenedAt: nowUTC()})
+	if err != nil || !claimed || got.TaskKey != "o/after-orphan" {
+		t.Fatalf("an orphaned marker must not wedge the slot: claimed=%v got=%q err=%v", claimed, got.TaskKey, err)
+	}
+	if _, err := os.Stat(recoverMarkerPath()); !os.IsNotExist(err) {
+		t.Fatalf("the recovery marker outlived the recovery: %v", err)
+	}
+}
+
+// TestClaimViaExclusiveCreateIsTheLinklessFallback pins the contract of the path
+// taken where link(2) is unavailable — network mounts and FAT-family volumes,
+// reachable through PROMPTSTER_EXPERIMENT_DIR. It carries the original
+// create-then-write window, which is why it is a fallback and not the default;
+// what it must NOT do is fail to publish, because cmdOpen would then record the
+// task as opened with nothing behind it.
+func TestClaimViaExclusiveCreateIsTheLinklessFallback(t *testing.T) {
+	withTempRoot(t)
+	if err := os.MkdirAll(tasksDir(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	data, err := marshalActiveTask(ActiveTask{TaskKey: "o/fallback", RepoRoot: "/a", OpenedAt: nowUTC()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, claimed, err := claimViaExclusiveCreate(
+		ActiveTask{TaskKey: "o/fallback", RepoRoot: "/a", OpenedAt: nowUTC()}, data)
+	if err != nil || !claimed || got.TaskKey != "o/fallback" {
+		t.Fatalf("free slot: claimed=%v got=%q err=%v", claimed, got.TaskKey, err)
+	}
+	if stored, ok := readActiveTask(); !ok || stored.TaskKey != "o/fallback" {
+		t.Fatalf("the fallback must publish a READABLE pointer, got %+v ok=%v", stored, ok)
+	}
+
+	held, claimed, err := claimViaExclusiveCreate(
+		ActiveTask{TaskKey: "o/second", RepoRoot: "/b", OpenedAt: nowUTC()}, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed || held.TaskKey != "o/fallback" {
+		t.Fatalf("occupied slot: claimed=%v held=%q", claimed, held.TaskKey)
 	}
 }
 
