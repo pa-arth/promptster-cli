@@ -688,16 +688,32 @@ func cmdStart(args []string) {
 		}
 	}
 
-	// Hosted-lane boot report (§3.9). Here, and not earlier, because it needs
-	// session.TreeVerification from the adopt step above and the session token
-	// saved just now.
+	// Hosted-lane boot report (§3.9). Started here, and not earlier, because it
+	// needs session.TreeVerification from the adopt step above and the session
+	// token saved just now.
+	//
+	// Started, not awaited. session.StartedAt is already set, so everything from
+	// this point is on the candidate's clock, and the report makes TWO sequential
+	// network calls — GitHub, then our API — each with httpClient's 15s timeout.
+	// Run inline that is up to 30 seconds of assessment time spent before the
+	// watchers are up and the brief is on screen, for telemetry the candidate
+	// cannot act on. It now overlaps the rest of `start` and is joined at the end
+	// with a short grace; see awaitHostedBootReport.
+	//
+	// The session is passed by value rather than captured, so nothing here shares
+	// mutable state with the rest of start.
 	//
 	// Unlike the device check this prints NOTHING on failure. A candidate cannot
 	// act on our telemetry and the clock is theirs; and an absent report is
 	// already a first-class server-side state (`uninstrumented-start`), so
 	// silence here is visible over there rather than lost.
+	var hostedBootDone chan struct{}
 	if hostedLane {
-		reportHostedBoot(session)
+		hostedBootDone = make(chan struct{})
+		go func(s Session) {
+			defer close(hostedBootDone)
+			reportHostedBoot(s)
+		}(session)
 	}
 
 	startStep(7, 7, "Enabling optional /explain...")
@@ -827,6 +843,35 @@ func cmdStart(args []string) {
 	fmt.Println()
 	fmt.Printf("  %s\n", dimText.Render("The task brief is also saved in TASK.md in your workspace."))
 	fmt.Println()
+
+	// Last thing before the process exits, so the report gets the whole of the
+	// output above as free overlap and holds the candidate's terminal for at most
+	// the grace below.
+	awaitHostedBootReport(hostedBootDone)
+}
+
+// hostedBootGrace bounds how long `start` will hold the terminal waiting
+// for our own telemetry once everything the candidate needs is on screen.
+//
+// A grace is needed at all because `start` exits when it returns: with no wait,
+// a report launched moments earlier would be killed mid-flight on nearly every
+// run and the lane would look uninstrumented for a reason that has nothing to do
+// with the box. It is deliberately far below httpClient's 15s per-call timeout —
+// abandoning a slow report costs a data point, and the sentinel is only written
+// after the POST succeeds, so the next `start` retries. Waiting costs the
+// candidate their clock, and that trade is not close.
+const hostedBootGrace = 3 * time.Second
+
+// awaitHostedBootReport joins the in-flight hosted-boot report, or gives up.
+func awaitHostedBootReport(done <-chan struct{}) {
+	if done == nil {
+		return
+	}
+	select {
+	case <-done:
+	case <-time.After(hostedBootGrace):
+		verbosef("hosted-boot: still in flight after %s — abandoning it; the sentinel is unwritten, so the next start retries", hostedBootGrace)
+	}
 }
 
 // nextStepLaunch returns the launch command, its description, and the tool

@@ -336,3 +336,38 @@ func TestDescribeHostedBootReportSaysUnknown(t *testing.T) {
 		t.Fatalf("got %q, want %q", got, want)
 	}
 }
+
+// The hosted-boot report is launched as a goroutine and joined at the end of
+// `start`. Two properties of that join are worth holding: it must not be the
+// thing that keeps the candidate's terminal, and it must not be so short that
+// every report is abandoned.
+func TestAwaitHostedBootReportReturnsWhenTheReportFinishes(t *testing.T) {
+	done := make(chan struct{})
+	close(done)
+	start := time.Now()
+	awaitHostedBootReport(done)
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("waited %s for an already-finished report", elapsed)
+	}
+}
+
+func TestAwaitHostedBootReportIsANoOpOffTheHostedLane(t *testing.T) {
+	start := time.Now()
+	awaitHostedBootReport(nil) // hostedBootDone is nil when the lane is not hosted
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("waited %s on a lane that never started a report", elapsed)
+	}
+}
+
+func TestHostedBootGraceIsWellUnderTheHTTPTimeout(t *testing.T) {
+	// The whole point of the goroutine is that the candidate's clock never pays
+	// for two 15s network calls. A grace at or above httpClient's timeout would
+	// re-create exactly the block it was moved to avoid.
+	if hostedBootGrace >= httpClient.Timeout {
+		t.Fatalf("hostedBootGrace %s is not under httpClient.Timeout %s — the report is back on the timed path",
+			hostedBootGrace, httpClient.Timeout)
+	}
+	if hostedBootGrace <= 0 {
+		t.Fatal("hostedBootGrace must leave the report some time, or every report is abandoned")
+	}
+}
