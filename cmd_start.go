@@ -688,6 +688,18 @@ func cmdStart(args []string) {
 		}
 	}
 
+	// Hosted-lane boot report (§3.9). Here, and not earlier, because it needs
+	// session.TreeVerification from the adopt step above and the session token
+	// saved just now.
+	//
+	// Unlike the device check this prints NOTHING on failure. A candidate cannot
+	// act on our telemetry and the clock is theirs; and an absent report is
+	// already a first-class server-side state (`uninstrumented-start`), so
+	// silence here is visible over there rather than lost.
+	if hostedLane {
+		reportHostedBoot(session)
+	}
+
 	startStep(7, 7, "Enabling optional /explain...")
 	initNudgeState()
 	endStep(7, 7, "Optional /explain ready", "commentary on your decisions, only if you want")

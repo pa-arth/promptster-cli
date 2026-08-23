@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -380,29 +379,15 @@ func hostedBriefLines() []string {
 	}
 }
 
-// hostedSetupJSON is the optional body of the onCreateCommand marker. It exists
-// so §1's lifecycle command can record facts the CLI cannot observe for itself.
-// Unread today by anything but `doctor`; the §3.4 boot report has no CLI caller
-// yet (see the note in doctorHostedLane).
-type hostedSetupJSON struct {
-	Prebuilt    *bool    `json:"prebuilt,omitempty"`
-	BootSeconds *float64 `json:"bootSeconds,omitempty"`
-}
-
-// readHostedSetupMarker parses the marker body when it holds one. A marker that
-// is empty or unparseable still means onCreateCommand finished — presence is the
-// signal; the body is extra.
-func readHostedSetupMarker() (hostedSetupJSON, bool) {
-	data, err := os.ReadFile(hostedSetupMarkerPath())
-	if err != nil {
-		return hostedSetupJSON{}, false
-	}
-	var m hostedSetupJSON
-	if json.Unmarshal(data, &m) != nil {
-		return hostedSetupJSON{}, true
-	}
-	return m, true
-}
+// The marker body and its reader now live in hosted_boot.go (§3.9).
+//
+// This file previously declared it as `{prebuilt, bootSeconds}` — a placeholder
+// written before §1.3 existed, and the wrong two fields. `onCreateCommand`
+// cannot know either: it finishes before there is a terminal to time the boot
+// to, and on a prebuilt box it ran days earlier in a different container
+// generation, so it cannot say whether THIS container came from a prebuild.
+// Both are GitHub's to answer. Nothing ever wrote that shape — there are no
+// mirrors yet — so this replaces a guess, not a producer.
 
 // looksLikeAssessmentKey reports whether s has the shape of a candidate key.
 // Deliberately loose — the server is the authority on validity; this only stops
@@ -566,11 +551,11 @@ func doctorHostedLane(session Session, sessionErr error) {
 				"    Fix: re-create the codespace, or run the assessment's setup command by hand."
 		}
 		detail := "yes"
-		if marker.Prebuilt != nil && *marker.Prebuilt {
-			detail = "yes (prebuilt)"
-		}
-		if marker.BootSeconds != nil {
-			detail += fmt.Sprintf(", boot %.0fs", *marker.BootSeconds)
+		if marker.SetupSeconds != nil {
+			// SETUP time, and labelled as such. It is not the boot budget: on a
+			// prebuilt box this elapsed on GitHub's clock during the prebuild, not
+			// on the candidate's.
+			detail += fmt.Sprintf(" (setup took %ds)", *marker.SetupSeconds)
 		}
 		return detail, ""
 	})

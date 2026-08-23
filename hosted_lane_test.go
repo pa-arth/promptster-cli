@@ -275,7 +275,12 @@ func TestHostedSetupMarker(t *testing.T) {
 		t.Fatal("read a marker that does not exist")
 	}
 
-	if err := os.WriteFile(marker, []byte(`{"prebuilt":true,"bootSeconds":12.5}`), 0o644); err != nil {
+	// The §3.9 body: key=value lines, exactly as scripts/lib/devcontainer.mjs
+	// emits them.
+	written := "schema=1\nstartedAt=2026-08-23T10:00:00Z\ncompletedAt=2026-08-23T10:00:42Z\n" +
+		"setupSeconds=42\nprebuildEnvRaw=\nprebuildEnvSet=no\n" +
+		"codespaceName=octocat-space-1\nissueId=prometheus-prometheus-15141\n"
+	if err := os.WriteFile(marker, []byte(written), 0o644); err != nil {
 		t.Fatalf("write marker: %v", err)
 	}
 	if !hostedSetupCompleted() {
@@ -285,11 +290,22 @@ func TestHostedSetupMarker(t *testing.T) {
 	if !ok {
 		t.Fatal("marker present but not read")
 	}
-	if body.Prebuilt == nil || !*body.Prebuilt {
-		t.Fatal("prebuilt not parsed")
+	if body.Schema != 1 {
+		t.Fatalf("schema = %d, want 1", body.Schema)
 	}
-	if body.BootSeconds == nil || *body.BootSeconds != 12.5 {
-		t.Fatalf("bootSeconds = %v, want 12.5", body.BootSeconds)
+	if body.SetupSeconds == nil || *body.SetupSeconds != 42 {
+		t.Fatalf("setupSeconds = %v, want 42", body.SetupSeconds)
+	}
+	if body.CompletedAt != "2026-08-23T10:00:42Z" {
+		t.Fatalf("completedAt = %q", body.CompletedAt)
+	}
+	if body.IssueID != "prometheus-prometheus-15141" {
+		t.Fatalf("issueId = %q", body.IssueID)
+	}
+	// Evidence, never a verdict: an unset CODESPACE_PREBUILD must not read as a
+	// statement that this was not a prebuild.
+	if body.PrebuildEnvSet {
+		t.Fatal("prebuildEnvSet true for an unset variable")
 	}
 
 	// An empty (touched) marker still means the setup command finished. Presence
