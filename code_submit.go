@@ -90,7 +90,7 @@ type submitCodePayload struct {
 // submitWorkspaceCode bundles the candidate's workspace as a tar.gz, uploads
 // it to Supabase Storage, and then notifies the API via /v1/candidate/submit-code.
 // Returns true on success.
-func submitWorkspaceCode(session Session) bool {
+func submitWorkspaceCode(session Session, autoSubmit bool) bool {
 	dim := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 	success := lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
 
@@ -143,8 +143,23 @@ func submitWorkspaceCode(session Session) bool {
 		diffOut, _ := runCommand(taskRoot, "git", diffArgs...)
 		diff = string(diffOut)
 	}
+	// An empty diff is ambiguous: the candidate wrote nothing, or they wrote it
+	// somewhere this bundle cannot see (a linked worktree, or a second clone made
+	// by following setupInstructions). Those are opposite outcomes and must not
+	// look identical, so go looking before accepting the empty result.
 	if diff == "" {
-		fmt.Fprintf(os.Stderr, "  warning: computed diff is empty — replay will show no modified files\n")
+		if stranded := detectStrandedWork(taskRoot, session.RepoCommit); len(stranded) > 0 {
+			reportStrandedWork(taskRoot, stranded)
+			if !autoSubmit {
+				return false
+			}
+			// --auto is the time-limit path. Refusing here would strand the
+			// session open forever, so submit and let the loud block above stand
+			// as the record of what happened.
+			fmt.Fprintln(os.Stderr, "  --auto: submitting anyway so the time limit still closes the session.")
+		} else {
+			fmt.Fprintf(os.Stderr, "  warning: computed diff is empty — replay will show no modified files\n")
+		}
 	}
 
 	// Build the tarball.
