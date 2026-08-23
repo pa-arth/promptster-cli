@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // withTestHTTPClient points the package httpClient at a test server for the
@@ -170,5 +171,32 @@ func TestSmokeTestProxy_SendsApiKeyToMessagesPath(t *testing.T) {
 	}
 	if gotVersion == "" {
 		t.Error("anthropic-version header must be sent")
+	}
+}
+
+// A stale session must not be probed: the check above it already names the real
+// fix (re-run start), and probing anyway either contradicts that with "contact
+// the recruiter" or — because neither proxy checks expires_at, only
+// candidate_keys.status — prints a green "model reachable" under "session
+// expired".
+func TestProxyProbeBlocker(t *testing.T) {
+	past := time.Now().Add(-time.Hour)
+	future := time.Now().Add(time.Hour)
+
+	for _, tc := range []struct {
+		name    string
+		session Session
+		want    string
+	}{
+		{"no token", Session{ExpiresAt: future}, "no session token"},
+		{"blank token", Session{SessionToken: "   ", ExpiresAt: future}, "no session token"},
+		{"expired", Session{SessionToken: "PST-TEST-KEY9", ExpiresAt: past}, "session expired"},
+		{"live", Session{SessionToken: "PST-TEST-KEY9", ExpiresAt: future}, ""},
+		// No local TTL is the legitimate case for older sessions — probe it.
+		{"no TTL recorded", Session{SessionToken: "PST-TEST-KEY9"}, ""},
+	} {
+		if got := proxyProbeBlocker(tc.session); got != tc.want {
+			t.Errorf("%s: proxyProbeBlocker = %q, want %q", tc.name, got, tc.want)
+		}
 	}
 }
