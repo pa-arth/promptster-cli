@@ -48,7 +48,7 @@ func cmdDone(args []string) {
 	// thinks they shipped but no code reached us. Treat any failure path as
 	// fatal and bail before /complete is called.
 	if session.TaskRoot != "" && session.SessionToken != "" {
-		if !submitWorkspaceCode(session) {
+		if !submitWorkspaceCode(session, *autoSubmit) {
 			fmt.Fprintln(os.Stderr)
 			fmt.Fprintln(os.Stderr, "error: code submission failed — assessment NOT marked complete")
 			fmt.Fprintln(os.Stderr, "  Fix the issue above and retry `promptster done --auto`.")
@@ -137,4 +137,3 @@ func copyToClipboard(text string) bool {
 	cmd.Stdin = strings.NewReader(text)
 	return cmd.Run() == nil
 }
-
