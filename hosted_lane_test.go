@@ -111,7 +111,11 @@ func TestTreeShasMatchRejectsShortPrefixes(t *testing.T) {
 	}
 }
 
-func gitInit(t *testing.T, dir string) {
+// gitInitSeeded initialises a repo AND lands a first commit, which the tree- and
+// nested-checkout tests here need. Distinct from stranded_work_test.go's gitInit,
+// which deliberately leaves HEAD unborn — commitsBeyondBase treats an unborn HEAD
+// as a known zero, so that test file cannot use a seeded repo.
+func gitInitSeeded(t *testing.T, dir string) {
 	t.Helper()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatalf("mkdir %s: %v", dir, err)
@@ -143,7 +147,7 @@ func gitInit(t *testing.T, dir string) {
 
 func TestReadTreeShaMatchesGit(t *testing.T) {
 	dir := t.TempDir()
-	gitInit(t, dir)
+	gitInitSeeded(t, dir)
 
 	sha, err := readTreeSha(dir)
 	if err != nil {
@@ -169,9 +173,9 @@ func TestReadTreeShaFailsOutsideRepo(t *testing.T) {
 
 func TestNestedGitCheckoutsFindsSecondClone(t *testing.T) {
 	root := t.TempDir()
-	gitInit(t, root)
+	gitInitSeeded(t, root)
 	nested := filepath.Join(root, "prometheus")
-	gitInit(t, nested)
+	gitInitSeeded(t, nested)
 
 	found := nestedGitCheckouts(root, 4)
 	if len(found) != 1 || found[0] != nested {
@@ -181,11 +185,11 @@ func TestNestedGitCheckoutsFindsSecondClone(t *testing.T) {
 
 func TestNestedGitCheckoutsIgnoresRootAndVendorDirs(t *testing.T) {
 	root := t.TempDir()
-	gitInit(t, root)
+	gitInitSeeded(t, root)
 	// A vendored dependency with its own .git must not be reported: crying wolf
 	// on every node_modules would train candidates to ignore the one that matters.
 	vendored := filepath.Join(root, "node_modules", "left-pad")
-	gitInit(t, vendored)
+	gitInitSeeded(t, vendored)
 
 	if found := nestedGitCheckouts(root, 4); len(found) != 0 {
 		t.Fatalf("nestedGitCheckouts = %v, want none", found)
@@ -194,7 +198,7 @@ func TestNestedGitCheckoutsIgnoresRootAndVendorDirs(t *testing.T) {
 
 func TestNestedGitCheckoutsFindsLinkedWorktree(t *testing.T) {
 	root := t.TempDir()
-	gitInit(t, root)
+	gitInitSeeded(t, root)
 	// A linked worktree's .git is a FILE, not a directory. Work stranded in one
 	// is exactly as invisible to `done` as work in a second clone.
 	wt := filepath.Join(root, "wt")
@@ -233,7 +237,7 @@ func TestSingleSubdirectoryRefusesAmbiguity(t *testing.T) {
 
 func TestResolveAdoptWorkspaceUsesFlagToplevel(t *testing.T) {
 	root := t.TempDir()
-	gitInit(t, root)
+	gitInitSeeded(t, root)
 	sub := filepath.Join(root, "pkg", "deep")
 	if err := os.MkdirAll(sub, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
@@ -422,7 +426,7 @@ func TestSubmissionCommitSuppressedOnHostedLane(t *testing.T) {
 	}
 
 	hosted := t.TempDir()
-	gitInit(t, hosted)
+	gitInitSeeded(t, hosted)
 	before := countCommits(hosted)
 	if recordSubmissionCommit(Session{HostedLane: true}, hosted) {
 		t.Fatal("recordSubmissionCommit reported an attempt on the hosted lane")
@@ -432,7 +436,7 @@ func TestSubmissionCommitSuppressedOnHostedLane(t *testing.T) {
 	}
 
 	local := t.TempDir()
-	gitInit(t, local)
+	gitInitSeeded(t, local)
 	before = countCommits(local)
 	if !recordSubmissionCommit(Session{}, local) {
 		t.Fatal("recordSubmissionCommit skipped the commit on the local lane")
@@ -447,7 +451,7 @@ func TestSubmissionCommitSuppressedOnHostedLane(t *testing.T) {
 // the candidate's work with no commit in between.
 func TestWorkIsStillVisibleWithNoSubmissionCommit(t *testing.T) {
 	dir := t.TempDir()
-	gitInit(t, dir)
+	gitInitSeeded(t, dir)
 	base, err := exec.Command("git", "-C", dir, "rev-parse", "HEAD").Output()
 	if err != nil {
 		t.Fatalf("rev-parse: %v", err)
@@ -486,7 +490,7 @@ func TestWorkIsStillVisibleWithNoSubmissionCommit(t *testing.T) {
 // look.
 func TestAdoptDoesNotMutateTheCheckout(t *testing.T) {
 	root := t.TempDir()
-	gitInit(t, root)
+	gitInitSeeded(t, root)
 	if out, err := exec.Command("git", "-C", root, "remote", "add", "origin", "https://github.com/promptster-assessments/pilot.git").CombinedOutput(); err != nil {
 		t.Fatalf("remote add: %v: %s", err, out)
 	}

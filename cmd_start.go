@@ -211,8 +211,15 @@ func cmdStart(args []string) {
 			os.Exit(1)
 		}
 		session.TreeVerification = outcome.State
-		session.TaskRoot = chosenPath
-		taskRootDisplay = chosenPath
+		// The subdirectory narrows the task boundary inside a monorepo, and that
+		// is a property of the ASSESSMENT, not of how the checkout got here. The
+		// clone path below applies it; adopting the repo root instead would put
+		// snapshots, capture, the diff and the bundle over the whole repository.
+		// Tree verification and DiffBaseCommit above deliberately stay on the repo
+		// root — they are repo-level facts.
+		adoptedTaskRoot := taskRootWithinRepo(chosenPath, session.RepoSubdir)
+		session.TaskRoot = adoptedTaskRoot
+		taskRootDisplay = adoptedTaskRoot
 		if shaOut, err := exec.Command("git", "-C", chosenPath, "rev-parse", "--short", "HEAD").Output(); err == nil {
 			session.WorkspaceCommit = strings.TrimSpace(string(shaOut))
 		}
@@ -223,9 +230,13 @@ func cmdStart(args []string) {
 		if fullSha, err := exec.Command("git", "-C", chosenPath, "rev-parse", "HEAD").Output(); err == nil {
 			session.DiffBaseCommit = strings.TrimSpace(string(fullSha))
 		}
-		note := chosenPath + " (adopted, tree verified)"
+		adoptedDisplay := chosenPath
+		if adoptedTaskRoot != chosenPath {
+			adoptedDisplay = fmt.Sprintf("%s (task root: %s)", chosenPath, adoptedTaskRoot)
+		}
+		note := adoptedDisplay + " (adopted, tree verified)"
 		if outcome.State == hostedTreeUnverified {
-			note = chosenPath + " (adopted, tree NOT verified)"
+			note = adoptedDisplay + " (adopted, tree NOT verified)"
 		}
 		endStep(3, 7, "Preparing workspace", note)
 		if outcome.State == hostedTreeUnverified {
@@ -272,16 +283,7 @@ func cmdStart(args []string) {
 			}
 			endStepWarn(3, 7, "Preparing workspace", msg)
 		} else {
-			if session.RepoSubdir != "" {
-				cleanedSubdir := filepath.Clean(session.RepoSubdir)
-				if cleanedSubdir == "." || cleanedSubdir == string(filepath.Separator) {
-					cleanedSubdir = ""
-				}
-				cleanedSubdir = strings.TrimPrefix(cleanedSubdir, string(filepath.Separator))
-				if cleanedSubdir != "" && !strings.HasPrefix(cleanedSubdir, "..") {
-					taskRootPath = filepath.Join(workspacePath, cleanedSubdir)
-				}
-			}
+			taskRootPath = taskRootWithinRepo(workspacePath, session.RepoSubdir)
 
 			if shaOut, err := exec.Command("git", "-C", workspacePath, "rev-parse", "--short", "HEAD").Output(); err == nil {
 				session.WorkspaceCommit = strings.TrimSpace(string(shaOut))
@@ -913,6 +915,31 @@ func wordWrap(text string, maxWidth int) []string {
 		lines = append(lines, current)
 	}
 	return lines
+}
+
+// taskRootWithinRepo applies session.RepoSubdir to a repository root, returning
+// the directory the assessment is actually scoped to.
+//
+// Shared by the clone path and the adopt path on purpose: they used to compute
+// this independently and the adopt path simply did not, so a hosted monorepo
+// assessment captured, diffed and bundled the entire repository. A subdirectory
+// that escapes the root (absolute, or climbing out with ..) is ignored rather
+// than honoured — the root is the safe answer and the value comes from the
+// server, not from the candidate.
+func taskRootWithinRepo(repoRoot, subdir string) string {
+	cleaned := strings.TrimSpace(subdir)
+	if cleaned == "" {
+		return repoRoot
+	}
+	cleaned = filepath.Clean(cleaned)
+	if cleaned == "." || cleaned == string(filepath.Separator) {
+		return repoRoot
+	}
+	cleaned = strings.TrimPrefix(cleaned, string(filepath.Separator))
+	if cleaned == "" || cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) {
+		return repoRoot
+	}
+	return filepath.Join(repoRoot, cleaned)
 }
 
 // resolveWorkspacePath determines the workspace directory. If --workspace is

@@ -155,7 +155,14 @@ func submitWorkspaceCode(session Session, autoSubmit bool) bool {
 	// by following setupInstructions). Those are opposite outcomes and must not
 	// look identical, so go looking before accepting the empty result.
 	if diff == "" {
-		if stranded := detectStrandedWork(taskRoot, session.RepoCommit, session.RepoURL); len(stranded) > 0 {
+		// Same base the diff and the bundle used, NOT session.RepoCommit. On the
+		// hosted lane RepoCommit is upstream's brokenSha and names no object in
+		// the mirror, so isAssessmentCheckout's commit signal never fires and its
+		// URL signal compares upstream against the mirror's origin — the guard
+		// would be silently inert on the one lane where a second checkout is
+		// easiest to create. Off the hosted lane diffBaseFor returns RepoCommit,
+		// so this is the same value it always was.
+		if stranded := detectStrandedWork(taskRoot, base, session.RepoURL); len(stranded) > 0 {
 			reportStrandedWork(taskRoot, stranded)
 			if !autoSubmit {
 				return false
