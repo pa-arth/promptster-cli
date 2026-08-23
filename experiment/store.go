@@ -188,12 +188,47 @@ func writeActiveTask(t ActiveTask) error {
 // fails with EEXIST exactly like O_EXCL but can only ever make a COMPLETE file
 // visible. The zero-byte state is now unreachable, which is what lets the
 // recovery branch below be reserved for genuine corruption.
-// claimAttempts bounds the link/recover loop. Recovery is microseconds, so this
-// is generous; it exists so an orphaned recovery marker surfaces as an error
-// instead of spinning forever.
-const claimAttempts = 8
+// The recover loop is bounded by TIME, not by a retry count. A count encodes an
+// assumption about how long recovery takes, and this fleet runs 5-10 sessions on
+// one box where load averages above 50 are normal — eight one-millisecond tries
+// would report "unreadable pointer" for a recovery that was merely slow, and the
+// caller treats that as a warning and carries on WITHOUT an envelope.
+//
+// recoverMarkerStale is the other half: a process killed while holding the
+// marker must not wedge every later claim, so a marker older than this is
+// treated as orphaned and cleared.
+const (
+	claimDeadline      = 5 * time.Second
+	claimBackoffMax    = 50 * time.Millisecond
+	recoverMarkerStale = 2 * time.Second
+)
 
 func recoverMarkerPath() string { return filepath.Join(tasksDir(), "active.recover") }
+
+// claimViaExclusiveCreate is the fallback for filesystems that reject hard links
+// (some network mounts, FAT-family volumes) — reachable through
+// PROMPTSTER_EXPERIMENT_DIR, or a home directory on such a mount. It is the
+// pre-link implementation, so the narrow create-then-write window returns THERE
+// and only there, which is strictly no worse than shipping a claim that cannot
+// be published at all: cmdOpen treats a claim error as a warning and continues,
+// recording the task as opened with no envelope behind it.
+func claimViaExclusiveCreate(t ActiveTask, data []byte) (ActiveTask, bool, error) {
+	f, err := os.OpenFile(activeTaskPath(), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		if os.IsExist(err) {
+			if held, ok := readActiveTask(); ok {
+				return held, false, nil
+			}
+			return ActiveTask{}, true, writeActiveTask(t)
+		}
+		return ActiveTask{}, false, err
+	}
+	defer f.Close()
+	if _, err := f.Write(data); err != nil {
+		return ActiveTask{}, false, err
+	}
+	return t, true, nil
+}
 
 func claimActiveTask(t ActiveTask) (ActiveTask, bool, error) {
 	if err := os.MkdirAll(tasksDir(), 0o700); err != nil {
@@ -233,13 +268,18 @@ func claimActiveTask(t ActiveTask) (ActiveTask, bool, error) {
 	// So the slot is never removed. It is REPLACED, with rename(2), by whichever
 	// racer holds the recovery marker — one syscall, no window, and every other
 	// racer's link keeps failing with EEXIST until it can read the replacement.
-	for attempt := 0; attempt < claimAttempts; attempt++ {
+	deadline := time.Now().Add(claimDeadline)
+	backoff := time.Millisecond
+	for {
 		err := os.Link(tmpPath, activeTaskPath())
 		if err == nil {
 			return t, true, nil
 		}
 		if !os.IsExist(err) {
-			return ActiveTask{}, false, err
+			// link(2) is unavailable here, or failed for a reason the fallback
+			// will surface as its own error. Never leave the caller with no
+			// envelope while telling it the task is open.
+			return claimViaExclusiveCreate(t, data)
 		}
 		if held, ok := readActiveTask(); ok {
 			return held, false, nil
@@ -248,31 +288,40 @@ func claimActiveTask(t ActiveTask) (ActiveTask, bool, error) {
 		// flight can no longer look like this, which is the whole point of the
 		// link(2) publish above.
 		rec, recErr := os.OpenFile(recoverMarkerPath(), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-		if recErr != nil {
-			// Someone else is recovering. Give them a moment, then re-link and
-			// read their replacement.
-			time.Sleep(time.Millisecond)
+		if recErr == nil {
+			held, ok := readActiveTask()
+			if ok {
+				// Someone replaced it while we took the marker.
+				rec.Close()
+				os.Remove(recoverMarkerPath())
+				return held, false, nil
+			}
+			renameErr := os.Rename(tmpPath, activeTaskPath())
+			rec.Close()
+			os.Remove(recoverMarkerPath())
+			if renameErr != nil {
+				return ActiveTask{}, false, renameErr
+			}
+			return t, true, nil
+		}
+		// Someone else is recovering — or died holding the marker.
+		if info, statErr := os.Stat(recoverMarkerPath()); statErr == nil &&
+			time.Since(info.ModTime()) > recoverMarkerStale {
+			os.Remove(recoverMarkerPath())
 			continue
 		}
-		held, ok := readActiveTask()
-		if !ok {
-			err = os.Rename(tmpPath, activeTaskPath())
+		if time.Now().After(deadline) {
+			break
 		}
-		rec.Close()
-		os.Remove(recoverMarkerPath())
-		if ok {
-			// Someone replaced it while we took the marker.
-			return held, false, nil
+		time.Sleep(backoff)
+		if backoff < claimBackoffMax {
+			backoff *= 2
 		}
-		if err != nil {
-			return ActiveTask{}, false, err
-		}
-		return t, true, nil
 	}
-	// Reached only if the slot stayed unreadable for every attempt — in practice
-	// a recovery marker orphaned by a killed process. Failing loudly is correct:
-	// the alternative is claiming a slot we could not prove was free, which is
-	// the silent orphaning this file exists to prevent.
+	// Reached only if the slot stayed unreadable for the whole deadline while a
+	// live-looking marker kept being refreshed. Failing loudly is correct: the
+	// alternative is claiming a slot we could not prove was free, which is the
+	// silent orphaning this file exists to prevent.
 	return ActiveTask{}, false, fmt.Errorf("envelope slot %s is held by an unreadable pointer", activeTaskPath())
 }
 
