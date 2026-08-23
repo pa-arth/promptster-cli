@@ -40,7 +40,32 @@ type Session struct {
 	SetupInstructions string `json:"setupInstructions,omitempty"`
 	WorkspaceCommit   string `json:"workspaceCommit,omitempty"`
 	TaskRoot          string `json:"taskRoot,omitempty"`
-	TimeLimitMinutes  int    `json:"timeLimitMinutes"`
+	// ExpectedTreeSha is the mirror's `git rev-parse HEAD^{tree}`, recorded at
+	// mirror-build time and mirrored from the redeem response. `start --adopt`
+	// compares the adopted checkout against it and HARD-FAILS on a mismatch
+	// (design.md §5). Empty when the server does not send it — that is an
+	// unverified adopt, reported loudly, never a silent pass.
+	ExpectedTreeSha string `json:"expectedTreeSha,omitempty"`
+	// HostedLane records that this session adopted a hosted checkout, so `done`,
+	// `abort` and `doctor` still know the lane in a shell whose environment has
+	// been stripped.
+	HostedLane bool `json:"hostedLane,omitempty"`
+	// TreeVerification is the adopt verdict for the record: "verified",
+	// "unverified", or absent on the local lane. The two fatal states never
+	// reach a saved session — `start` exits on them.
+	TreeVerification string `json:"treeVerification,omitempty"`
+	// DiffBaseCommit is the commit every diff and bundle is measured against.
+	//
+	// It exists because RepoCommit CANNOT play that role on an adopted checkout.
+	// RepoCommit is the UPSTREAM brokenSha; the mirror is a single orphan commit
+	// whose TREE equals upstream's at that sha but whose commit object upstream's
+	// sha names does not exist in the mirror at all. `git diff <brokenSha>` there
+	// fails outright, and the failure path is a warning plus an EMPTY diff — a
+	// submission that silently contains none of the candidate's work.
+	//
+	// Empty on the local lane, where RepoCommit is fetched and therefore real.
+	DiffBaseCommit   string `json:"diffBaseCommit,omitempty"`
+	TimeLimitMinutes int    `json:"timeLimitMinutes"`
 	// ApiURL is the resolved API URL at the time of `start`. Hooks read this
 	// as a fallback when the PROMPTSTER_API_URL env var is not set (e.g. Cursor
 	// launched from Dock won't inherit shell env vars).

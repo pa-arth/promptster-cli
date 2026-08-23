@@ -322,6 +322,13 @@ func cmdDoctor() {
 		})
 
 		check("Shell hook sourced in RC file(s)", func() (string, string) {
+			// On the hosted lane the image's own shell init sources the hook and
+			// `start` skips the per-user injection, so an empty RC is the CORRECT
+			// state there — failing on it would print a red ✗ describing a
+			// deliberate choice. The hosted section runs its own check.
+			if inCodespace() && systemShellInitSourcesHook() {
+				return "system shell init (hosted lane)", ""
+			}
 			rcs := shellRCPathsForInstall()
 			if len(rcs) == 0 {
 				return "", "could not determine shell RC path\n    Fix: manually source " + shellPath + " in your shell RC"
@@ -361,6 +368,10 @@ func cmdDoctor() {
 		return "clean", ""
 	})
 	fmt.Println()
+
+	// Hosted lane. Printed only inside a codespace (or for a session that recorded
+	// one), so the local lane's output is byte-identical to what it was.
+	doctorHostedLane(session, sessionErr)
 
 	// Editor attention capture — installed, activated, and capturing.
 	// Deliberately before Connectivity: all three of these are local facts, and

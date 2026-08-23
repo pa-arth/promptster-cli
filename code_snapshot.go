@@ -68,7 +68,7 @@ func snapshotWorkspace(session Session) {
 	}
 
 	taskRoot := session.TaskRoot
-	baseSha := session.RepoCommit
+	baseSha := diffBaseFor(session)
 
 	// Stage with -N (intent-to-add) so untracked files appear in `git diff`
 	// without actually committing or polluting the index. Pathspec excludes

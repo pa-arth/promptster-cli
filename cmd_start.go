@@ -52,8 +52,31 @@ func cmdStart(args []string) {
 	// change leaves standing: the extension installs into whatever editor the
 	// candidate uses. What is retired is Cursor as an instrumented AGENT.
 	noEditorExt := fs.Bool("no-editor-extension", false, "Skip installing the Promptster editor extension into VS Code/Cursor (the session records that editor attention capture was unavailable)")
+	// --adopt: work in the checkout that is already here instead of cloning one.
+	//
+	// It DEFAULTS ON inside a Codespace (openspec §2.2). That default is the
+	// point: the candidate's typed command has to be identical on both lanes —
+	// `promptster start PST-XXXX-XXXX` — because the hosted lane exists to delete
+	// setup steps, and "on this lane, add a flag" is a setup step. `--adopt=false`
+	// still forces the clone path for anyone who needs it.
+	adoptFlag := fs.Bool("adopt", false, "Adopt the checkout already present instead of cloning (default: on inside a GitHub Codespace)")
 	fs.Parse(args) //nolint:errcheck
 	startVerbose = *verbose
+
+	adopt := *adoptFlag
+	if !fs.Changed("adopt") {
+		adopt = inCodespace()
+	}
+	// hostedLane is deliberately NOT `adopt && inCodespace()`. The fork hazard
+	// (design.md §2) and the wrong-instructions hazard (§3.2) are properties of
+	// being in a read-only codespace, not of how the workspace was resolved — so
+	// `--adopt=false` inside a codespace must still suppress the commit and the
+	// clone-and-checkout text. Tying the copy to the flag would let one override
+	// silently switch off a privacy mechanism.
+	hostedLane := inCodespace()
+	if hostedLane {
+		verbosef("hosted lane detected: CODESPACE_NAME=%s", codespaceName())
+	}
 
 	// Check for CLI updates (non-blocking, best-effort)
 	checkForUpdate()
@@ -72,9 +95,7 @@ func cmdStart(args []string) {
 	skipConsent := false
 	taskRootDisplay := ""
 
-	// If a key is passed as a positional arg, auto-redeem first
-	if remaining := fs.Args(); len(remaining) > 0 && strings.HasPrefix(strings.ToUpper(remaining[0]), "PST-") {
-		key := remaining[0]
+	redeemKey := func(key string) {
 		keyStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("14")).Bold(true)
 		fmt.Printf("  Redeeming %s...\n", keyStyle.Render(key))
 		var redeemArgs []string
@@ -86,11 +107,32 @@ func cmdStart(args []string) {
 		fmt.Println()
 	}
 
+	// If a key is passed as a positional arg, auto-redeem first
+	if remaining := fs.Args(); len(remaining) > 0 && strings.HasPrefix(strings.ToUpper(remaining[0]), "PST-") {
+		redeemKey(remaining[0])
+	}
+
 	startStepSection("Setup")
 
 	startStep(1, 7, "Loading saved session...")
 	verbosef("session file: %s", sessionPath())
 	saved, err := loadSession()
+	if err != nil {
+		// No saved session and no key on the command line. ASK for it rather than
+		// exiting (openspec §2.7): the hosted lane launches this from
+		// postAttachCommand, so a hard exit here would greet the candidate with an
+		// error telling them to run the command that just ran. Their only action
+		// is a paste, and this is where the paste goes.
+		//
+		// Non-interactive callers keep the old exact behaviour — promptForAssessmentKey
+		// returns "" when stdin is not a terminal, so scripts still fail fast.
+		if key := promptForAssessmentKey(); key != "" {
+			fmt.Println()
+			redeemKey(key)
+			startStep(1, 7, "Loading saved session...")
+			saved, err = loadSession()
+		}
+	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error: no session found — run: promptster start PST-XXXX-XXXX")
 		os.Exit(1)
@@ -98,6 +140,11 @@ func cmdStart(args []string) {
 	verbosef("sessionId=%s assessmentId=%s", saved.SessionID, saved.AssessmentID)
 	endStep(1, 7, "Loading saved session", "")
 	session = saved
+	// Recorded from the ENVIRONMENT, not from the assessment's hostingLane: the
+	// assessment carries the recruiter's OFFER, and a candidate offered the
+	// hosted lane can still clone locally. This is what keeps `done`, `abort` and
+	// `doctor` on the right lane in a shell that never inherited the codespace env.
+	session.HostedLane = hostedLane
 	taskBrief = saved.TaskBrief
 	timeLimitMinutes = saved.TimeLimitMinutes
 	skipConsent = saved.ConsentAccepted
@@ -130,14 +177,74 @@ func cmdStart(args []string) {
 	// [3/7] Prepare workspace (select path + clone/init if needed) ───────────
 	// Workspace selection is interactive when stdin is a terminal and no
 	// --workspace flag was given; otherwise a sensible default is used silently.
-	isInteractive := stdinIsTerminal() && *workspaceFlag == ""
+	isInteractive := stdinIsTerminal() && *workspaceFlag == "" && !adopt
 	if !isInteractive {
 		startStep(3, 7, "Preparing workspace...")
 	} else {
 		startStepBlock(3, 7, "Preparing workspace...")
 	}
 
-	chosenPath := resolveWorkspacePath(*workspaceFlag, session)
+	var chosenPath string
+	if adopt {
+		// ADOPT: the tree is already here. prepareWorkspaceCheckout is skipped
+		// ENTIRELY — not pointed elsewhere, not made conditional inside — because
+		// running it in a codespace materialises a second tree beside the mirror
+		// the container was built from, and TaskRoot follows the new one while the
+		// candidate keeps working in the old one.
+		adopted, adoptErr := resolveAdoptWorkspace(*workspaceFlag)
+		if adoptErr != nil {
+			endStepWarn(3, 7, "Preparing workspace", adoptErr.Error())
+			fmt.Fprintln(os.Stderr)
+			fmt.Fprintln(os.Stderr, "error: --adopt could not find a checkout to adopt.")
+			fmt.Fprintln(os.Stderr, "  Run promptster start from inside the assessment folder, or pass --workspace PATH.")
+			os.Exit(1)
+		}
+		chosenPath = adopted
+		verbosef("adopted checkout: %s", chosenPath)
+
+		actualTree, treeErr := readTreeSha(chosenPath)
+		outcome := evaluateAdoptedTree(session.ExpectedTreeSha, actualTree, treeErr)
+		verbosef("tree verification: state=%s expected=%s actual=%s", outcome.State, outcome.Expected, outcome.Actual)
+		if outcome.fatal() {
+			endStepWarn(3, 7, "Preparing workspace", "tree check failed ("+outcome.State+")")
+			printAdoptFailure(outcome, chosenPath)
+			os.Exit(1)
+		}
+		session.TreeVerification = outcome.State
+		// The subdirectory narrows the task boundary inside a monorepo, and that
+		// is a property of the ASSESSMENT, not of how the checkout got here. The
+		// clone path below applies it; adopting the repo root instead would put
+		// snapshots, capture, the diff and the bundle over the whole repository.
+		// Tree verification and DiffBaseCommit above deliberately stay on the repo
+		// root — they are repo-level facts.
+		adoptedTaskRoot := taskRootWithinRepo(chosenPath, session.RepoSubdir)
+		session.TaskRoot = adoptedTaskRoot
+		taskRootDisplay = adoptedTaskRoot
+		if shaOut, err := exec.Command("git", "-C", chosenPath, "rev-parse", "--short", "HEAD").Output(); err == nil {
+			session.WorkspaceCommit = strings.TrimSpace(string(shaOut))
+		}
+		// The adopted checkout's own HEAD is the diff base. session.RepoCommit is
+		// the UPSTREAM brokenSha and names no object in a mirror clone, so leaving
+		// it as the base makes every diff and every bundle scrub fail — silently,
+		// into an empty submission. See Session.DiffBaseCommit.
+		if fullSha, err := exec.Command("git", "-C", chosenPath, "rev-parse", "HEAD").Output(); err == nil {
+			session.DiffBaseCommit = strings.TrimSpace(string(fullSha))
+		}
+		adoptedDisplay := chosenPath
+		if adoptedTaskRoot != chosenPath {
+			adoptedDisplay = fmt.Sprintf("%s (task root: %s)", chosenPath, adoptedTaskRoot)
+		}
+		note := adoptedDisplay + " (adopted, tree verified)"
+		if outcome.State == hostedTreeUnverified {
+			note = adoptedDisplay + " (adopted, tree NOT verified)"
+		}
+		endStep(3, 7, "Preparing workspace", note)
+		if outcome.State == hostedTreeUnverified {
+			printAdoptUnverified(outcome)
+		}
+	} else {
+		chosenPath = resolveWorkspacePath(*workspaceFlag, session)
+	}
 	verbosef("workspace path: %s", chosenPath)
 	if session.RepoURL != "" {
 		verbosef("repo: %s", session.RepoURL)
@@ -149,7 +256,11 @@ func cmdStart(args []string) {
 		}
 	}
 
-	if session.RepoURL == "" {
+	if adopt {
+		// Nothing to do: the adopt branch above already resolved TaskRoot from the
+		// checkout that was here. This arm exists so the two paths are visibly
+		// exclusive rather than exclusive by accident.
+	} else if session.RepoURL == "" {
 		// No repo to clone — just ensure the directory exists and set TaskRoot.
 		if err := os.MkdirAll(chosenPath, 0o755); err != nil {
 			endStepWarn(3, 7, "Preparing workspace", fmt.Sprintf("could not create directory: %v", err))
@@ -172,16 +283,7 @@ func cmdStart(args []string) {
 			}
 			endStepWarn(3, 7, "Preparing workspace", msg)
 		} else {
-			if session.RepoSubdir != "" {
-				cleanedSubdir := filepath.Clean(session.RepoSubdir)
-				if cleanedSubdir == "." || cleanedSubdir == string(filepath.Separator) {
-					cleanedSubdir = ""
-				}
-				cleanedSubdir = strings.TrimPrefix(cleanedSubdir, string(filepath.Separator))
-				if cleanedSubdir != "" && !strings.HasPrefix(cleanedSubdir, "..") {
-					taskRootPath = filepath.Join(workspacePath, cleanedSubdir)
-				}
-			}
+			taskRootPath = taskRootWithinRepo(workspacePath, session.RepoSubdir)
 
 			if shaOut, err := exec.Command("git", "-C", workspacePath, "rev-parse", "--short", "HEAD").Output(); err == nil {
 				session.WorkspaceCommit = strings.TrimSpace(string(shaOut))
@@ -372,7 +474,21 @@ func cmdStart(args []string) {
 	for _, rc := range shellRCPathsForInstall() {
 		verbosef("will inject source line into %s", rc)
 	}
-	_, shellErr := installShellHook()
+	// On the hosted lane the image's own shell init sources the hook, so writing
+	// it into ~/.bashrc as well would double it. Skip the injection only when the
+	// system line is actually there — see systemShellInitSourcesHook.
+	//
+	// The failure is non-fatal on BOTH lanes and always was: `start` warns and
+	// carries on. Worth stating rather than changing, because a hosted box has a
+	// read-only-ish home in some configurations and a fatal shell-hook failure
+	// there would kill an assessment over terminal capture, which is one signal
+	// among many.
+	injectRC := true
+	if hostedLane && systemShellInitSourcesHook() {
+		injectRC = false
+		verbosef("hosted lane: system shell init already sources the hook — skipping RC injection")
+	}
+	_, shellErr := installShellHookWithRC(injectRC)
 	if shellErr != nil {
 		fmt.Fprintf(os.Stderr, "warning: could not install shell hook: %v\n", shellErr)
 	}
@@ -610,9 +726,23 @@ func cmdStart(args []string) {
 		fmt.Printf("  %s %s\n", infoLabel.Render("Workspace:"), codeText.Render(taskRootDisplay))
 		fmt.Println()
 	}
-	if strings.TrimSpace(session.SetupInstructions) != "" {
+	// setupInstructions is DISPLAY-ONLY on every lane — the CLI never executes it,
+	// it just prints it — which is exactly why it is dangerous here. On the hosted
+	// lane the stored text tells the candidate to clone and check out, and a
+	// candidate who follows it lands in a second checkout that `done` does not
+	// bundle. Backend #789 already serves lane-aware text (§3.2); this is the
+	// defense in depth behind it, and it is reliable in a way it would not be on
+	// the local lane because the hosted image bakes this binary in — no version skew.
+	if strings.TrimSpace(session.SetupInstructions) != "" && !hostedLane {
 		fmt.Printf("  %s\n", infoLabel.Render("Setup / How to run:"))
 		for _, line := range strings.Split(session.SetupInstructions, "\n") {
+			fmt.Printf("  %s\n", infoText.Render(line))
+		}
+		fmt.Println()
+	}
+	if hostedLane {
+		fmt.Printf("  %s\n", infoLabel.Render("Your environment:"))
+		for _, line := range hostedBriefLines() {
 			fmt.Printf("  %s\n", infoText.Render(line))
 		}
 		fmt.Println()
@@ -653,12 +783,26 @@ func cmdStart(args []string) {
 	warnBody := lipgloss.NewStyle().
 		Foreground(cWarnText)
 	var warnContent strings.Builder
-	warnContent.WriteString(warnHeading.Render("⚠  Open " + toolNoun + " from this workspace"))
-	warnContent.WriteString("\n")
-	warnContent.WriteString(warnBody.Render(strings.Join(wordWrap(
-		"Promptster only captures sessions started from the directory above. "+
-			"A session opened anywhere else will not be recorded.",
-		64), "\n")))
+	if hostedLane {
+		// The local-lane warning tells the candidate not to open their editor
+		// somewhere else. In a codespace there IS nowhere else — the terminal they
+		// are reading this in is already in the workspace — and the mistake that
+		// actually happens here is the opposite one: making a second checkout.
+		warnContent.WriteString(warnHeading.Render("⚠  Work here, in this codespace"))
+		warnContent.WriteString("\n")
+		warnContent.WriteString(warnBody.Render(strings.Join(wordWrap(
+			"Do not clone the repository again. Promptster submits the working tree "+
+				"at the path above; anything you write in a second copy will not be "+
+				"captured and will not be submitted.",
+			64), "\n")))
+	} else {
+		warnContent.WriteString(warnHeading.Render("⚠  Open " + toolNoun + " from this workspace"))
+		warnContent.WriteString("\n")
+		warnContent.WriteString(warnBody.Render(strings.Join(wordWrap(
+			"Promptster only captures sessions started from the directory above. "+
+				"A session opened anywhere else will not be recorded.",
+			64), "\n")))
+	}
 	fmt.Println(warnBorderStyle.Render(warnContent.String()))
 	fmt.Println()
 
@@ -771,6 +915,31 @@ func wordWrap(text string, maxWidth int) []string {
 		lines = append(lines, current)
 	}
 	return lines
+}
+
+// taskRootWithinRepo applies session.RepoSubdir to a repository root, returning
+// the directory the assessment is actually scoped to.
+//
+// Shared by the clone path and the adopt path on purpose: they used to compute
+// this independently and the adopt path simply did not, so a hosted monorepo
+// assessment captured, diffed and bundled the entire repository. A subdirectory
+// that escapes the root (absolute, or climbing out with ..) is ignored rather
+// than honoured — the root is the safe answer and the value comes from the
+// server, not from the candidate.
+func taskRootWithinRepo(repoRoot, subdir string) string {
+	cleaned := strings.TrimSpace(subdir)
+	if cleaned == "" {
+		return repoRoot
+	}
+	cleaned = filepath.Clean(cleaned)
+	if cleaned == "." || cleaned == string(filepath.Separator) {
+		return repoRoot
+	}
+	cleaned = strings.TrimPrefix(cleaned, string(filepath.Separator))
+	if cleaned == "" || cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) {
+		return repoRoot
+	}
+	return filepath.Join(repoRoot, cleaned)
 }
 
 // resolveWorkspacePath determines the workspace directory. If --workspace is

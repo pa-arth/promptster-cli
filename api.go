@@ -68,8 +68,25 @@ type RedeemResponse struct {
 	RepoCommit        string `json:"repoCommit"`
 	SetupInstructions string `json:"setupInstructions"`
 	RepoSubdir        string `json:"repoSubdir"`
-	TimeLimitMinutes  int    `json:"timeLimitMinutes"`
-	IssueID           string `json:"issueId"`
+	// HostingLane is "hosted" or "local" (backend #789). Read but NOT acted on:
+	// it is the RECRUITER's offer, and a candidate offered the hosted lane can
+	// still clone locally. What lane this session is actually on is decided by
+	// the environment the CLI finds itself in (see inCodespace), which is the
+	// same reasoning the backend applies when a boot report arrives.
+	HostingLane string `json:"hostingLane,omitempty"`
+	// HostedLaunchUrl is the codespaces.new deep link for the mirror (backend
+	// #789). Carried so `doctor` can point a candidate at the right box.
+	HostedLaunchUrl string `json:"hostedLaunchUrl,omitempty"`
+	// ExpectedTreeSha is the mirror tree `start --adopt` verifies against.
+	//
+	// ⚠ THE BACKEND DOES NOT SEND THIS YET. `oss_issues` has `mirror_repo_slug`
+	// but no expected-tree column, and no §3 task carries the catalog's
+	// `expectedTreeSha` (openspec §1.1) onto the redeem payload. Absence is
+	// handled as an explicit `unverified` adopt rather than as a match, so the
+	// day the field starts arriving the check begins working with no CLI change.
+	ExpectedTreeSha  string `json:"expectedTreeSha,omitempty"`
+	TimeLimitMinutes int    `json:"timeLimitMinutes"`
+	IssueID          string `json:"issueId"`
 	// ExpiresAt is the candidate-key expiration timestamp. The shell hook uses
 	// this for local staleness checks so it can self-evict on stale sessions
 	// without an API round-trip per new shell.
