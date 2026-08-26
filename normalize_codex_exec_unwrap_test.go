@@ -227,3 +227,87 @@ func TestCodexRejectedPatchEmitsNoFileDiff(t *testing.T) {
 		t.Error("the failed apply_patch must be recorded as ok=false")
 	}
 }
+
+// --- FileChange is the authoritative record --------------------------------
+//
+// The apply_patch ENVELOPE is the model's request; the FileChange item is what
+// landed. Only the latter can describe a deletion: the envelope spells one
+// "*** Delete File: path" with no body, so the file_diff carried diff="" and
+// linesRemoved=0 and the replay rendered "No diff content available" for a file
+// the candidate deliberately removed.
+
+const codexFileChangeDelete = `{"timestamp":"2026-08-26T13:30:00.0Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"FileChange","id":"exec-1","changes":{"src/old.py":{"type":"delete","content":"import os\nimport sys\nprint(1)\n"}}}}}`
+
+const codexFileChangeUpdate = `{"timestamp":"2026-08-26T13:30:05.0Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"FileChange","id":"exec-2","changes":{"src/keep.py":{"type":"update","unified_diff":"@@ -1,2 +1,2 @@\n-old\n+new\n","move_path":null}}}}}`
+
+func TestCodexDeletedFileReportsItsLines(t *testing.T) {
+	p := newCodexRolloutProcessor("sess-1", false)
+	events := feed(p, codexFileChangeDelete)
+
+	if len(events) != 1 || events[0].Kind != "file_diff" {
+		t.Fatalf("expected one file_diff, got %v", kindsOf(events))
+	}
+	d := eventData(t, events[0])
+	if got, _ := d["changeType"].(string); got != "delete" {
+		t.Errorf("changeType = %q, want delete", got)
+	}
+	if got, _ := d["linesRemoved"].(int); got != 3 {
+		t.Errorf("linesRemoved = %v, want 3 — a deletion is not zero work", d["linesRemoved"])
+	}
+	// The replay renders "No diff content available." on an empty body, which is
+	// exactly the wrong thing to show for a deliberate deletion.
+	diff, _ := d["diff"].(string)
+	if diff == "" {
+		t.Fatal("a deleted file must still carry a renderable diff body")
+	}
+	if !strings.Contains(diff, "-import os") {
+		t.Errorf("deleted content must render as removals: %q", diff)
+	}
+}
+
+func TestCodexUpdateUsesTheHostsUnifiedDiff(t *testing.T) {
+	p := newCodexRolloutProcessor("sess-1", false)
+	events := feed(p, codexFileChangeUpdate)
+
+	if len(events) != 1 {
+		t.Fatalf("expected one file_diff, got %v", kindsOf(events))
+	}
+	d := eventData(t, events[0])
+	diff, _ := d["diff"].(string)
+	if !strings.Contains(diff, "-old") || !strings.Contains(diff, "+new") {
+		t.Errorf("the host's unified_diff must be used verbatim: %q", diff)
+	}
+	if got, _ := d["linesAdded"].(int); got != 1 {
+		t.Errorf("linesAdded = %v, want 1", d["linesAdded"])
+	}
+}
+
+func TestCodexFileChangeSuppressesTheEnvelopeFallback(t *testing.T) {
+	// CALL -> FILECHANGE -> OUTPUT is the real ordering. When the authoritative
+	// record already fired, re-deriving from the envelope would double every
+	// file edit AND report the worse version of it.
+	p := newCodexRolloutProcessor("sess-1", false)
+	events := feed(p, codexExecPatchCall, codexFileChangeUpdate, codexExecPatchOutput)
+
+	diffs := 0
+	for _, e := range events {
+		if e.Kind == "file_diff" {
+			diffs++
+		}
+	}
+	if diffs != 1 {
+		t.Fatalf("expected exactly 1 file_diff (FileChange only), got %d: %v", diffs, kindsOf(events))
+	}
+}
+
+func TestCodexEnvelopeStillCoversAHostWithoutFileChange(t *testing.T) {
+	// If no FileChange arrives, the envelope must still produce the edit —
+	// otherwise a host that does not emit FileChange silently captures nothing,
+	// which is the original bug.
+	p := newCodexRolloutProcessor("sess-1", false)
+	events := feed(p, codexExecPatchCall, codexExecPatchOutput)
+
+	if len(events) != 1 || events[0].Kind != "file_diff" {
+		t.Fatalf("expected the envelope fallback to emit one file_diff, got %v", kindsOf(events))
+	}
+}

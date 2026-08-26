@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf16"
@@ -45,7 +46,14 @@ type codexRolloutProcessor struct {
 	// arrives later via one or more write_stdin calls. Keyed by cell ID. Without
 	// this, the handoff line parses as exitCode=0 and every long-running command
 	// is reported green regardless of how it actually ended.
-	running        map[string]codexPendingCall
+	running map[string]codexPendingCall
+	// sawFileChange records whether a FileChange item arrived since the current
+	// apply_patch call. Ordering in the rollout is strictly
+	// CALL -> FILECHANGE -> OUTPUT, and a REJECTED patch produces no FileChange
+	// at all, so this is an exact signal rather than a heuristic: it decides
+	// whether the authoritative record already covered this patch, or whether the
+	// envelope has to stand in for a host that does not emit FileChange.
+	sawFileChange  bool
 	lastTokenUsage map[string]interface{}
 }
 
@@ -192,9 +200,91 @@ func (p *codexRolloutProcessor) itemCompleted(payload map[string]interface{}, ts
 			return nil
 		}
 		return p.aiResponseEvent(codexItemText(item), ts, raw)
+	case "FileChange":
+		// The 0.149 spelling of patch_apply_end, and the AUTHORITATIVE record of
+		// what landed on disk: `update` carries a real unified_diff, `add` and
+		// `delete` carry the file's full content. It is emitted only for patches
+		// that actually applied, strictly between the apply_patch call and its
+		// output line.
+		p.sawFileChange = true
+		return p.fileChangeItem(item, ts, raw)
 	default:
 		return nil
 	}
+}
+
+// fileChangeItem emits one file_diff per changed path from a FileChange item.
+//
+// This replaces reading the apply_patch ENVELOPE, which is the model's request
+// rather than the outcome. The envelope also cannot describe a deletion: it
+// spells one `*** Delete File: path` with no body, so a deleted file reported
+// diff="" and linesRemoved=0 — the replay then renders "No diff content
+// available" for a file the candidate deliberately removed, and the reviewer
+// sees a 53-line deletion as zero lines of work.
+func (p *codexRolloutProcessor) fileChangeItem(item map[string]interface{}, ts, raw string) []Event {
+	changes, ok := item["changes"].(map[string]interface{})
+	if !ok || len(changes) == 0 {
+		return nil
+	}
+	// Map iteration is randomised; replay ordering must not be.
+	paths := make([]string, 0, len(changes))
+	for path := range changes {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+
+	events := make([]Event, 0, len(paths))
+	for _, path := range paths {
+		change, _ := changes[path].(map[string]interface{})
+		if change == nil {
+			continue
+		}
+		changeType := stringField(change, "type")
+		diff := stringField(change, "unified_diff")
+		if diff == "" {
+			// add/delete carry the whole file instead of a diff. Render it as one,
+			// so the line counts are real and the replay has something to show.
+			if content := stringField(change, "content"); content != "" {
+				diff = prefixEveryLine(content, codexDiffSign(changeType))
+			}
+		}
+		added, removed := countDiffLines(diff)
+		e := p.newCodexEvent("file_diff", ts)
+		e.Provenance = aiProvenance()
+		data := map[string]interface{}{
+			"path":         path,
+			"diff":         diff,
+			"linesAdded":   added,
+			"linesRemoved": removed,
+			"attribution":  "likely_ai",
+			"changeType":   changeType,
+		}
+		if mv := stringField(change, "move_path"); mv != "" {
+			data["movePath"] = mv
+		}
+		e.Data = data
+		e.RawPayload = strPreview(diff, 500)
+		events = append(events, e)
+	}
+	return events
+}
+
+// codexDiffSign is the unified-diff marker for a whole-file change. An unknown
+// type is treated as an addition rather than dropped — a diff shown with the
+// wrong sign is recoverable by eye; a silently missing file edit is not.
+func codexDiffSign(changeType string) string {
+	if changeType == "delete" {
+		return "-"
+	}
+	return "+"
+}
+
+func prefixEveryLine(content, sign string) string {
+	lines := strings.Split(strings.TrimSuffix(content, "\n"), "\n")
+	for i, l := range lines {
+		lines[i] = sign + l
+	}
+	return strings.Join(lines, "\n")
 }
 
 // codexItemText joins the text runs of an item_completed content array. Codex
@@ -317,6 +407,11 @@ func (p *codexRolloutProcessor) responseItem(payload map[string]interface{}, ts,
 		// patch_apply_end companion and is emitted from the envelope instead.
 		if name == "apply_patch" {
 			return nil
+		}
+		if name == "wrapped_apply_patch" {
+			// Arm the FileChange detector for THIS patch. Reset per call so a
+			// FileChange from an earlier patch can never vouch for a later one.
+			p.sawFileChange = false
 		}
 		callID := stringField(payload, "call_id")
 		if callID != "" {
@@ -800,6 +895,12 @@ func (p *codexRolloutProcessor) emitWrappedPatch(call codexPendingCall, output, 
 		}
 		e.RawPayload = raw
 		return []Event{e}
+	}
+	// The host already reported what landed, with real content for adds and
+	// deletes and a real unified_diff for updates. Re-deriving it from the
+	// envelope here would double every file edit AND report the worse version.
+	if p.sawFileChange {
+		return nil
 	}
 	type change struct {
 		path       string
