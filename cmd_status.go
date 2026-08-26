@@ -90,11 +90,16 @@ func cmdStatus(args []string) {
 		row("Started:", session.StartedAt.Local().Format("2006-01-02 15:04:05")),
 		row("Elapsed:", elapsed.String()),
 	}
-	// Legacy sessions (pre tool-select) recorded no tools and were Claude-only.
-	usesClaude := len(session.Tools) == 0 || hasTool(session.Tools, toolClaude)
-	if session.TaskRoot != "" && usesClaude {
+	if session.TaskRoot != "" {
 		rows = append(rows, row("Claude hooks:", filepath.Join(session.TaskRoot, ".claude", "settings.local.json")))
 	}
+
+	nudge := loadNudgeState()
+	if !nudge.LastExplainAt.IsZero() {
+		sinceExplain := time.Since(nudge.LastExplainAt).Round(time.Second)
+		rows = append(rows, row("Last explain:", sinceExplain.String()+" ago"))
+	}
+
 	if hasTool(session.Tools, toolCodex) {
 		// Codex capture is a background daemon, and its failure mode is silence:
 		// a watcher left running by a PREVIOUS session keeps the liveness check
@@ -102,12 +107,6 @@ func cmdStatus(args []string) {
 		// nothing is captured and nothing says so. Report ownership, not just
 		// liveness — the distinction is the whole bug.
 		rows = append(rows, row("Codex:", codexCaptureStatus(session)))
-	}
-
-	nudge := loadNudgeState()
-	if !nudge.LastExplainAt.IsZero() {
-		sinceExplain := time.Since(nudge.LastExplainAt).Round(time.Second)
-		rows = append(rows, row("Last explain:", sinceExplain.String()+" ago"))
 	}
 
 	if session.TimeLimitMinutes > 0 {
