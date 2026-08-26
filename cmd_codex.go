@@ -59,8 +59,19 @@ func cmdCodex(args []string) {
 	// codex config", which answered a different question: that file is shared by
 	// every session the machine has ever run, so a leftover from last week read
 	// as consent for today.
-	if len(session.Tools) > 0 && !hasTool(session.Tools, toolCodex) {
-		codexLaunchFail("codex is not instrumented for this session — it was started with "+strings.Join(session.Tools, ", "),
+	//
+	// An EMPTY Tools list is not a wildcard. It means a session recorded before
+	// tool selection existed — which is before codex was instrumented at all, so
+	// it is Claude-only by definition (see Session.Tools) and has no codex
+	// watcher running. Treating empty as "anything goes" was the same permissive
+	// read as the old config check, and it landed in the same place: a codex run
+	// billed to the hiring team and captured by nobody.
+	if !hasTool(session.Tools, toolCodex) {
+		started := "claude — this session predates codex support"
+		if len(session.Tools) > 0 {
+			started = strings.Join(session.Tools, ", ")
+		}
+		codexLaunchFail("codex is not instrumented for this session — it was started with "+started,
 			"Run: promptster start PST-XXXX-XXXX --tools codex")
 	}
 

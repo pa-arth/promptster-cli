@@ -119,3 +119,31 @@ func TestCodexLaunchArgv(t *testing.T) {
 		}
 	})
 }
+
+// `promptster codex` refuses to launch for a session that did not select codex.
+// The guard is what keeps a run from being billed to the hiring team's key and
+// captured by nobody — the codex rollout watcher only runs for a codex session.
+func TestCodexInstrumentationGuard(t *testing.T) {
+	cases := []struct {
+		name    string
+		tools   []string
+		allowed bool
+	}{
+		{"codex selected", []string{"codex"}, true},
+		{"both selected", []string{"claude", "codex"}, true},
+		{"claude only", []string{"claude"}, false},
+		// THE HOLE. An empty Tools list is a session recorded before tool
+		// selection existed — i.e. before codex was instrumented at all, so it is
+		// Claude-only by definition and has no watcher running. Reading empty as
+		// "anything goes" let codex run uncaptured on a legacy session.
+		{"legacy session with no tools recorded", nil, false},
+		{"legacy session with an empty tools list", []string{}, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := hasTool(c.tools, toolCodex); got != c.allowed {
+				t.Errorf("hasTool(%v, codex) = %v, want %v — this is the launch guard", c.tools, got, c.allowed)
+			}
+		})
+	}
+}

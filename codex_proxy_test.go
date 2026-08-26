@@ -267,3 +267,75 @@ func mustRead(t *testing.T, path string) string {
 	}
 	return string(data)
 }
+
+// A purge that CANNOT rewrite the config must keep the sidecar. Deleting it
+// turns a recoverable failure into a permanent one: the managed block is still
+// in the config (so codex is still hijacked) and the only record of the
+// model_provider we displaced is gone, so every later purge strips the block and
+// restores nothing.
+func TestPurgeKeepsRestoreStateWhenTheRewriteFails(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	codexHomeDir, stateDirPath := isolateCodexEnv(t)
+	cfg := writeLegacyConfig(t, codexHomeDir, "model = \"gpt-5.5\"\n")
+	writeLegacyState(t, stateDirPath, codexProxyState{
+		ConfigPath:        cfg,
+		HadConfig:         true,
+		HadModelProvider:  true,
+		PrevModelProvider: "openai",
+	})
+
+	// Read-only CODEX_HOME: the config is still readable, but the temp file the
+	// rewrite goes through cannot be created.
+	if err := os.Chmod(codexHomeDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(codexHomeDir, 0o700) })
+
+	purgeLegacyCodexProxyBlock()
+
+	statePath := filepath.Join(stateDirPath, "codex-proxy-state.json")
+	if _, err := os.Stat(statePath); err != nil {
+		t.Fatalf("sidecar deleted despite a failed rewrite — the displaced model_provider is now unrecoverable: %v", err)
+	}
+
+	// And once the failure clears, the retry restores what it was holding.
+	if err := os.Chmod(codexHomeDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	purgeLegacyCodexProxyBlock()
+	after := mustRead(t, cfg)
+	if !strings.Contains(after, `model_provider = "openai"`) {
+		t.Errorf("retry did not restore the user's model_provider:\n%s", after)
+	}
+	if strings.Contains(after, codexProxyMarkerBegin) {
+		t.Errorf("retry left the managed block behind:\n%s", after)
+	}
+	if _, err := os.Stat(statePath); !os.IsNotExist(err) {
+		t.Errorf("sidecar survived a rewrite that landed, stat err = %v", err)
+	}
+}
+
+// A config that cannot be READ (permissions, busy mount) is a temporary failure,
+// not "nothing to restore". Only an absent file spends the sidecar.
+func TestPurgeKeepsRestoreStateWhenTheConfigCannotBeRead(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores file permissions")
+	}
+	codexHomeDir, stateDirPath := isolateCodexEnv(t)
+	cfg := writeLegacyConfig(t, codexHomeDir, "")
+	writeLegacyState(t, stateDirPath, codexProxyState{
+		ConfigPath: cfg, HadConfig: true, HadModelProvider: true, PrevModelProvider: "openai",
+	})
+	if err := os.Chmod(cfg, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(cfg, 0o600) })
+
+	purgeLegacyCodexProxyBlock()
+
+	if _, err := os.Stat(filepath.Join(stateDirPath, "codex-proxy-state.json")); err != nil {
+		t.Errorf("sidecar deleted on an unreadable (not absent) config: %v", err)
+	}
+}

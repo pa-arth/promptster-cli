@@ -168,7 +168,12 @@ func purgeLegacyCodexProxyBlock() {
 
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		_ = os.Remove(codexProxyStatePath())
+		// Gone means there is nothing left to restore INTO, so the sidecar is
+		// spent. Any other read error (permissions, a busy mount) is temporary
+		// and the sidecar is the only record of what to put back — keep it.
+		if os.IsNotExist(err) {
+			_ = os.Remove(codexProxyStatePath())
+		}
 		return
 	}
 	content, hadBlock := stripCodexProxyBlock(string(raw))
@@ -186,15 +191,29 @@ func purgeLegacyCodexProxyBlock() {
 	// If ≤1.9 created the file and it is now effectively empty, remove it so the
 	// machine is left exactly as Promptster found it.
 	if hadState && !state.HadConfig && strings.TrimSpace(content) == "" {
-		_ = os.Remove(path)
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return // config still there; keep the sidecar so a later run can retry
+		}
 		_ = os.Remove(codexProxyStatePath())
 		return
 	}
 
+	// THE SIDECAR IS DELETED ONLY ON A REWRITE THAT ACTUALLY LANDED.
+	//
+	// It used to be deleted unconditionally, which turned a recoverable failure
+	// into a permanent one: on a read-only mount or a permissions error the
+	// managed block stays in the config — so the user's codex is still hijacked —
+	// and the one record of the `model_provider` we displaced is gone. Every
+	// later purge would then strip the block and restore nothing, leaving them
+	// to remember what their own config used to say.
 	if hadBlock {
 		tmp := path + ".tmp"
-		if err := os.WriteFile(tmp, []byte(content), 0o644); err == nil {
-			_ = os.Rename(tmp, path)
+		if err := os.WriteFile(tmp, []byte(content), 0o644); err != nil {
+			return
+		}
+		if err := os.Rename(tmp, path); err != nil {
+			_ = os.Remove(tmp)
+			return
 		}
 	}
 	_ = os.Remove(codexProxyStatePath())
