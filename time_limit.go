@@ -2,8 +2,10 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"time"
 )
 
@@ -31,7 +33,35 @@ func sessionDeadline(session Session) (time.Time, bool) {
 // deadline rather than past it. The hook call sites remain as a backstop for a
 // session whose watcher died; the marker below is what keeps the two paths from
 // acting twice.
-func checkTimeLimit() {
+func checkTimeLimit() { checkTimeLimitFrom(surfaceVisible) }
+
+// checkTimeLimitFromWatcher is the `promptster diff-watch` entry point. The
+// daemon's stdout and stderr are both git-watcher.log, so anything it prints is
+// invisible to the candidate — it leaves a notice for the next hook instead.
+func checkTimeLimitFromWatcher() { checkTimeLimitFrom(surfaceLogFile) }
+
+// Whether the caller owns a stream the candidate actually reads.
+type expirySurface int
+
+const (
+	surfaceVisible expirySurface = iota // a hook: its stderr reaches the IDE
+	surfaceLogFile                      // the watcher: its stderr reaches a log
+)
+
+func checkTimeLimitFrom(surface expirySurface) {
+	// Before anything else, and deliberately before the session load below: the
+	// watcher may have auto-submitted and then had `done` delete the session out
+	// from under us, so a drain that ran after the load would never happen.
+	//
+	// ONLY A VISIBLE CALLER MAY DRAIN. The watcher writes the notice and then
+	// keeps polling; if it drained too, its very next iteration would consume its
+	// own message into git-watcher.log and the hook would find nothing left. A
+	// drain is a delivery, and only a caller whose stderr the candidate reads can
+	// deliver.
+	if surface == surfaceVisible {
+		drainExpiryNotice()
+	}
+
 	session, err := loadSession()
 	if err != nil {
 		return
@@ -56,8 +86,45 @@ func checkTimeLimit() {
 		}
 		markAutoSubmitted()
 
-		// Time is up — auto-submit
-		fmt.Fprintf(os.Stderr, "\n[promptster] ⏰ Time limit reached. Auto-submitting your assessment...\n")
+		// Time is up — auto-submit.
+		banner := "\n[promptster] ⏰ Time limit reached. Auto-submitting your assessment...\n"
+		fmt.Fprint(os.Stderr, banner)
+
+		// WHERE THE CANDIDATE ACTUALLY READS THIS. The hook call sites write to a
+		// stderr the IDE surfaces, so on those paths the line above is seen. The
+		// watcher is a DAEMON whose stdout and stderr are both `git-watcher.log`
+		// (git_watcher.go, spawnGitWatcher) — so on what is now the ORDINARY
+		// detection path, everything printed here and everything `done` prints
+		// afterwards lands in a log file nobody opens. Detection was fixed by
+		// moving the check into the watcher; the announcement must not be lost in
+		// the same move.
+		//
+		// Two channels, because neither alone covers every lane:
+		//   1. /dev/tty, when the daemon still shares the candidate's terminal.
+		//   2. a durable one-shot notice drained by the next hook (drainExpiryNotice,
+		//      called at the top of this function and at the top of `cmdHook`).
+		// The notice lives in the GLOBAL dir on purpose: `done` runs
+		// cleanupPromptsterState, which wipes the workspace state dir, and the
+		// notice has to outlive that to be read afterwards.
+		//
+		// Only the invisible caller leaves one. A hook has already printed the
+		// banner above to a stream the candidate reads, and `done`'s own submitted
+		// box follows it there — a notice on that path would just say it twice.
+		//
+		// The watcher leaves one even when /dev/tty opens. A tty existing is not
+		// the same as the candidate watching it — the terminal that launched the
+		// session is often not the pane they are working in — and the two failure
+		// modes are not comparable: a line they read twice versus never being told
+		// their assessment was submitted at all.
+		out := io.Writer(os.Stderr)
+		if surface == surfaceLogFile {
+			writeExpiryNotice(session)
+			if tty, err := os.OpenFile("/dev/tty", os.O_WRONLY, 0); err == nil {
+				defer tty.Close()
+				fmt.Fprint(tty, banner)
+				out = tty
+			}
+		}
 
 		// Run promptster done in the background.
 		//
@@ -70,8 +137,8 @@ func checkTimeLimit() {
 		// handler itself did not pass it.
 		bin := promptsterBin()
 		cmd := exec.Command(bin, "done", "--auto")
-		cmd.Stdout = os.Stderr
-		cmd.Stderr = os.Stderr
+		cmd.Stdout = out
+		cmd.Stderr = out
 		_ = cmd.Start()
 		// Don't wait — let the hook return so the IDE doesn't hang
 		return
@@ -145,6 +212,51 @@ func alreadyAutoSubmitted() bool {
 func markAutoSubmitted() {
 	_ = os.MkdirAll(stateDir(), 0o700)
 	_ = os.WriteFile(autoSubmitMarkerPath(), []byte(time.Now().UTC().Format(time.RFC3339)), 0o644)
+}
+
+// expiryNoticePath is the one-shot message left for the candidate when expiry
+// was handled by a process they cannot see.
+//
+// GLOBAL DIR, NOT THE SESSION STATE DIR, and that is the whole point. The
+// auto-submit spawns `promptster done`, which runs cleanupPromptsterState and
+// deletes the workspace's `.promptster/` along with the session file. A notice
+// written there would be destroyed by the very command it is announcing, before
+// any hook could read it. `~/.promptster/` outlives the session; the drain
+// removes the file itself, so nothing accumulates.
+func expiryNoticePath() string {
+	return filepath.Join(globalPromptsterDir(), "expiry-notice")
+}
+
+// writeExpiryNotice records what the candidate would have been told, had the
+// process that detected expiry owned a surface they read.
+func writeExpiryNotice(session Session) {
+	appURL := os.Getenv("PROMPTSTER_APP_URL")
+	if appURL == "" {
+		appURL = "https://promptster.ai"
+	}
+	msg := "\n[promptster] ⏰ Time limit reached — your assessment was submitted automatically.\n"
+	if session.SessionID != "" && session.Key != "" {
+		msg += fmt.Sprintf("[promptster] Your results: %s/replay/%s?key=%s\n",
+			appURL, session.SessionID, session.Key)
+	}
+	_ = os.MkdirAll(globalPromptsterDir(), 0o700)
+	_ = os.WriteFile(expiryNoticePath(), []byte(msg), 0o600)
+}
+
+// drainExpiryNotice prints a pending notice exactly once and removes it.
+//
+// Called from `checkTimeLimit` (before its session load, which fails once
+// `done` has cleaned up) and from the top of `cmdHook` (before ITS session
+// load, for the same reason). Removing the file before printing would lose the
+// message if the write failed; removing it after is the correct order because a
+// second reader finding it already gone is exactly what "once" means.
+func drainExpiryNotice() {
+	data, err := os.ReadFile(expiryNoticePath())
+	if err != nil || len(data) == 0 {
+		return
+	}
+	fmt.Fprint(os.Stderr, string(data))
+	_ = os.Remove(expiryNoticePath())
 }
 
 // preDeadlineSnapshotMarkerPath throttles the one forced snapshot the watcher

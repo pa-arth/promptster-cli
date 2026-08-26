@@ -251,7 +251,7 @@ func runGitWatcher() error {
 		// typing was never. This daemon runs for every session and every lane and
 		// already re-reads the session file above, so it is the one place that can
 		// promise a bound. `cur` is that fresh read, not the stale `session`.
-		checkTimeLimit()
+		checkTimeLimitFromWatcher()
 		maybeSnapshotBeforeDeadline(cur)
 
 		select {

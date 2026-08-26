@@ -2,9 +2,11 @@ package main
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -149,5 +151,119 @@ func TestApiCompleteKeepsOtherRefusalsFatal(t *testing.T) {
 	}
 	if isAssessmentClosed(err) {
 		t.Fatal("a validation failure must not be reported to the candidate as submitted")
+	}
+}
+
+// ── The announcement, and the markers that must not outlive the session ──────
+//
+// Detection moved into `promptster diff-watch`, whose stdout and stderr are both
+// git-watcher.log. So on what is now the ORDINARY detection path, the banner and
+// everything `done` prints land in a file nobody opens. The notice below is the
+// durable channel that carries it to the next hook, which does own a surface the
+// candidate reads.
+
+func TestExpiryNoticeSurvivesSessionCleanupAndDrainsOnce(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	state := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", state)
+	t.Setenv("PROMPTSTER_APP_URL", "http://app.test")
+
+	writeExpiryNotice(Session{SessionID: "sess-1", Key: "PST-K"})
+
+	// THE POINT OF THE GLOBAL DIR: `done` wipes the workspace state dir, and the
+	// notice has to be readable after that or the candidate is told nothing.
+	cleanupPromptsterState(state)
+	if _, err := os.Stat(expiryNoticePath()); err != nil {
+		t.Fatalf("notice did not survive cleanupPromptsterState: %v", err)
+	}
+
+	got := captureStderr(t, drainExpiryNotice)
+	if !strings.Contains(got, "Time limit reached") {
+		t.Fatalf("drain printed no announcement; got %q", got)
+	}
+	if !strings.Contains(got, "http://app.test/replay/sess-1?key=PST-K") {
+		t.Fatalf("drain omitted the results URL; got %q", got)
+	}
+
+	// Once. A second hook must say nothing.
+	if again := captureStderr(t, drainExpiryNotice); again != "" {
+		t.Fatalf("second drain printed %q; the notice is one-shot", again)
+	}
+}
+
+func TestCleanupRemovesExpiryMarkers(t *testing.T) {
+	// stateDir() is WORKSPACE-scoped. A marker left behind makes the NEXT
+	// assessment taken in the same directory return early from the expiry branch
+	// and never auto-submit — the exact bug the marker was added to prevent.
+	state := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", state)
+	t.Setenv("HOME", t.TempDir())
+
+	markAutoSubmitted()
+	markPreDeadlineSnapshotted()
+	markThresholdWarned(5)
+
+	cleanupPromptsterState(state)
+
+	if alreadyAutoSubmitted() {
+		t.Fatal("time-auto-submitted survived cleanup — the next assessment would never auto-submit")
+	}
+	if alreadyPreDeadlineSnapshotted() {
+		t.Fatal("pre-deadline-snapshot survived cleanup")
+	}
+	if alreadyWarnedForThreshold(5) {
+		t.Fatal("threshold marker survived cleanup")
+	}
+}
+
+// captureStderr runs fn with os.Stderr redirected to a pipe and returns what it
+// wrote. The drain writes to stderr because that is the stream a hook's caller
+// surfaces to the candidate.
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	orig := os.Stderr
+	os.Stderr = w
+	fn()
+	os.Stderr = orig
+	w.Close()
+	out, _ := io.ReadAll(r)
+	r.Close()
+	return string(out)
+}
+
+// THE WATCHER MUST NOT EAT ITS OWN MESSAGE.
+//
+// Found by running the real daemon: the watcher wrote the notice, kept polling,
+// and one second later drained it into git-watcher.log — the very file the
+// notice exists to escape. The hook then found nothing and the candidate was
+// told nothing, which is the original defect wearing a new hat. A drain is a
+// DELIVERY, so only a caller whose stderr the candidate reads may perform one.
+func TestWatcherDoesNotDrainItsOwnNotice(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+
+	writeExpiryNotice(Session{SessionID: "sess-1", Key: "PST-K"})
+
+	// The watcher polls again with no session on disk (`done` deleted it). Its
+	// drain must be a no-op.
+	if out := captureStderr(t, func() { checkTimeLimitFrom(surfaceLogFile) }); out != "" {
+		t.Fatalf("watcher printed %q — that message belongs to the next hook", out)
+	}
+	if _, err := os.Stat(expiryNoticePath()); err != nil {
+		t.Fatal("watcher consumed the notice; the hook will have nothing to surface")
+	}
+
+	// A hook, which does own a visible stream, delivers it.
+	if out := captureStderr(t, func() { checkTimeLimitFrom(surfaceVisible) }); !strings.Contains(out, "Time limit reached") {
+		t.Fatalf("hook did not deliver the notice; got %q", out)
+	}
+	if _, err := os.Stat(expiryNoticePath()); err == nil {
+		t.Fatal("notice survived delivery — the next hook would repeat it")
 	}
 }

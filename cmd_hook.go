@@ -118,6 +118,13 @@ func writeCursorHookResponse(eventName string) {
 // cmdHook is called by Claude Code hooks, Cursor hooks, and the shell hook.
 // It must never block or disrupt IDE execution; all failures are best-effort.
 func cmdHook(args []string) {
+	// FIRST, and ahead of every early return below. When the watcher handled
+	// expiry it announced that into `git-watcher.log`, where nobody reads it, and
+	// the `done` it spawned then deleted the session — so `checkTimeLimit`'s own
+	// drain is unreachable on exactly the path that needs it. A hook's stderr is
+	// a surface the candidate reads, and this is the first moment we hold one.
+	drainExpiryNotice()
+
 	// Route shell-cmd subcommand (from shell hook)
 	if len(args) > 0 && args[0] == "shell-cmd" {
 		cmdHookShellCmd(args[1:])

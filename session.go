@@ -242,6 +242,15 @@ func cleanupPromptsterState(taskRoot string) {
 		"time-warned-5",
 		"time-warned-2",
 		"time-warned-1",
+		// The expiry markers belong in this list for the same reason the threshold
+		// warnings do, and more urgently: stateDir() is WORKSPACE-scoped, so a
+		// second assessment taken in the same directory would find
+		// `time-auto-submitted` already present, return early from the expiry
+		// branch, and never auto-submit at all — reinstating the exact bug the
+		// marker was added to fix. Leaving them behind also keeps `.promptster/`
+		// non-empty, so the `os.Remove(dir)` below silently fails.
+		"time-auto-submitted",
+		"pre-deadline-snapshot",
 		"git-watcher.json",
 		"git-watcher.log",
 		"git-watcher-ref",
