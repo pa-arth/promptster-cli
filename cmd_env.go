@@ -5,7 +5,6 @@ import (
 	"os"
 	"os/exec"
 	"strings"
-	"time"
 )
 
 // cmdEnv handles `promptster env [--clear]`.
@@ -49,7 +48,11 @@ func cmdEnv(args []string) {
 	// Local staleness check. If ExpiresAt isn't populated (older session.json
 	// written by a pre-feature CLI), we have nothing to compare against — do
 	// nothing and let the server-side proxy reject a stale token if needed.
-	if !session.ExpiresAt.IsZero() && time.Now().After(session.ExpiresAt) {
+	//
+	// ⛔ selfEvictArmed() is what keeps a hosted box alive. On a seeded session
+	// this same line, fired once per shell prompt, wipes the box's entire
+	// configuration. §8.6, task 2.5e.
+	if session.expired() && session.selfEvictArmed() {
 		fireBackgroundCleanup("expired")
 	}
 }
@@ -71,8 +74,17 @@ func cmdAuthToken(args []string) {
 	if session.SessionToken == "" || session.TaskRoot == "" {
 		return
 	}
-	if !session.ExpiresAt.IsZero() && time.Now().After(session.ExpiresAt) {
-		fireBackgroundCleanup("expired")
+	// ⛔ WITHHOLDING the token and DESTROYING the session are separate decisions,
+	// and only the first one is unconditional. An expired session must stop
+	// handing out a credential — that is honest degradation, and Claude Code
+	// reads empty stdout as "no helper credential" and falls back. Tearing the
+	// box down is the destructive half, and the apiKeyHelper IS this command, so
+	// on a seeded box Claude Code would trigger its own teardown once per API
+	// request. §8.6, task 2.5e.
+	if session.expired() {
+		if session.selfEvictArmed() {
+			fireBackgroundCleanup("expired")
+		}
 		return
 	}
 	// No trailing newline: Claude Code uses the raw stdout as the credential.
@@ -83,7 +95,14 @@ func cmdAuthToken(args []string) {
 // expired session tears down its hooks + RC lines without blocking the caller.
 // Best-effort: if the binary or the command goes sideways we stay quiet, since
 // callers treat no-output as "no session" anyway.
-func fireBackgroundCleanup(reason string) {
+//
+// A var rather than a plain func so tests can observe WHETHER it fired. That
+// distinction is the whole of task 2.5e: on a seeded box, "printed nothing" and
+// "printed nothing AND wiped the box" are the same stdout and opposite outcomes,
+// so a test that only reads stdout cannot tell the fix from the bug.
+var fireBackgroundCleanup = realFireBackgroundCleanup
+
+func realFireBackgroundCleanup(reason string) {
 	bin, _ := os.Executable()
 	if bin == "" {
 		bin = promptsterBin()

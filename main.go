@@ -204,6 +204,8 @@ Flags for start:
   --workspace PATH  Use PATH as workspace directory (skip interactive prompt)
   --adopt           Use the checkout that is already here instead of cloning one
                     (defaults ON inside a GitHub Codespace; --adopt=false forces a clone)
+  --seeded          Start from a session the provisioning worker already wrote to
+                    disk: no redeem, no consent prompt, no key argument
   --restart         Offer to restart running editors so they reload hooks
   --verbose         Print each sub-step (paths, API URL, hook events) for debugging
 

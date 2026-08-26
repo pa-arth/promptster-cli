@@ -67,6 +67,23 @@ func cmdStart(args []string) {
 	// setup steps, and "on this lane, add a flag" is a setup step. `--adopt=false`
 	// still forces the clone path for anyone who needs it.
 	adoptFlag := fs.Bool("adopt", false, "Adopt the checkout already present instead of cloning (default: on inside a GitHub Codespace)")
+	// --seeded: the session is ALREADY ON DISK, written as bytes by the
+	// provisioning worker. Nothing here redeems.
+	//
+	// This is a first-class mode rather than an argv incantation the worker
+	// passes to the existing `start`, and that distinction is the whole task
+	// (openspec private-problem-sandbox-lane §7.2 step 3, task 2.5c). The
+	// suppressions below — no redeem, no consent TUI, no workspace prompt — are
+	// each a REFUSAL with a message, not a flag that happens to skip the right
+	// branch. A combination of flags that produces the same behaviour today is
+	// not testable, and drifts the first time one of the branches moves.
+	//
+	// Why the worker cannot simply redeem inside the box: `POST /v1/candidate/redeem`
+	// is single-use and 409s a second attempt, and it returns the candidate key
+	// AS the session token — so redeeming from inside puts the strictly more
+	// powerful, still-unredeemed artifact in a box we do not fully trust, and
+	// takes the 409 away from the worker permanently. design.md §7.1/§7.2.
+	seededFlag := fs.Bool("seeded", false, "Start from a session already written to disk by the provisioning worker: no redeem, no consent prompt, no key argument")
 	fs.Parse(args) //nolint:errcheck
 
 	// Refuse rather than pick a winner. A silent precedence rule here decides,
@@ -79,10 +96,34 @@ func cmdStart(args []string) {
 	}
 	startVerbose = *verbose
 
+	seeded := *seededFlag
 	adopt := *adoptFlag
 	if !fs.Changed("adopt") {
 		adopt = inCodespace()
 	}
+	if seeded {
+		if msg := seededArgsRefusal(fs.Args()); msg != "" {
+			fmt.Fprint(os.Stderr, msg)
+			os.Exit(1)
+		}
+		// The tree is already in the box; there is nothing to clone and nowhere to
+		// clone it from that would not be a second copy beside the one the
+		// candidate is looking at. This overrides `--adopt=false` deliberately —
+		// on a seeded box the clone path has no correct behaviour to fall back to.
+		adopt = true
+		// No TUI can be answered here. There is no terminal attached to a worker's
+		// `commands.run`, and a consent prompt that nobody answers is a start that
+		// hangs for the whole assessment window.
+		*acceptTos = true
+		// The extension install is PROMPTED by default, and a prompt with nobody
+		// to answer it must decline — which would silently hand every hosted box a
+		// no-capture editor. `--no-editor-extension` still wins, so a caller can
+		// still choose.
+		if !*noEditorExt {
+			*yesEditorExt = true
+		}
+	}
+
 	// hostedLane is deliberately NOT `adopt && inCodespace()`. The fork hazard
 	// (design.md §2) and the wrong-instructions hazard (§3.2) are properties of
 	// being in a read-only codespace, not of how the workspace was resolved — so
@@ -133,6 +174,15 @@ func cmdStart(args []string) {
 	startStep(1, 7, "Loading saved session...")
 	verbosef("session file: %s", sessionPath())
 	saved, err := loadSession()
+	if seeded {
+		// The seed IS the input to this mode. Prompting would ask a worker for a
+		// key it must not have, and the generic message below would tell the
+		// operator to run a redeem that must not happen here.
+		if msg := seededSessionRefusal(err, saved, sessionPath()); msg != "" {
+			fmt.Fprint(os.Stderr, msg)
+			os.Exit(1)
+		}
+	}
 	if err != nil {
 		// No saved session and no key on the command line. ASK for it rather than
 		// exiting (openspec §2.7): the hosted lane launches this from
@@ -161,6 +211,15 @@ func cmdStart(args []string) {
 	// hosted lane can still clone locally. This is what keeps `done`, `abort` and
 	// `doctor` on the right lane in a shell that never inherited the codespace env.
 	session.HostedLane = hostedLane
+	if seeded {
+		// ⛔ 2.5e. This session lives in a box we provisioned and own, so the TTL
+		// self-eviction path must not arm. Set BEFORE anything can fire it: the
+		// shell hook, the apiKeyHelper and `promptster codex` all trigger teardown
+		// on an expired session, and the apiKeyHelper IS `auth-token`, so Claude
+		// Code would tear the box down once per API request. design.md §8.6.
+		session.NoSelfEvict = true
+		session.SeededAt = time.Now()
+	}
 	taskBrief = saved.TaskBrief
 	timeLimitMinutes = saved.TimeLimitMinutes
 	skipConsent = saved.ConsentAccepted
@@ -207,12 +266,27 @@ func cmdStart(args []string) {
 		// running it in a codespace materialises a second tree beside the mirror
 		// the container was built from, and TaskRoot follows the new one while the
 		// candidate keeps working in the old one.
-		adopted, adoptErr := resolveAdoptWorkspace(*workspaceFlag)
+		// A seeded session already records its own task root; use it when no
+		// --workspace was given, instead of falling back to the worker's cwd.
+		adoptTarget := *workspaceFlag
+		if seeded && strings.TrimSpace(adoptTarget) == "" && session.TaskRoot != "" {
+			adoptTarget = session.TaskRoot
+			verbosef("seeded: adopting the task root from the session (%s)", adoptTarget)
+		}
+		adopted, adoptErr := resolveAdoptWorkspace(adoptTarget)
 		if adoptErr != nil {
 			endStepWarn(3, 7, "Preparing workspace", adoptErr.Error())
 			fmt.Fprintln(os.Stderr)
-			fmt.Fprintln(os.Stderr, "error: --adopt could not find a checkout to adopt.")
-			fmt.Fprintln(os.Stderr, "  Run promptster start from inside the assessment folder, or pass --workspace PATH.")
+			if seeded {
+				fmt.Fprintln(os.Stderr, "error: --seeded could not find the checkout the session names.")
+				fmt.Fprintf(os.Stderr, "  taskRoot in the session: %q\n", session.TaskRoot)
+				fmt.Fprintln(os.Stderr, "  It must exist AND be a git repository — Claude Code resolves the project")
+				fmt.Fprintln(os.Stderr, "  root by walking to the git root, so a tree seeded without .git gives the")
+				fmt.Fprintln(os.Stderr, "  candidate a dead agent and zero capture.")
+			} else {
+				fmt.Fprintln(os.Stderr, "error: --adopt could not find a checkout to adopt.")
+				fmt.Fprintln(os.Stderr, "  Run promptster start from inside the assessment folder, or pass --workspace PATH.")
+			}
 			os.Exit(1)
 		}
 		chosenPath = adopted

@@ -5,7 +5,6 @@ import (
 	"os"
 	"os/exec"
 	"strings"
-	"time"
 )
 
 // cmdCodex handles `promptster codex [args...]` — launch codex wired to the
@@ -44,8 +43,12 @@ func cmdCodex(args []string) {
 		codexLaunchFail("this session has no token or workspace recorded (redeem ran but start never finished)",
 			"Run: promptster start PST-XXXX-XXXX --tools codex")
 	}
-	if !session.ExpiresAt.IsZero() && time.Now().After(session.ExpiresAt) {
-		fireBackgroundCleanup("expired")
+	// Same split as auth-token: refusing the launch is unconditional, tearing
+	// the session down is not. §8.6, task 2.5e.
+	if session.expired() {
+		if session.selfEvictArmed() {
+			fireBackgroundCleanup("expired")
+		}
 		codexLaunchFail("this session has expired",
 			"Run: promptster start PST-XXXX-XXXX (or promptster reset)")
 	}
