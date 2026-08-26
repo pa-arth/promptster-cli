@@ -45,8 +45,15 @@ func runHookScript(t *testing.T, shell, home, pathDir, preamble, body string) st
 	// _promptster_hook_script is for the bodies that need to source the hook a
 	// SECOND time — the re-source path, where a self-recursive wrapper would
 	// otherwise be born.
+	// FUNCNEST bounds a self-recursive wrapper where the shell supports it. Two
+	// limits, both measured rather than assumed: it must be set INSIDE the
+	// script (an inherited one is not applied), and it does nothing at all on
+	// macOS, whose /bin/bash is 3.2.57 — FUNCNEST arrived in 4.2. So this is
+	// what makes a bash regression abort in milliseconds on CI (ubuntu, bash 5),
+	// and locally the context below is the only thing that catches it. zsh has
+	// its own nesting limit and aborts under a second everywhere.
 	args := []string{"-i", "-c",
-		"_promptster_hook_script=" + script + "\n" + preamble + "\n. " + script + "\n" + body}
+		"FUNCNEST=50\n_promptster_hook_script=" + script + "\n" + preamble + "\n. " + script + "\n" + body}
 	if shell == "bash" {
 		args = append([]string{"--norc", "--noprofile"}, args...)
 	} else {
@@ -54,17 +61,20 @@ func runHookScript(t *testing.T, shell, home, pathDir, preamble, body string) st
 	}
 
 	// A regression in the launcher is a runaway, not a wrong answer: the wrapper
-	// calls itself, and bash with FUNCNEST unset recurses until the machine
-	// gives out. Bound both — FUNCNEST so bash reports instead of spinning, and
-	// the context so any other hang fails the test rather than wedging the suite.
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// calls itself and never returns. On a shell FUNCNEST cannot reach, this
+	// context is the ONLY thing that catches it — so it must stay, and it is
+	// deliberately generous: these are real interactive shells, and on a
+	// loaded machine (load average 210 while five sessions built at once) a
+	// healthy one has taken over 30s to reach its prompt. A tight bound there
+	// fails the suite for being busy, which is worse than useless in a gate.
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, bin, args...)
-	cmd.Env = append(os.Environ(), "HOME="+home, "PATH="+pathDir+":/usr/bin:/bin", "FUNCNEST=50")
+	cmd.Env = append(os.Environ(), "HOME="+home, "PATH="+pathDir+":/usr/bin:/bin")
 	out, _ := cmd.CombinedOutput()
 	if ctx.Err() != nil {
-		t.Fatalf("%s hung on the hook (30s):\n%s", shell, out)
+		t.Fatalf("%s hung on the hook (120s):\n%s", shell, out)
 	}
 	return string(out)
 }

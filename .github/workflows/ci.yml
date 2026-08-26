@@ -1,0 +1,45 @@
+# `go test` on every pull request.
+#
+# release.yml runs the same suite, but only on a `v*` tag — so until this
+# existed a PR could go green with a failing test, and one did: #33 shipped
+# with TestShellHookScriptStructure failing while packaging.yml reported
+# `install-check pass`. Packaging cannot see it; _test.go files are not
+# compiled into the binaries it builds.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    # The suite runs real interactive shells and takes minutes, not seconds.
+    # Bounded so a hang fails the job instead of burning the runner budget.
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      # shell_hook_codex_launcher_test.go runs the rendered hook in a real bash
+      # AND a real zsh, and SKIPS the shell it cannot find. A runner without zsh
+      # would therefore drop half that coverage and still report green, which is
+      # the exact failure mode this workflow exists to end — so install it, then
+      # assert both are there rather than trusting the image.
+      - name: Ensure both shells the hook tests need
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq zsh
+          command -v bash
+          command -v zsh
+
+      - name: Run Go tests
+        # -count=1 defeats the build cache: a cached PASS from an earlier run is
+        # not evidence about this commit.
+        run: go test -count=1 -timeout 15m ./...
