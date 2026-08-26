@@ -81,9 +81,12 @@ JSON
         | run hook pre-tool-use >/dev/null 2>&1
       ;;
     codex)
+      # The global codex config must be left ALONE — the provider is passed per
+      # launch by `promptster codex`. A block here is the leak that broke every
+      # codex on the machine, session or no session.
       CFG="$SBX/codexhome/config.toml"
-      { [ -f "$CFG" ] && grep -q 'model_provider = "promptster"' "$CFG"; } \
-        && pass "codex config.toml proxy provider written" || fail "codex proxy config"
+      { [ ! -f "$CFG" ] || ! grep -q 'promptster' "$CFG"; } \
+        && pass "global codex config untouched by start" || fail "start wrote to the global codex config"
       local NOW; NOW="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
       local RDIR="$SBX/codexhome/sessions/$(date -u +%Y/%m/%d)"; mkdir -p "$RDIR"
       cat > "$RDIR/rollout-qa.jsonl" <<RJ

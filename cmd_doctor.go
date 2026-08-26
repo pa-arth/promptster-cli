@@ -22,7 +22,7 @@ func cmdDoctor() {
 	// instruments it. With no session we default to Claude (the historical
 	// default) so a fresh machine still gets a meaningful environment check.
 	claudeRelevant := sessionErr != nil || hasTool(session.Tools, toolClaude)
-	codexRelevant := codexProxyConfigured() || (sessionErr == nil && hasTool(session.Tools, toolCodex))
+	codexRelevant := legacyCodexProxyBlockPresent() || (sessionErr == nil && hasTool(session.Tools, toolCodex))
 	// Cursor used to be a third relevant tool here. openspec
 	// changes/employer-supplied-model-key retired it as a selectable tool, so
 	// there is no Cursor binary check and no Cursor hooks section any more.
@@ -131,30 +131,39 @@ func cmdDoctor() {
 	fmt.Println()
 
 	// ── Codex (OpenAI) proxy ────────────────────────────────────────────────
-	// Only shown when codex is instrumented for this session or a managed block
-	// is present. codex config is GLOBAL, so a block left by a dead session would
-	// break the user's personal codex everywhere — reconcile auto-heals that.
+	// Shown when codex is instrumented for this session, or when a pre-1.10
+	// managed block is still sitting in the user's global codex config — the
+	// second case is a machine to heal, not a session to report on.
 	if codexRelevant {
-		reconcileCodexProxyIfStale()
+		// Heal first, then report on what is left, so the check below describes
+		// the config the user actually has.
+		purgeLegacyCodexProxyBlock()
 
 		fmt.Println("Codex")
-		check("Codex proxy config (model_provider + provider block)", func() (string, string) {
+		check("Global codex config untouched", func() (string, string) {
+			// The only correct state is "Promptster is not in this file". The
+			// provider is passed per launch by `promptster codex`; a block here
+			// means a pre-1.10 session wrote one and the purge above could not
+			// remove it (unreadable file, read-only mount).
 			data, err := os.ReadFile(codexConfigPath())
-			if err != nil || !strings.Contains(string(data), codexProxyMarkerBegin) {
-				return "", "Promptster provider not in " + codexConfigPath() + "\n    Fix: promptster start --tools codex"
+			if err != nil {
+				return "no " + codexConfigPath() + " (nothing to clean)", ""
 			}
-			if !strings.Contains(string(data), fmt.Sprintf("model_provider = %q", codexProxyProviderID)) {
-				return "", "model_provider not set to " + codexProxyProviderID + " in " + codexConfigPath() + "\n    Fix: re-run promptster start --tools codex"
+			if strings.Contains(string(data), codexProxyMarkerBegin) {
+				return "", "a pre-1.10 Promptster block is still in " + codexConfigPath() + " and could not be removed — every codex run on this machine will demand " + codexProxyTokenEnv + "\n    Fix: delete the lines between " + codexProxyMarkerBegin + " and " + codexProxyMarkerEnd
 			}
-			return codexConfigPath(), ""
+			if m := rootModelProviderRe.FindStringSubmatch(string(data)); m != nil && m[1] == codexProxyProviderID {
+				return "", "model_provider = \"" + codexProxyProviderID + "\" is set in " + codexConfigPath() + " with no Promptster block around it\n    Fix: remove that line — Promptster selects its provider per launch and never needs it"
+			}
+			return "clean (provider is passed per launch)", ""
 		})
 		if sessionErr == nil {
 			check("Codex proxy token resolves", func() (string, string) {
 				if strings.TrimSpace(session.SessionToken) == "" || strings.TrimSpace(session.TaskRoot) == "" {
-					return "", "session missing token or workspace — PROMPTSTER_PROXY_TOKEN will be empty, codex will 401\n    Fix: re-run promptster start"
+					return "", "session missing token or workspace — 'promptster codex' will refuse to launch\n    Fix: re-run promptster start"
 				}
 				if !session.ExpiresAt.IsZero() && time.Now().After(session.ExpiresAt) {
-					return "", "session expired — PROMPTSTER_PROXY_TOKEN will be empty, codex will 401\n    Fix: promptster start PST-XXXX-XXXX (or promptster reset)"
+					return "", "session expired — 'promptster codex' will refuse to launch\n    Fix: promptster start PST-XXXX-XXXX (or promptster reset)"
 				}
 				return "yes", ""
 			})
@@ -166,7 +175,7 @@ func cmdDoctor() {
 				if blocked := proxyProbeBlocker(session); blocked != "" {
 					return "skipped (" + blocked + " — see above)", ""
 				}
-				if err := smokeTestCodexProxy(apiURL()+"/v1/proxy/openai/v1", session.SessionToken); err != nil {
+				if err := smokeTestCodexProxy(codexProxyBaseURL(), session.SessionToken); err != nil {
 					return "", err.Error() + "\n    Fix: if the key was rejected or the budget is spent, contact the recruiter"
 				}
 				return "yes", ""
@@ -183,11 +192,11 @@ func cmdDoctor() {
 			if len(found) == 0 {
 				return "none", ""
 			}
-			// Our custom provider has its own env_key (PROMPTSTER_PROXY_TOKEN), so
-			// these are ignored while model_provider=promptster — but they'd take
-			// over (bypassing capture + billing) if codex ever falls back to the
-			// built-in openai provider. Flag so it's a deliberate choice.
-			return "", strings.Join(found, "/") + " set in this shell — ignored while the Promptster provider is selected, but would bypass capture if codex falls back to the built-in openai provider\n    Fix: unset " + strings.Join(found, " ") + " to be safe"
+			// Our provider has its own env_key (PROMPTSTER_PROXY_TOKEN), so these
+			// are ignored inside a `promptster codex` launch — but they take over
+			// (bypassing capture + billing) in a bare `codex`. Flag so it's a
+			// deliberate choice.
+			return "", strings.Join(found, "/") + " set in this shell — ignored inside 'promptster codex', but a bare codex would use them and bypass capture\n    Fix: unset " + strings.Join(found, " ") + " to be safe"
 		})
 		fmt.Println()
 	}

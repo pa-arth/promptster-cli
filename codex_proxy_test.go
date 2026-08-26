@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,7 +12,7 @@ import (
 const testCodexBaseURL = "https://api.test.promptster.ai/v1/proxy/openai/v1"
 
 // isolateCodexEnv points CODEX_HOME and the per-session state dir at temp dirs
-// so codex config mutation + the sidecar state file never touch the real machine.
+// so nothing here can touch the real machine's codex config.
 func isolateCodexEnv(t *testing.T) (codexHomeDir, stateDirPath string) {
 	t.Helper()
 	codexHomeDir = t.TempDir()
@@ -21,192 +22,224 @@ func isolateCodexEnv(t *testing.T) (codexHomeDir, stateDirPath string) {
 	return codexHomeDir, stateDirPath
 }
 
-func TestConfigureCodexProxy_NewFile(t *testing.T) {
-	isolateCodexEnv(t)
-
-	if err := configureCodexProxy(testCodexBaseURL); err != nil {
-		t.Fatalf("configureCodexProxy: %v", err)
-	}
-
-	data, err := os.ReadFile(codexConfigPath())
-	if err != nil {
-		t.Fatalf("config not written: %v", err)
-	}
-	s := string(data)
-	for _, want := range []string{
+// legacyCodexProxyBlock reproduces, byte for byte, the marker-fenced block CLI
+// ≤1.9 wrote into the user's GLOBAL ~/.codex/config.toml. Nothing in the CLI
+// generates this any more — it lives here so the purge can be tested against
+// what is actually sitting on upgraded machines.
+func legacyCodexProxyBlock(baseURL string) string {
+	return strings.Join([]string{
 		codexProxyMarkerBegin,
-		codexProxyMarkerEnd,
 		`model_provider = "promptster"`,
-		`[model_providers.promptster]`,
-		`base_url = "` + testCodexBaseURL + `"`,
+		"",
+		"[model_providers.promptster]",
+		`name = "Promptster"`,
+		`base_url = "` + baseURL + `"`,
 		`wire_api = "responses"`,
 		`env_key = "PROMPTSTER_PROXY_TOKEN"`,
-		`requires_openai_auth = false`,
+		"requires_openai_auth = false",
+		codexProxyMarkerEnd,
+	}, "\n")
+}
+
+func writeLegacyConfig(t *testing.T, codexHomeDir, userContent string) string {
+	t.Helper()
+	cfg := filepath.Join(codexHomeDir, "config.toml")
+	body := legacyCodexProxyBlock(testCodexBaseURL) + "\n"
+	if userContent != "" {
+		body += "\n" + userContent
+	}
+	if err := os.WriteFile(cfg, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return cfg
+}
+
+func writeLegacyState(t *testing.T, stateDirPath string, s codexProxyState) {
+	t.Helper()
+	data, err := json.Marshal(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stateDirPath, "codex-proxy-state.json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The overlay is the whole instrumentation now, so it has to carry every field
+// codex needs to resolve the provider — and none of the credential.
+func TestCodexProxyArgs(t *testing.T) {
+	args := codexProxyArgs(testCodexBaseURL)
+
+	if len(args)%2 != 0 {
+		t.Fatalf("args must be -c/value pairs, got %v", args)
+	}
+	var pairs []string
+	for i := 0; i < len(args); i += 2 {
+		if args[i] != "-c" {
+			t.Fatalf("arg %d = %q, want -c (%v)", i, args[i], args)
+		}
+		pairs = append(pairs, args[i+1])
+	}
+	joined := strings.Join(pairs, "\n")
+
+	for _, want := range []string{
+		`model_provider="promptster"`,
+		`model_providers.promptster.name="Promptster"`,
+		`model_providers.promptster.base_url="` + testCodexBaseURL + `"`,
+		`model_providers.promptster.wire_api="responses"`,
+		`model_providers.promptster.env_key="PROMPTSTER_PROXY_TOKEN"`,
+		`model_providers.promptster.requires_openai_auth=false`,
 	} {
-		if !strings.Contains(s, want) {
-			t.Errorf("config missing %q\n---\n%s", want, s)
+		if !strings.Contains(joined, want) {
+			t.Errorf("overlay missing %q\n---\n%s", want, joined)
 		}
 	}
-	// The token must NEVER be written to the global config file.
-	if strings.Contains(s, "PST-") || strings.Contains(strings.ToLower(s), "bearer") {
-		t.Errorf("config appears to contain a credential:\n%s", s)
-	}
+}
 
-	if !codexProxyConfigured() {
-		t.Error("codexProxyConfigured() = false after configure")
+// The credential rides the environment, never the overlay: argv is world-
+// readable in `ps`, so a token there would be a token on the process list.
+func TestCodexProxyArgs_CarriesNoCredential(t *testing.T) {
+	joined := strings.Join(codexProxyArgs(testCodexBaseURL), " ")
+	if strings.Contains(joined, "PST-") || strings.Contains(strings.ToLower(joined), "bearer") {
+		t.Errorf("overlay appears to contain a credential: %s", joined)
 	}
-
-	// We created the file → revert must delete it entirely.
-	revertCodexProxy()
-	if _, err := os.Stat(codexConfigPath()); !os.IsNotExist(err) {
-		t.Errorf("expected config.toml removed after revert, stat err = %v", err)
+	// env_key NAMES the variable; it must not carry a value for it.
+	if strings.Contains(joined, "PROMPTSTER_PROXY_TOKEN=P") {
+		t.Errorf("overlay assigns the token instead of naming the variable: %s", joined)
 	}
 }
 
-func TestConfigureCodexProxy_PreservesUserContentAndRevertsExactly(t *testing.T) {
-	codexHomeDir, _ := isolateCodexEnv(t)
-	original := "# my codex config\n\n[tools]\nweb_search = true\n"
+// Instrumenting codex must not write to the user's global config at all — that
+// is the regression this whole change exists to prevent. Build the launch the
+// way cmdCodex does and assert the file is untouched.
+func TestCodexLaunchLeavesGlobalConfigUntouched(t *testing.T) {
+	codexHomeDir, stateDirPath := isolateCodexEnv(t)
 	cfg := filepath.Join(codexHomeDir, "config.toml")
+	original := "model_provider = \"openai\"\n\n[tools]\nweb_search = true\n"
 	if err := os.WriteFile(cfg, []byte(original), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := configureCodexProxy(testCodexBaseURL); err != nil {
-		t.Fatalf("configureCodexProxy: %v", err)
-	}
-	got, _ := os.ReadFile(cfg)
-	if !strings.Contains(string(got), "[tools]") || !strings.Contains(string(got), "web_search = true") {
-		t.Errorf("user content lost:\n%s", got)
-	}
-	if !strings.HasPrefix(string(got), codexProxyMarkerBegin) {
-		t.Errorf("managed block should be prepended:\n%s", got)
-	}
+	_ = codexProxyArgs(codexProxyBaseURL())
+	_ = envWithProxyToken(os.Environ(), "PST-LIVE")
 
-	revertCodexProxy()
-	after, err := os.ReadFile(cfg)
-	if err != nil {
-		t.Fatalf("config deleted but should be preserved: %v", err)
+	after := mustRead(t, cfg)
+	if after != original {
+		t.Errorf("global codex config was modified:\nwant %q\ngot  %q", original, after)
 	}
-	if string(after) != original {
-		t.Errorf("revert not exact:\nwant %q\ngot  %q", original, string(after))
+	if entries, _ := os.ReadDir(stateDirPath); len(entries) != 0 {
+		t.Errorf("launch wrote sidecar state: %v", entries)
 	}
 }
 
-func TestConfigureCodexProxy_DisplacesAndRestoresModelProvider(t *testing.T) {
+func TestPurgeLegacyBlock_PreservesUserContent(t *testing.T) {
 	codexHomeDir, _ := isolateCodexEnv(t)
-	original := "model_provider = \"openai\"\nmodel = \"gpt-5.5\"\n\n[tools]\nweb_search = true\n"
-	cfg := filepath.Join(codexHomeDir, "config.toml")
-	if err := os.WriteFile(cfg, []byte(original), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	user := "# my codex config\n\n[tools]\nweb_search = true\n"
+	cfg := writeLegacyConfig(t, codexHomeDir, user)
 
-	if err := configureCodexProxy(testCodexBaseURL); err != nil {
-		t.Fatalf("configureCodexProxy: %v", err)
-	}
-	got := mustRead(t, cfg)
-	// Exactly one model_provider assignment, and it's ours.
-	if strings.Count(got, "model_provider = ") != 1 {
-		t.Errorf("expected exactly one model_provider line:\n%s", got)
-	}
-	if !strings.Contains(got, `model_provider = "promptster"`) {
-		t.Errorf("our model_provider not set:\n%s", got)
-	}
-	// The user's other root key + table must survive.
-	if !strings.Contains(got, `model = "gpt-5.5"`) || !strings.Contains(got, "[tools]") {
-		t.Errorf("user content lost:\n%s", got)
-	}
+	purgeLegacyCodexProxyBlock()
 
-	revertCodexProxy()
+	after := mustRead(t, cfg)
+	if strings.Contains(after, "promptster") {
+		t.Errorf("managed traces remain after purge:\n%s", after)
+	}
+	if after != user {
+		t.Errorf("purge not exact:\nwant %q\ngot  %q", user, after)
+	}
+}
+
+func TestPurgeLegacyBlock_RestoresDisplacedModelProvider(t *testing.T) {
+	codexHomeDir, stateDirPath := isolateCodexEnv(t)
+	cfg := writeLegacyConfig(t, codexHomeDir, "model = \"gpt-5.5\"\n\n[tools]\nweb_search = true\n")
+	writeLegacyState(t, stateDirPath, codexProxyState{
+		ConfigPath:        cfg,
+		HadConfig:         true,
+		HadModelProvider:  true,
+		PrevModelProvider: "openai",
+	})
+
+	purgeLegacyCodexProxyBlock()
+
 	after := mustRead(t, cfg)
 	if !strings.Contains(after, `model_provider = "openai"`) {
 		t.Errorf("original model_provider not restored:\n%s", after)
 	}
 	if strings.Contains(after, "promptster") {
-		t.Errorf("managed traces remain after revert:\n%s", after)
+		t.Errorf("managed traces remain:\n%s", after)
 	}
 	if !strings.Contains(after, `model = "gpt-5.5"`) || !strings.Contains(after, "[tools]") {
-		t.Errorf("user content lost after revert:\n%s", after)
+		t.Errorf("user content lost:\n%s", after)
+	}
+	if _, err := os.Stat(filepath.Join(stateDirPath, "codex-proxy-state.json")); !os.IsNotExist(err) {
+		t.Errorf("sidecar state survived the purge, stat err = %v", err)
 	}
 }
 
-func TestConfigureCodexProxy_IdempotentReapply(t *testing.T) {
+func TestPurgeLegacyBlock_RemovesFileItCreated(t *testing.T) {
+	codexHomeDir, stateDirPath := isolateCodexEnv(t)
+	cfg := writeLegacyConfig(t, codexHomeDir, "")
+	writeLegacyState(t, stateDirPath, codexProxyState{ConfigPath: cfg, HadConfig: false})
+
+	purgeLegacyCodexProxyBlock()
+
+	if _, err := os.Stat(cfg); !os.IsNotExist(err) {
+		t.Errorf("expected config.toml removed, stat err = %v", err)
+	}
+}
+
+// THE behaviour change. The old reconciler only stripped the block when it
+// judged the owning session stale — and it judged that from ~/.promptster, so a
+// live session kept the block and a wiped state dir was indistinguishable from a
+// healthy machine. Nothing writes the block any more, so its presence is a
+// leftover regardless of what any session is doing.
+func TestPurgeLegacyBlock_IsUnconditional(t *testing.T) {
 	codexHomeDir, _ := isolateCodexEnv(t)
-	cfg := filepath.Join(codexHomeDir, "config.toml")
-	if err := os.WriteFile(cfg, []byte("model_provider = \"openai\"\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	for i := 0; i < 3; i++ {
-		if err := configureCodexProxy(testCodexBaseURL); err != nil {
-			t.Fatalf("configureCodexProxy #%d: %v", i, err)
-		}
-	}
-	got := mustRead(t, cfg)
-	if n := strings.Count(got, codexProxyMarkerBegin); n != 1 {
-		t.Errorf("expected exactly one managed block after re-apply, got %d:\n%s", n, got)
-	}
-
-	// Original model_provider must still round-trip after multiple re-applies.
-	revertCodexProxy()
-	after := mustRead(t, cfg)
-	if !strings.Contains(after, `model_provider = "openai"`) {
-		t.Errorf("original model_provider lost across re-apply:\n%s", after)
-	}
-}
-
-func TestReconcileCodexProxyIfStale_NoSessionStripsBlock(t *testing.T) {
-	isolateCodexEnv(t)
-	if err := configureCodexProxy(testCodexBaseURL); err != nil {
-		t.Fatal(err)
-	}
-	// No session.json in the state dir → stale → reconcile strips the block.
-	reconcileCodexProxyIfStale()
-	if codexProxyConfigured() {
-		t.Error("stale managed block was not stripped by reconcile")
-	}
-}
-
-func TestReconcileCodexProxyIfStale_LiveSessionKeepsBlock(t *testing.T) {
-	isolateCodexEnv(t)
-	if err := configureCodexProxy(testCodexBaseURL); err != nil {
-		t.Fatal(err)
-	}
-	// A live, unexpired session owns the block → reconcile must keep it.
+	cfg := writeLegacyConfig(t, codexHomeDir, "")
 	if err := saveSession(Session{
 		SessionID:    "sess-live",
 		SessionToken: "PST-LIVE-TOKEN",
 		TaskRoot:     t.TempDir(),
+		Tools:        []string{toolCodex},
 		ExpiresAt:    time.Now().Add(time.Hour),
 	}); err != nil {
 		t.Fatal(err)
 	}
-	reconcileCodexProxyIfStale()
-	if !codexProxyConfigured() {
-		t.Error("live session's managed block was wrongly stripped")
+
+	purgeLegacyCodexProxyBlock()
+
+	if legacyCodexProxyBlockPresent() {
+		t.Error("legacy block survived a purge because a session was live")
+	}
+	if after := mustRead(t, cfg); strings.Contains(after, "promptster") {
+		t.Errorf("managed traces remain:\n%s", after)
 	}
 }
 
-func TestReconcileCodexProxyIfStale_ExpiredSessionStripsBlock(t *testing.T) {
+func TestPurgeLegacyBlock_NoConfigIsNoOp(t *testing.T) {
 	isolateCodexEnv(t)
-	if err := configureCodexProxy(testCodexBaseURL); err != nil {
+	purgeLegacyCodexProxyBlock()
+	if _, err := os.Stat(codexConfigPath()); !os.IsNotExist(err) {
+		t.Errorf("purge created a config file where none existed: %v", err)
+	}
+}
+
+func TestPurgeLegacyBlock_LeavesUnrelatedConfigAlone(t *testing.T) {
+	codexHomeDir, _ := isolateCodexEnv(t)
+	cfg := filepath.Join(codexHomeDir, "config.toml")
+	original := "model_provider = \"openai\"\nmodel = \"gpt-5.5\"\n"
+	if err := os.WriteFile(cfg, []byte(original), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := saveSession(Session{
-		SessionID:    "sess-expired",
-		SessionToken: "PST-OLD",
-		TaskRoot:     t.TempDir(),
-		ExpiresAt:    time.Now().Add(-time.Hour),
-	}); err != nil {
-		t.Fatal(err)
-	}
-	reconcileCodexProxyIfStale()
-	if codexProxyConfigured() {
-		t.Error("expired session's managed block was not stripped")
+
+	purgeLegacyCodexProxyBlock()
+
+	if after := mustRead(t, cfg); after != original {
+		t.Errorf("purge touched a config it never wrote:\nwant %q\ngot  %q", original, after)
 	}
 }
 
 func TestStripCodexProxyBlock(t *testing.T) {
-	content := "before\n" + codexProxyBlock(testCodexBaseURL) + "\nafter\n"
+	content := "before\n" + legacyCodexProxyBlock(testCodexBaseURL) + "\nafter\n"
 	cleaned, had := stripCodexProxyBlock(content)
 	if !had {
 		t.Error("expected block detected")

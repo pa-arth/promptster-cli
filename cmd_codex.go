@@ -8,23 +8,29 @@ import (
 	"time"
 )
 
-// cmdCodex handles `promptster codex [args...]` — launch codex with the proxy
-// credential already in its process environment.
+// cmdCodex handles `promptster codex [args...]` — launch codex wired to the
+// Promptster proxy for exactly this one process.
 //
-// WHY THIS COMMAND EXISTS. Codex has no apiKeyHelper equivalent, so our managed
-// provider block in ~/.codex/config.toml reads the credential from
-// $PROMPTSTER_PROXY_TOKEN (codex_proxy.go). The only thing that ever exported
-// that variable was the shell hook — and the hook is sourced from an RC file, so
-// the shell the candidate ran `promptster start` in never had it. Following the
-// printed next steps in that same shell produced codex's
-// "Missing environment variable: PROMPTSTER_PROXY_TOKEN" every time.
+// WHY THIS COMMAND EXISTS. Codex has no apiKeyHelper equivalent and no
+// per-workspace config, so instrumenting it means (a) selecting a custom model
+// provider and (b) putting the credential in the process environment. Both used
+// to be done OUT OF BAND — the provider written into the user's global
+// ~/.codex/config.toml, the credential exported by the shell hook — and both
+// leaked past the thing they were meant to scope. The provider hijacked every
+// codex on the machine and survived any teardown that did not run; the shell
+// export only ever existed in shells that sourced the hook AFTER `start`, which
+// is never the shell the candidate is standing in.
 //
-// The hook is fixed too (shell_hook.go now re-resolves per prompt), but a hook
-// can only ever fix SOME shells: it needs an RC file, an interactive shell, and
-// a supported shell family. This command depends on none of that — it reads the
-// 0600 session.json and hands the token to the child directly — which is why it
-// is what `start` prints as step 2.
+// Doing both here, per launch, is the whole fix. The overlay dies with the
+// process and the token comes straight from the 0600 session.json, so codex
+// outside this command is exactly the codex the candidate had before Promptster
+// was installed.
 func cmdCodex(args []string) {
+	// A machine that ran CLI ≤1.9 may still carry that version's managed block in
+	// the global codex config. Heal it here too: this is a codex command, so it
+	// is the most likely place a candidate with a broken personal codex lands.
+	purgeLegacyCodexProxyBlock()
+
 	// Same guard sequence as cmdAuthToken (cmd_env.go), including the expired
 	// self-eviction. Difference: auth-token stays silent because Claude Code
 	// treats empty stdout as "no credential" and falls back; here a human is
@@ -44,13 +50,18 @@ func cmdCodex(args []string) {
 			"Run: promptster start PST-XXXX-XXXX (or promptster reset)")
 	}
 
-	// No managed block means this session was not started with --tools codex, so
-	// codex would run on the candidate's own OpenAI auth: no proxy, no metering,
-	// and — because the model traffic never reaches us — no captured prompts.
-	// Refusing beats launching something that silently records nothing.
-	if !codexProxyConfigured() {
-		codexLaunchFail("codex is not instrumented for this session — the Promptster provider is not in "+codexConfigPath(),
-			"Run: promptster start --tools codex")
+	// A session started without codex has no consent to meter codex traffic
+	// against the hiring team's key, and its rollout watcher is not running — so
+	// the run would be billed to somebody and captured by nobody. Refusing beats
+	// launching something that silently records nothing.
+	//
+	// Session.Tools is the authority. It used to be "is our block in the global
+	// codex config", which answered a different question: that file is shared by
+	// every session the machine has ever run, so a leftover from last week read
+	// as consent for today.
+	if len(session.Tools) > 0 && !hasTool(session.Tools, toolCodex) {
+		codexLaunchFail("codex is not instrumented for this session — it was started with "+strings.Join(session.Tools, ", "),
+			"Run: promptster start PST-XXXX-XXXX --tools codex")
 	}
 
 	bin, err := exec.LookPath(toolBinaryName(toolCodex))
@@ -74,14 +85,31 @@ func cmdCodex(args []string) {
 
 	env := envWithProxyToken(os.Environ(), session.SessionToken)
 
-	// Extra args are forwarded verbatim so `promptster codex exec "..."`,
-	// `promptster codex --model ...` and friends behave as the bare binary would.
-	argv := append([]string{bin}, args...)
+	// Provider overlay first, then the user's args verbatim, so
+	// `promptster codex exec "..."`, `promptster codex --model ...` and friends
+	// behave as the bare binary would. codex accepts -c both before and after a
+	// subcommand; before is the position that works for every subcommand.
+	//
+	// A user-supplied `-c model_provider=...` later in argv would win, which is
+	// correct: an explicit override is a deliberate act, and codex would then be
+	// off-proxy and visibly so (it prints the provider at startup), rather than
+	// silently pinned by a file they never edited.
+	argv := codexLaunchArgv(bin, codexProxyBaseURL(), args)
 	if err := execCodex(bin, argv, env); err != nil {
 		fmt.Fprintf(os.Stderr, "error: could not launch codex: %v\n", err)
 		os.Exit(1)
 	}
 }
+
+// codexLaunchArgv builds the child's argv: the binary, our provider overlay,
+// then the user's arguments untouched.
+func codexLaunchArgv(bin, baseURL string, args []string) []string {
+	argv := append([]string{bin}, codexProxyArgs(baseURL)...)
+	return append(argv, args...)
+}
+
+// codexProxyBaseURL is the Responses-API prefix codex POSTs to (<base>/responses).
+func codexProxyBaseURL() string { return apiURL() + "/v1/proxy/openai/v1" }
 
 // codexLaunchFail prints a refusal plus the command that fixes it, and exits
 // non-zero. Never returns.
@@ -95,7 +123,7 @@ func codexLaunchFail(problem, fix string) {
 // duplicate key is resolved differently across platforms, and the stale one
 // winning is exactly the 401 this command exists to prevent.
 func envWithProxyToken(env []string, token string) []string {
-	const key = "PROMPTSTER_PROXY_TOKEN="
+	key := codexProxyTokenEnv + "="
 	out := make([]string, 0, len(env)+1)
 	for _, kv := range env {
 		if strings.HasPrefix(kv, key) {

@@ -66,3 +66,56 @@ func contains(xs []string, want string) bool {
 	}
 	return false
 }
+
+// TestCodexLaunchArgv — the instrumentation now lives entirely in argv, so its
+// position in argv is load-bearing.
+func TestCodexLaunchArgv(t *testing.T) {
+	const base = "https://api.test.promptster.ai/v1/proxy/openai/v1"
+
+	t.Run("binary first, overlay next, user args last", func(t *testing.T) {
+		argv := codexLaunchArgv("/usr/local/bin/codex", base, []string{"exec", "fix the bug"})
+		if argv[0] != "/usr/local/bin/codex" {
+			t.Fatalf("argv[0] = %q, want the resolved binary", argv[0])
+		}
+		overlay := codexProxyArgs(base)
+		for i, want := range overlay {
+			if argv[1+i] != want {
+				t.Fatalf("argv[%d] = %q, want %q", 1+i, argv[1+i], want)
+			}
+		}
+		// codex accepts -c before a subcommand and that is the position that
+		// works for every subcommand, so the user's args must come after.
+		tail := argv[1+len(overlay):]
+		if len(tail) != 2 || tail[0] != "exec" || tail[1] != "fix the bug" {
+			t.Errorf("user args not forwarded verbatim: %v", tail)
+		}
+	})
+
+	t.Run("a user override comes later and therefore wins", func(t *testing.T) {
+		argv := codexLaunchArgv("codex", base, []string{"-c", `model_provider="openai"`})
+		ours, theirs := -1, -1
+		for i, a := range argv {
+			if a == `model_provider="promptster"` {
+				ours = i
+			}
+			if a == `model_provider="openai"` {
+				theirs = i
+			}
+		}
+		if ours == -1 || theirs == -1 {
+			t.Fatalf("expected both provider selections in argv: %v", argv)
+		}
+		// Deliberate and visible — codex prints the provider it resolved — beats
+		// silently pinning a user who asked for something else.
+		if theirs < ours {
+			t.Errorf("user override at %d precedes ours at %d; it must be able to win", theirs, ours)
+		}
+	})
+
+	t.Run("no args still launches instrumented", func(t *testing.T) {
+		argv := codexLaunchArgv("codex", base, nil)
+		if len(argv) != 1+len(codexProxyArgs(base)) {
+			t.Errorf("bare launch argv = %v", argv)
+		}
+	})
+}

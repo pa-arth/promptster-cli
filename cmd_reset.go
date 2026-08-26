@@ -58,7 +58,7 @@ func cmdReset(args []string) {
 	stopGitWatcher()
 	stopCodexWatcher()
 	stopClaudeWatcher()
-	revertCodexProxy() // strip our block from ~/.codex/config.toml before state is wiped
+	purgeLegacyCodexProxyBlock() // heal a global codex config a pre-1.10 session left rewritten
 	cleanupPromptsterState(workspace)
 
 	dir := globalPromptsterDir()

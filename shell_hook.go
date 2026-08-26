@@ -61,10 +61,13 @@ func shellHookPath() string {
 //     when the session's local TTL has passed, so an abandoned session's RC
 //     line + shell hook disappear on the next new terminal.
 //
-//  3. Codex proxy token — re-resolved from `auth-token` on EVERY prompt while
-//     inside the workspace, and unset the moment `auth-token` goes quiet. It is
-//     not cached on "already exported": that would strand an expired credential
-//     in the shell and skip the one call that notices the expiry.
+//  3. Codex launcher — a PWD-gated `codex` shell function that routes to
+//     `promptster codex` inside the workspace and to the real binary everywhere
+//     else. It replaces the old PROMPTSTER_PROXY_TOKEN export: the credential
+//     now goes straight into one codex process instead of into the shell, so
+//     there is no exported secret to strand when a session ends, and no global
+//     codex config to leave broken. Dispatch is per call, so the function goes
+//     inert the moment the session does — even in a shell already open.
 func shellHookScript() string {
 	bin := promptsterBin()
 	return fmt.Sprintf(`#!/bin/sh
@@ -133,42 +136,46 @@ _promptster_in_workspace() {
   esac
 }
 
-# ── Codex proxy token (PWD-gated) ──────────────────────────────────────────
-# Codex has NO apiKeyHelper equivalent — its custom model provider reads the
-# proxy credential from $PROMPTSTER_PROXY_TOKEN. So, unlike Claude (whose token
-# is fed via apiKeyHelper and never touches the shell), codex forces the token
-# into the env. We scope it tightly: export ONLY inside the workspace AND only
-# while our managed provider block is present in codex's config (so a Claude-
-# only session never exports it), sourced from the 0600 session.json via
-# 'auth-token'. It is unset the moment you leave the workspace, so it never
-# leaks into an unrelated shell.
-_promptster_codex_cfg="${CODEX_HOME:-$HOME/.codex}/config.toml"
-_promptster_codex_active() {
-  [ -f "$_promptster_codex_cfg" ] && grep -q "%s" "$_promptster_codex_cfg" 2>/dev/null
-}
-_promptster_sync_codex_token() {
-  if _promptster_in_workspace && _promptster_codex_active; then
-    # Re-resolved EVERY prompt, never cached on "already exported". auth-token
-    # is the single source of truth: it prints the token for a live session,
-    # prints NOTHING for an expired one, and fires the background cleanup on
-    # its way out. Short-circuiting while the variable is non-empty would keep
-    # an expired credential exported for the life of the shell AND skip the
-    # only call that ever notices the expiry — the same resolve-once bug this
-    # hook exists to fix, one branch lower down.
-    _promptster_tok="$("$_promptster_bin" auth-token 2>/dev/null)"
-    if [ -n "$_promptster_tok" ]; then
-      PROMPTSTER_PROXY_TOKEN="$_promptster_tok"
-      export PROMPTSTER_PROXY_TOKEN
-    elif [ -n "${PROMPTSTER_PROXY_TOKEN:-}" ]; then
-      unset PROMPTSTER_PROXY_TOKEN
-    fi
-    unset _promptster_tok
-  elif [ -n "${PROMPTSTER_PROXY_TOKEN:-}" ]; then
-    unset PROMPTSTER_PROXY_TOKEN
-  fi
-}
-# Sync once now so a 'codex' run in this fresh shell sees the token immediately.
-_promptster_sync_codex_token
+# ── Codex launcher (PWD-gated) ─────────────────────────────────────────────
+# Codex needs two things Promptster supplies: a custom model provider and the
+# proxy credential in its environment. 'promptster codex' supplies both, scoped
+# to that one process (cmd_codex.go). This wrapper is here so that typing the
+# thing muscle memory types — plain 'codex' — inside the assessment workspace
+# gets the instrumented launch anyway.
+#
+# WHAT THIS REPLACED, and why the replacement is not the same shape. The hook
+# used to put the proxy credential into the shell environment itself, because
+# codex read the provider from a GLOBAL ~/.codex/config.toml that 'start' had
+# rewritten. So
+# every codex on the machine wanted that variable, and a session that ended
+# without a clean teardown left the user's personal codex demanding a token no
+# shell would ever again export. Nothing is global now: outside the workspace
+# this function calls the real binary and changes nothing about it, and the
+# credential never enters an environment that outlives one codex process.
+#
+# The dispatch is re-evaluated on every call, so this function is inert the
+# moment the session ends — including in shells that are already open, which a
+# config file could never manage.
+# A shell upgraded from a hook that DID export the credential is still carrying
+# it. Drop it here: nothing reads it any more, and it names a session that is
+# almost certainly over.
+[ -n "${PROMPTSTER_PROXY_TOKEN:-}" ] && unset PROMPTSTER_PROXY_TOKEN
+
+_promptster_codex_real="$(command -v codex 2>/dev/null)"
+case "$_promptster_codex_real" in
+  /*)
+    # Only wrap a real binary. If 'codex' already resolves to a function or an
+    # alias, it is the user's, and shadowing it would be our second uninvited
+    # global change to their setup.
+    codex() {
+      if _promptster_resolve_ws && _promptster_in_workspace; then
+        "$_promptster_bin" codex "$@"
+      else
+        "$_promptster_codex_real" "$@"
+      fi
+    }
+    ;;
+esac
 
 # TTL self-eviction (backgrounded, no output). 'promptster env' fires a
 # background cleanup when the session's local ExpiresAt has passed; otherwise
@@ -212,7 +219,6 @@ if [ -n "$ZSH_VERSION" ]; then
     # (or ended) since the last prompt, in this very shell.
     _promptster_resolve_ws || :
     _promptster_ttl_check
-    _promptster_sync_codex_token
     _promptster_in_workspace || return 0
     if [ -n "$_promptster_last_cmd" ]; then
       local now elapsed=0
@@ -251,7 +257,6 @@ elif [ -n "$BASH_VERSION" ]; then
     # Same as zsh's precmd: re-resolve before anything reads $_promptster_ws.
     _promptster_resolve_ws || :
     _promptster_ttl_check
-    _promptster_sync_codex_token
     _promptster_in_workspace || return 0
     if [ -n "$_promptster_last_cmd" ]; then
       local elapsed=0
@@ -269,7 +274,7 @@ elif [ -n "$BASH_VERSION" ]; then
     *) PROMPT_COMMAND="_promptster_prompt_cmd${PROMPT_COMMAND:+;$PROMPT_COMMAND}" ;;
   esac
 fi
-`, bin, codexProxyMarker)
+`, bin)
 }
 
 // shellRCPathsForInstall returns the user's shell RC files to inject the

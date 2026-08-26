@@ -71,7 +71,7 @@ func cmdDone(args []string) {
 	stopGitWatcher()
 	stopCodexWatcher()
 	stopClaudeWatcher()
-	revertCodexProxy() // strip our block from ~/.codex/config.toml before state is wiped
+	purgeLegacyCodexProxyBlock() // heal a global codex config a pre-1.10 session left rewritten
 	cleanupPromptsterState(session.TaskRoot)
 
 	doneBox := lipgloss.NewStyle().
@@ -118,7 +118,7 @@ func cmdDone(args []string) {
 		// Suppressed on the hosted lane: this warns that a PERSONAL shell has been
 		// left carrying assessment proxy env, and there is no personal shell in a
 		// disposable VM that is about to be deleted. Everything it protects —
-		// the marker fences, the sidecar state, revertCodexProxy above — still runs.
+		// the marker fences, the sidecar state, the legacy purge above — still runs.
 		printShellProxyEnvClearHint()
 	}
 
