@@ -869,6 +869,11 @@ var codexPatchFileHeaders = []struct {
 	{"*** Delete File: ", "delete"},
 }
 
+// codexPatchMovePrefix marks a rename inside an apply_patch envelope. It
+// follows the `*** Update File:` header it belongs to and names the
+// DESTINATION; the header keeps naming the source.
+const codexPatchMovePrefix = "*** Move to: "
+
 // emitWrappedPatch derives one file_diff per changed file from a wrapped
 // apply_patch envelope, which arrives with no patch_apply_end companion.
 //
@@ -887,7 +892,7 @@ func (p *codexRolloutProcessor) emitWrappedPatch(call codexPendingCall, output, 
 	// retry. Emitting from the envelope alone invents file_diffs for edits that
 	// never touched the tree, and double-counts the retry — inflating exactly the
 	// number a reviewer reads as work done.
-	if codexScriptFailed(output) {
+	if codexWrappedPatchRejected(output) {
 		e := p.newCodexEvent("tool_use", ts)
 		e.Data = map[string]interface{}{
 			"toolName": "apply_patch",
@@ -904,6 +909,7 @@ func (p *codexRolloutProcessor) emitWrappedPatch(call codexPendingCall, output, 
 	}
 	type change struct {
 		path       string
+		movePath   string
 		changeType string
 		lines      []string
 	}
@@ -925,8 +931,17 @@ func (p *codexRolloutProcessor) emitWrappedPatch(call codexPendingCall, output, 
 		if matched {
 			continue
 		}
-		// Envelope framing (*** Begin Patch / *** End Patch / *** Move to:) is not
-		// diff content. Everything else in a file section is.
+		// A rename names its destination on its own line. Dropping it left the
+		// event keyed to a path the patch had just removed, so replay pointed at
+		// the wrong file and cross-channel dedup could never match the Git event
+		// for the destination. Carry it as movePath — the same shape the
+		// FileChange and patch_apply_end producers already emit for a rename.
+		if current >= 0 && strings.HasPrefix(line, codexPatchMovePrefix) {
+			changes[current].movePath = strings.TrimSpace(strings.TrimPrefix(line, codexPatchMovePrefix))
+			continue
+		}
+		// The rest of the envelope framing (*** Begin Patch / *** End Patch) is
+		// not diff content. Everything else in a file section is.
 		if current < 0 || strings.HasPrefix(line, "*** ") {
 			continue
 		}
@@ -938,7 +953,7 @@ func (p *codexRolloutProcessor) emitWrappedPatch(call codexPendingCall, output, 
 		added, removed := countDiffLines(diff)
 		e := p.newCodexEvent("file_diff", ts)
 		e.Provenance = aiProvenance()
-		e.Data = map[string]interface{}{
+		data := map[string]interface{}{
 			"path":         c.path,
 			"diff":         diff,
 			"linesAdded":   added,
@@ -946,6 +961,10 @@ func (p *codexRolloutProcessor) emitWrappedPatch(call codexPendingCall, output, 
 			"attribution":  "likely_ai",
 			"changeType":   c.changeType,
 		}
+		if c.movePath != "" {
+			data["movePath"] = c.movePath
+		}
+		e.Data = data
 		e.RawPayload = strPreview(diff, 500)
 		events = append(events, e)
 	}
@@ -1035,6 +1054,23 @@ func parseCodexExecOutput(output string) (int, string) {
 // command's own output, not this command's verdict.
 func codexScriptFailed(output string) bool {
 	return strings.HasPrefix(strings.TrimSpace(output), "Script failed")
+}
+
+// codexWrappedPatchRejected reports a wrapped apply_patch whose edits never
+// reached the tree. The script envelope alone is not enough to decide that:
+// codexScriptFailed is deliberately anchored to the head of the blob, and a
+// wrapper that CATCHES the rejection reports "Script completed" with the
+// refusal in its body. Every wrapped rejection in the sampled rollouts (4/4)
+// did fail its script, so the anchored check carries them — this second clause
+// is what makes the swallowed case impossible rather than merely unobserved.
+//
+// Under-reporting is the deliberate direction here. A script that lands one
+// patch and is refused another emits nothing from the envelope, but a host that
+// applied anything emits FileChange for it, and sawFileChange already returns
+// before this point. So the only thing this can cost is an invented diff.
+func codexWrappedPatchRejected(output string) bool {
+	return codexScriptFailed(output) ||
+		strings.Contains(output, "apply_patch verification failed")
 }
 
 // countDiffLines counts added/removed lines in a unified diff, excluding the

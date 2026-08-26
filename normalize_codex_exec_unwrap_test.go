@@ -311,3 +311,72 @@ func TestCodexEnvelopeStillCoversAHostWithoutFileChange(t *testing.T) {
 		t.Fatalf("expected the envelope fallback to emit one file_diff, got %v", kindsOf(events))
 	}
 }
+
+// A rename inside a wrapped envelope names its destination on a `*** Move to:`
+// line of its own. Dropping that line left the event keyed to a path the patch
+// had just removed: replay pointed at the wrong file, and cross-channel dedup
+// could never match the Git event for the destination. movePath is the shape
+// the FileChange and patch_apply_end producers already use for a rename.
+func TestCodexWrappedApplyPatchCarriesMoveDestination(t *testing.T) {
+	const call = `{"timestamp":"2026-08-26T13:30:00.0Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"call_9","input":"const patch = \"*** Begin Patch\n*** Update File: internal/auth.go\n*** Move to: internal/session/auth.go\n@@ func Login\n-\tif user == nil {\n+\tif user == nil || user.Disabled {\n*** End Patch\";\nawait tools.apply_patch(patch);"}}`
+	const out = `{"timestamp":"2026-08-26T13:30:00.5Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_9","output":"Done"}}`
+
+	p := newCodexRolloutProcessor("sess-1", false)
+	events := feed(p, call, out)
+
+	if len(events) != 1 || events[0].Kind != "file_diff" {
+		t.Fatalf("expected one file_diff, got %v", kindsOf(events))
+	}
+	d := eventData(t, events[0])
+	if got, _ := d["path"].(string); got != "internal/auth.go" {
+		t.Errorf("path = %q, want the source path", got)
+	}
+	if got, _ := d["movePath"].(string); got != "internal/session/auth.go" {
+		t.Errorf("movePath = %q, want the destination — the rename was dropped", got)
+	}
+	// The framing line is a destination, not diff content.
+	if diff, _ := d["diff"].(string); strings.Contains(diff, "Move to") {
+		t.Errorf("the Move to line leaked into the diff body: %q", diff)
+	}
+}
+
+// A patch with no rename must not grow a movePath key — the sibling producers
+// only set it when the host reported one.
+func TestCodexWrappedApplyPatchOmitsMovePathWhenThereIsNoRename(t *testing.T) {
+	p := newCodexRolloutProcessor("sess-1", false)
+	events := feed(p, codexExecPatchCall, codexExecPatchOutput)
+
+	if len(events) != 1 {
+		t.Fatalf("expected one event, got %v", kindsOf(events))
+	}
+	if _, present := eventData(t, events[0])["movePath"]; present {
+		t.Error("movePath set on a patch that renames nothing")
+	}
+}
+
+// A rejected patch is a REQUEST, not a record of what landed. The script
+// envelope alone cannot decide that: codexScriptFailed is anchored to the head
+// of the blob, so a wrapper that catches the refusal and reports "Script
+// completed" would have its envelope emitted as real file_diffs — inventing AI
+// edits and marking unchanged paths as AI-touched.
+func TestCodexWrappedApplyPatchNeverInventsDiffsFromASwallowedRejection(t *testing.T) {
+	const call = `{"timestamp":"2026-08-26T13:31:00.0Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"call_10","input":"const patch = \"*** Begin Patch\n*** Update File: internal/auth.go\n@@ func Login\n-\told\n+\tnew\n*** End Patch\";\ntry { await tools.apply_patch(patch); } catch (e) { console.log(e.message); }"}}`
+	// The script itself SUCCEEDS — the wrapper caught the refusal and printed it.
+	const out = `{"timestamp":"2026-08-26T13:31:00.5Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_10","output":"Script completed\nWall time 0.1 seconds\nOutput:\napply_patch verification failed: Failed to find expected lines in internal/auth.go"}}`
+
+	p := newCodexRolloutProcessor("sess-1", false)
+	events := feed(p, call, out)
+
+	for _, e := range events {
+		if e.Kind == "file_diff" {
+			t.Fatalf("emitted a file_diff for a patch the host refused: %v", eventData(t, e))
+		}
+	}
+	if len(events) != 1 || events[0].Kind != "tool_use" {
+		t.Fatalf("a refused patch must still be recorded as a failed tool_use, got %v", kindsOf(events))
+	}
+	d := eventData(t, events[0])
+	if ok, _ := d["ok"].(bool); ok {
+		t.Error("the refused patch was recorded as ok")
+	}
+}
