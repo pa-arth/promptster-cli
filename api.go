@@ -213,9 +213,24 @@ func apiSaveWorkspaceCommit(sessionID, sessionToken, commitSha string) error {
 	return nil
 }
 
-// apiConfirmConsent calls POST /v1/candidate/consent to mark consent confirmed server-side.
-func apiConfirmConsent(key string) error {
-	body := []byte(`{"key":"` + key + `"}`)
+// apiConfirmConsent calls POST /v1/candidate/consent to mark consent confirmed
+// server-side.
+//
+// disclosureHash attests WHAT WE RENDERED. Pass it only when the disclosure
+// came from this server; pass "" when the fallback was shown. The server
+// records the version and hash from its own copy either way, so the attestation
+// is the only thing standing between a stale client and a sha256 proof that
+// someone accepted a document they were never shown. It answers a mismatch with
+// 409, which is a refusal to record such a proof, not a failure.
+func apiConfirmConsent(key, disclosureHash string) error {
+	payload := map[string]string{"key": key}
+	if disclosureHash != "" {
+		payload["disclosureHash"] = disclosureHash
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
 	req, err := http.NewRequest(http.MethodPost, apiURL()+"/v1/candidate/consent", bytes.NewReader(body))
 	if err != nil {
 		return err
@@ -226,6 +241,13 @@ func apiConfirmConsent(key string) error {
 		return fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusConflict {
+		// Our consent text is older than the server's. Recording this would be
+		// the false proof the attestation exists to prevent, so the server
+		// refused — correctly. Only an upgrade fixes it.
+		return fmt.Errorf("the terms shown by this CLI are out of date\n" +
+			"  Update Promptster and run this again: npm install -g @promptster/cli")
+	}
 	if resp.StatusCode != 200 {
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		return fmt.Errorf("consent confirmation failed (status %d): %s", resp.StatusCode, string(respBody))
@@ -237,10 +259,18 @@ func apiConfirmConsent(key string) error {
 // the web consent page and this CLI render these plain strings — the API is the
 // single source of truth so the lists can't drift apart.
 type ConsentDisclosure struct {
+	Version        string   `json:"version"`
 	Captures       []string `json:"captures"`
 	DoesNotCapture []string `json:"doesNotCapture"`
 	Evaluated      []string `json:"evaluated"`
-	TosURL         string   `json:"tosUrl"`
+	// The de-identified training-use clause. It has been in the canonical
+	// disclosure since consent v2 and this struct had no field for it, so the
+	// CLI decoded the response and dropped it on the floor — while the server
+	// went on stamping a corpus-eligible version and a sha256 onto the
+	// candidate's record. Every consent taken through this client before v4 is
+	// therefore a proof of assent to a clause the candidate was never shown.
+	DataUse []string `json:"dataUse"`
+	TosURL  string   `json:"tosUrl"`
 }
 
 // ConsentInfo is the subset of GET /v1/candidate/consent the CLI consumes:
@@ -249,6 +279,12 @@ type ConsentDisclosure struct {
 type ConsentInfo struct {
 	AlreadyConfirmed bool              `json:"alreadyConfirmed"`
 	Disclosure       ConsentDisclosure `json:"disclosure"`
+	// sha256 of the disclosure above, as the server computed it. Echoed back on
+	// POST to attest what we actually rendered; the server 409s on a mismatch
+	// rather than record a proof for a document we never displayed. Empty when
+	// the GET failed and we fell back to the embedded copy — in which case we
+	// attest nothing, which is the honest answer.
+	DisclosureHash string `json:"disclosureHash"`
 }
 
 // apiConsentInfo fetches consent state + canonical disclosure via
