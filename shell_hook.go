@@ -42,6 +42,18 @@ func shellHookPath() string {
 //     recorded. Each is sent to `promptster hook shell-cmd`, which normalizes it
 //     to a `command` event (same shape as AI-executed Bash tool calls).
 //
+//     The active workspace is re-resolved on EVERY prompt, and this hook
+//     installs itself even in a shell with no session at all. It used to do the
+//     opposite — read ~/.promptster/active-workspace once at source time and
+//     `return 0` if no session was live yet — and that was a bug, not an
+//     optimisation. `promptster start` runs INSIDE an already-open shell, so
+//     the shell a candidate is standing in when they read the printed next
+//     steps was, by construction, the one shell that had registered nothing:
+//     no preexec, no precmd, no PROMPTSTER_PROXY_TOKEN. Terminal capture was
+//     silently off there, and codex died on "Missing environment variable:
+//     PROMPTSTER_PROXY_TOKEN". A shell that DID have the hook loaded was no
+//     better: it held the workspace path captured before `start` ran.
+//
 //  2. TTL self-eviction — a single backgrounded `promptster env` at shell start.
 //     It exports nothing now; its only job is to fire `promptster cleanup` when
 //     the session's local TTL has passed, so an abandoned session's RC line +
@@ -62,27 +74,46 @@ case $- in
   *) return 0 2>/dev/null || : ;;
 esac
 
-# Resolve the active workspace pointer (global, written by 'promptster start').
-_promptster_ws=""
-if [ -f "$HOME/.promptster/active-workspace" ]; then
-  _promptster_ws="$(cat "$HOME/.promptster/active-workspace" 2>/dev/null)"
-fi
-
-# No active session → nothing to do for this shell.
-if [ -z "$_promptster_ws" ] || [ ! -f "$_promptster_ws/.promptster/session.json" ]; then
-  return 0 2>/dev/null || :
-fi
-
-# Canonicalize to the PHYSICAL path (resolve symlinks). On macOS /tmp is a
-# symlink to /private/tmp, so a workspace handed out as /tmp/foo would otherwise
-# never match a terminal whose $PWD is /private/tmp/foo, silently dropping every
-# human terminal command. Resolving both sides to their physical path fixes it.
-_promptster_ws_phys="$(cd "$_promptster_ws" 2>/dev/null && pwd -P)"
-[ -n "$_promptster_ws_phys" ] && _promptster_ws="$_promptster_ws_phys"
-
 _promptster_bin="%s"
 
+# Resolve the active workspace pointer (global, written by 'promptster start').
+#
+# Called from precmd on EVERY prompt, never once at shell start. 'promptster
+# start' runs inside a shell that is already open, so a hook that resolved this
+# once would be permanently blind in the one shell the candidate is actually
+# standing in: no session when the RC was sourced, so no terminal capture and no
+# codex token, for the life of that shell. Re-reading a 40-byte file per prompt
+# is what it costs for that not to be true.
+#
+# Returns non-zero and leaves _promptster_ws empty when no session is live,
+# which is the normal state for most shells on the machine.
+_promptster_resolve_ws() {
+  _promptster_ws=""
+  [ -f "$HOME/.promptster/active-workspace" ] || return 1
+  _promptster_ws="$(cat "$HOME/.promptster/active-workspace" 2>/dev/null)"
+  [ -n "$_promptster_ws" ] || return 1
+  if [ ! -f "$_promptster_ws/.promptster/session.json" ]; then
+    _promptster_ws=""
+    return 1
+  fi
+  # Canonicalize to the PHYSICAL path (resolve symlinks). On macOS /tmp is a
+  # symlink to /private/tmp, so a workspace handed out as /tmp/foo would
+  # otherwise never match a terminal whose $PWD is /private/tmp/foo, silently
+  # dropping every human terminal command. Resolving both sides to their
+  # physical path fixes it.
+  _promptster_ws_phys="$(cd "$_promptster_ws" 2>/dev/null && pwd -P)"
+  [ -n "$_promptster_ws_phys" ] && _promptster_ws="$_promptster_ws_phys"
+  return 0
+}
+
+# Resolve once now, so the first command typed in this shell is captured and a
+# codex launched before the first prompt already sees the token. Failure is the
+# ordinary no-session case; the hooks below still install, and no-op.
+_promptster_resolve_ws || :
+
 _promptster_in_workspace() {
+  # No live session → no workspace to be inside of.
+  [ -n "$_promptster_ws" ] || return 1
   # Fast path: logical $PWD already matches (no symlink in play).
   case "$PWD" in
     "$_promptster_ws"|"$_promptster_ws"/*) return 0 ;;
@@ -124,7 +155,12 @@ _promptster_sync_codex_token
 # TTL self-eviction (backgrounded, no output). 'promptster env' fires a
 # background cleanup when the session's local ExpiresAt has passed; otherwise
 # it does nothing. Detached so shell start never blocks on the spawn.
-( "$_promptster_bin" env >/dev/null 2>&1 & ) 2>/dev/null
+#
+# Gated on a live session. The old early-return meant this only ever ran in a
+# shell that had one; now that the hook installs unconditionally, spawning it
+# from every interactive shell on the machine would be one process per shell for
+# a command that returns immediately when there is no session to evict.
+[ -n "$_promptster_ws" ] && ( "$_promptster_bin" env >/dev/null 2>&1 & ) 2>/dev/null
 
 if [ -n "$ZSH_VERSION" ]; then
   # ── zsh: preexec receives the full command line as $1 ──
@@ -140,6 +176,9 @@ if [ -n "$ZSH_VERSION" ]; then
 
   promptster_precmd() {
     local exit_code=$?
+    # Before anything reads $_promptster_ws: a session may have been started
+    # (or ended) since the last prompt, in this very shell.
+    _promptster_resolve_ws || :
     _promptster_sync_codex_token
     _promptster_in_workspace || return 0
     if [ -n "$_promptster_last_cmd" ]; then
@@ -176,6 +215,8 @@ elif [ -n "$BASH_VERSION" ]; then
 
   _promptster_prompt_cmd() {
     local exit_code=$?
+    # Same as zsh's precmd: re-resolve before anything reads $_promptster_ws.
+    _promptster_resolve_ws || :
     _promptster_sync_codex_token
     _promptster_in_workspace || return 0
     if [ -n "$_promptster_last_cmd" ]; then

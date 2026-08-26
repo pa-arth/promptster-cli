@@ -57,9 +57,13 @@ func TestShellHookScriptStructure(t *testing.T) {
 	}
 
 	// 3. TTL self-eviction is preserved: a backgrounded `promptster env` at
-	//    shell start fires cleanup for an expired session.
+	//    shell start fires cleanup for an expired session. Now gated on a live
+	//    session, since the hook installs into shells that have none.
 	if !strings.Contains(script, `( "$_promptster_bin" env >/dev/null 2>&1 & )`) {
 		t.Errorf("shell hook missing backgrounded TTL self-eviction trigger")
+	}
+	if !strings.Contains(script, `[ -n "$_promptster_ws" ] && ( "$_promptster_bin" env`) {
+		t.Errorf("TTL self-eviction should not spawn a process in every sessionless shell")
 	}
 
 	// 4. Command capture is gated to the workspace tree.
@@ -84,6 +88,53 @@ func TestShellHookScriptStructure(t *testing.T) {
 	// 7. Non-interactive bailout is preserved (sourced by SSH/scp etc).
 	if !strings.Contains(script, "case $- in") {
 		t.Errorf("shell hook missing non-interactive bailout")
+	}
+
+	// 8. THE REGRESSION. The hook used to read ~/.promptster/active-workspace
+	//    once at source time and `return 0` when no session was live. Because
+	//    `promptster start` runs inside a shell that is already open, that made
+	//    the candidate's own shell the one shell guaranteed to have registered
+	//    nothing — no command capture, and no PROMPTSTER_PROXY_TOKEN, which is
+	//    how `codex` died on "Missing environment variable" immediately after
+	//    start printed "Codex ready".
+	//
+	//    Two properties keep that from coming back: resolution is a FUNCTION
+	//    (so it can be called again), and it is called from the per-prompt
+	//    hooks of both shell families.
+	if !strings.Contains(script, "_promptster_resolve_ws()") {
+		t.Errorf("workspace resolution must be a function so it can re-run per prompt")
+	}
+	for _, hook := range []string{
+		"promptster_precmd() {",      // zsh
+		"_promptster_prompt_cmd() {", // bash
+	} {
+		idx := strings.Index(script, hook)
+		if idx == -1 {
+			t.Fatalf("shell hook missing %q", hook)
+		}
+		body := script[idx:]
+		if end := strings.Index(body, "\n  }"); end != -1 {
+			body = body[:end]
+		}
+		if !strings.Contains(body, "_promptster_resolve_ws") {
+			t.Errorf("%s must re-resolve the workspace; a session started mid-shell is invisible otherwise", hook)
+		}
+	}
+
+	// 9. And the early bail is GONE. A shell sourcing this with no active
+	//    session must still install its hooks — that is the whole point of 8.
+	//    The only permitted early return is the non-interactive bailout (7).
+	if strings.Contains(script, "session.json\" ]; then\n  return 0") {
+		t.Errorf("hook must not skip installation when no session is live at source time")
+	}
+	if got := strings.Count(script, "return 0 2>/dev/null || :"); got != 1 {
+		t.Errorf("expected exactly one early return (the non-interactive bailout), got %d", got)
+	}
+
+	// 10. _promptster_in_workspace must be false — not erroring, not true —
+	//     when there is no session, since it now runs in shells that have none.
+	if !strings.Contains(script, `[ -n "$_promptster_ws" ] || return 1`) {
+		t.Errorf("_promptster_in_workspace must return false when no session is live")
 	}
 
 	// Surface the full rendered script when -v is passed so a human can

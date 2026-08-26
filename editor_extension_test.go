@@ -175,3 +175,56 @@ func TestWriteVsixToTempWritesTheEmbeddedBytes(t *testing.T) {
 		t.Error("cleanup left the staged artifact behind")
 	}
 }
+
+// TestConfirmEditorExtensionFlags pins the flag branches, which must resolve
+// without consulting a terminal at all.
+func TestConfirmEditorExtensionFlags(t *testing.T) {
+	if confirmEditorExtension(true, false) {
+		t.Error("--no-editor-extension must decline")
+	}
+	if !confirmEditorExtension(false, true) {
+		t.Error("--editor-extension must accept without prompting")
+	}
+	// --no wins if both somehow reach here; `start` rejects the combination
+	// before this is called, so this only pins that the safe side is the
+	// fallback rather than an install.
+	if confirmEditorExtension(true, true) {
+		t.Error("contradictory flags must not resolve to an install")
+	}
+}
+
+// TestConfirmEditorExtensionNoTTYDeclines is the property the whole prompt
+// exists for: an unanswerable question is not consent. `go test` runs with
+// stdin not a terminal, so this exercises the real path.
+//
+// It only means something when a supported editor is actually present — with
+// none, the function returns true so installEditorExtension can record
+// no_supported_editor, which is a different fact about the machine than a
+// candidate declining. Skip rather than assert the wrong thing.
+func TestConfirmEditorExtensionNoTTYDeclines(t *testing.T) {
+	if len(detectEditors()) == 0 {
+		t.Skip("no VS Code or Cursor on this machine; the no-TTY branch is unreachable")
+	}
+	if stdinIsTerminal() {
+		t.Skip("stdin is a terminal; this test asserts the non-interactive path")
+	}
+	if confirmEditorExtension(false, false) {
+		t.Error("no terminal to ask must decline, never install by default")
+	}
+}
+
+// TestDeclinedNoteDoesNotNameTheFlag — the note used to say
+// "(--no-editor-extension)", which is now the less likely of the two ways to
+// get here: the usual one is a candidate typing n at the prompt.
+func TestDeclinedNoteDoesNotNameTheFlag(t *testing.T) {
+	result := installEditorExtension(false)
+	if result.Status != editorCaptureDeclined {
+		t.Fatalf("status = %q, want %q", result.Status, editorCaptureDeclined)
+	}
+	if strings.Contains(result.Note, "--no-editor-extension") {
+		t.Errorf("declined note should not attribute the decline to the flag: %q", result.Note)
+	}
+	if !strings.Contains(result.Note, "declined") {
+		t.Errorf("declined note should still say the capture was declined: %q", result.Note)
+	}
+}

@@ -28,7 +28,7 @@ func cmdRedeem(args []string) {
 	// Show consent TUI before redeeming — accept must happen first. If consent was
 	// already given via the web flow, runConsent skips the disclosure but still asks
 	// the cadence question.
-	result := runConsent(info.Disclosure, info.AlreadyConfirmed, *acceptTos)
+	result := runConsent(info.Disclosure, info.DisclosureHash, info.AlreadyConfirmed, *acceptTos)
 	if !result.Accepted {
 		fmt.Println("\nAssessment declined. No data has been recorded.")
 		os.Exit(0)
@@ -37,7 +37,7 @@ func cmdRedeem(args []string) {
 	// Confirm consent server-side so the redeem endpoint allows it. Skip when the
 	// web flow already recorded it — the POST is idempotent, but there's no need.
 	if !info.AlreadyConfirmed {
-		if err := apiConfirmConsent(key); err != nil {
+		if err := apiConfirmConsent(key, result.DisclosureHash); err != nil {
 			fmt.Fprintf(os.Stderr, "error confirming consent: %v\n", err)
 			os.Exit(1)
 		}

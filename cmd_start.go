@@ -52,6 +52,13 @@ func cmdStart(args []string) {
 	// change leaves standing: the extension installs into whatever editor the
 	// candidate uses. What is retired is Cursor as an instrumented AGENT.
 	noEditorExt := fs.Bool("no-editor-extension", false, "Skip installing the Promptster editor extension into VS Code/Cursor (the session records that editor attention capture was unavailable)")
+	// The affirmative twin of --no-editor-extension, for runs with no terminal
+	// to ask. Since the install is now PROMPTED, and a prompt with nobody to
+	// answer it must decline, a scripted or hosted run that genuinely wants
+	// attention capture needs a way to say yes in advance. Without this, making
+	// the install opt-in would have silently switched every non-interactive lane
+	// to no-capture.
+	yesEditorExt := fs.Bool("editor-extension", false, "Install the Promptster editor extension without prompting (for non-interactive runs)")
 	// --adopt: work in the checkout that is already here instead of cloning one.
 	//
 	// It DEFAULTS ON inside a Codespace (openspec §2.2). That default is the
@@ -61,6 +68,15 @@ func cmdStart(args []string) {
 	// still forces the clone path for anyone who needs it.
 	adoptFlag := fs.Bool("adopt", false, "Adopt the checkout already present instead of cloning (default: on inside a GitHub Codespace)")
 	fs.Parse(args) //nolint:errcheck
+
+	// Refuse rather than pick a winner. A silent precedence rule here decides,
+	// on the candidate's behalf, whether software goes on their machine — and
+	// whichever way it resolved, half the scripts passing both flags would be
+	// getting the opposite of what they asked for without being told.
+	if *noEditorExt && *yesEditorExt {
+		fmt.Fprintln(os.Stderr, "error: --editor-extension and --no-editor-extension contradict each other; pass one")
+		os.Exit(1)
+	}
 	startVerbose = *verbose
 
 	adopt := *adoptFlag
@@ -165,7 +181,7 @@ func cmdStart(args []string) {
 		// Best-effort fetch of consent state + canonical disclosure; zero value
 		// falls back to the embedded disclosure and unconfirmed consent.
 		info, _ := apiConsentInfo(session.Key)
-		result := runConsent(info.Disclosure, info.AlreadyConfirmed, *acceptTos)
+		result := runConsent(info.Disclosure, info.DisclosureHash, info.AlreadyConfirmed, *acceptTos)
 		if !result.Accepted {
 			fmt.Println("\nAssessment declined. No data has been recorded.")
 			os.Exit(0)
@@ -516,6 +532,20 @@ func cmdStart(args []string) {
 		if err := configureCodexProxy(codexProxyURL); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: could not configure Codex proxy: %v\n", err)
 		}
+		// The smoke test below authenticates with session.SessionToken over a
+		// direct HTTP call, so it proves the proxy and the org key are healthy
+		// and proves NOTHING about whether codex will find a credential. Those
+		// came apart in exactly one place and it was the place that mattered:
+		// this shell predates the session, so it has no PROMPTSTER_PROXY_TOKEN,
+		// and a candidate who read "Codex ready" and typed `codex` got
+		// "Missing environment variable: PROMPTSTER_PROXY_TOKEN".
+		//
+		// Say it here rather than let step 2 look like an arbitrary detour.
+		// `promptster codex` carries the credential itself (cmd_codex.go), which
+		// is why it is what gets printed.
+		if os.Getenv("PROMPTSTER_PROXY_TOKEN") == "" {
+			verbosef("no PROMPTSTER_PROXY_TOKEN in this shell — 'promptster codex' will supply it")
+		}
 	}
 
 	// No subscription-logout step: the apiKeyHelper out-ranks a logged-in
@@ -655,7 +685,15 @@ func cmdStart(args []string) {
 	// assessment exactly as before. What changes is that the session then says
 	// capture was unavailable, so a reviewer never reads that silence as a
 	// candidate who opened no files.
-	editorCapture := installEditorExtension(!*noEditorExt)
+	//
+	// ASKED FOR, not assumed. This used to install unconditionally — shelling
+	// `--install-extension --force` with stdin closed, which suppresses the
+	// editor's own confirmation — into both VS Code and Cursor, and tell the
+	// candidate afterwards. Recording someone's process is something they
+	// consented to; putting software on their personal machine is a separate
+	// thing to consent to, and it was never asked. It is disclosed in consent
+	// v4 and asked for here.
+	editorCapture := installEditorExtension(confirmEditorExtension(*noEditorExt, *yesEditorExt))
 	printEditorCaptureLine(editorCapture)
 
 	// [6/7] Save session + verify setup ───────────────────────────────────────
@@ -877,6 +915,14 @@ func awaitHostedBootReport(done <-chan struct{}) {
 // nextStepLaunch returns the launch command, its description, and the tool
 // noun used in the "open from this workspace" reminder, adapting to whichever
 // tool(s) the candidate selected.
+//
+// Claude is launched BARE and Codex through `promptster codex`, and the
+// asymmetry is not cosmetic. Claude Code's credential rides an apiKeyHelper in
+// <ws>/.claude/settings.local.json, which it reads at runtime in any shell.
+// Codex reads $PROMPTSTER_PROXY_TOKEN from its process environment, which the
+// shell that just ran `promptster start` does not have — printing a bare `codex`
+// here is what sent candidates straight into "Missing environment variable:
+// PROMPTSTER_PROXY_TOKEN". See cmd_codex.go.
 func nextStepLaunch(useClaude, useCodex bool) (cmd, desc, noun string) {
 	type launch struct{ cmd, noun string }
 	var sel []launch
@@ -884,13 +930,13 @@ func nextStepLaunch(useClaude, useCodex bool) (cmd, desc, noun string) {
 		sel = append(sel, launch{"claude", "Claude Code"})
 	}
 	if useCodex {
-		sel = append(sel, launch{"codex", "Codex"})
+		sel = append(sel, launch{"promptster codex", "Codex"})
 	}
 	if len(sel) == 0 {
 		return "claude", "— opens Claude Code in this workspace", "Claude Code"
 	}
 	if len(sel) == 1 {
-		return sel[0].cmd, "— opens " + sel[0].noun + " in this workspace", sel[0].noun
+		return sel[0].cmd, "— opens " + sel[0].noun + " in this workspace" + launchNote(sel[0].cmd), sel[0].noun
 	}
 	cmds := make([]string, len(sel))
 	nouns := make([]string, len(sel))
@@ -901,6 +947,17 @@ func nextStepLaunch(useClaude, useCodex bool) (cmd, desc, noun string) {
 	return cmds[0] + "   # or: " + strings.Join(cmds[1:], " / "),
 		"— open " + strings.Join(nouns, " or ") + " in this workspace",
 		strings.Join(nouns, " / ")
+}
+
+// launchNote explains a launch command that is not the one muscle memory would
+// reach for. Only `promptster codex` needs it: a candidate who has used codex
+// before will otherwise read step 2 as a pointless wrapper, type `codex`, and
+// land on the exact error this whole change exists to remove.
+func launchNote(cmd string) string {
+	if cmd == "promptster codex" {
+		return ", with this session's credential"
+	}
+	return ""
 }
 
 // printTaskBrief displays the task brief in a styled lipgloss box.

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -150,6 +151,64 @@ func writeVsixToTemp() (string, func(), error) {
 // network-mounted home — must not hold up the assessment.
 const installExtensionTimeout = 45 * time.Second
 
+// confirmEditorExtension decides whether to install, asking the candidate when
+// there is anyone there to ask.
+//
+// The three ways this resolves, in order:
+//
+//   - Either flag set: that is the answer. --no-editor-extension declines,
+//     --editor-extension accepts without a prompt. `start` rejects both at once
+//     before we get here.
+//   - No supported editor present: no question worth asking. Return true and
+//     let installEditorExtension record no_supported_editor, which is a
+//     different and more useful state than "declined".
+//   - Otherwise: ask, defaulting to yes — but only with a terminal attached.
+//
+// NO TTY MEANS NO. A prompt nobody can answer is not consent, and the whole
+// point of this function is that we stopped inferring it. That does cost
+// capture on scripted lanes, which is what --editor-extension is for.
+func confirmEditorExtension(noFlag, yesFlag bool) bool {
+	if noFlag {
+		return false
+	}
+	if yesFlag {
+		return true
+	}
+
+	editors := detectEditors()
+	if len(editors) == 0 {
+		return true
+	}
+
+	names := make([]string, 0, len(editors))
+	for _, e := range editors {
+		names = append(names, e.name)
+	}
+	joined := strings.Join(names, " and ")
+
+	dim := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	if !stdinIsTerminal() {
+		fmt.Println()
+		fmt.Printf("  %s\n", dim.Render("No terminal to ask — skipping the "+joined+" extension. Pass --editor-extension to install it in scripted runs."))
+		return false
+	}
+
+	fmt.Println()
+	fmt.Printf("  Install the Promptster extension into %s?\n", joined)
+	fmt.Printf("  %s\n", dim.Render("Records which files you open and for how long. No file contents."))
+	fmt.Printf("  %s\n", dim.Render("Removed by 'promptster done'. Pause any time from the command palette."))
+	fmt.Print("  Install? [Y/n]: ")
+
+	scanner := bufio.NewScanner(os.Stdin)
+	if !scanner.Scan() {
+		// stdin closed under us mid-prompt. Same reasoning as the no-TTY case:
+		// an unanswered question is not a yes.
+		return false
+	}
+	ans := strings.TrimSpace(strings.ToLower(scanner.Text()))
+	return ans != "n" && ans != "no"
+}
+
 // installEditorExtension installs the embedded .vsix into every supported
 // editor found, and returns what happened.
 //
@@ -165,7 +224,7 @@ func installEditorExtension(enabled bool) editorCaptureResult {
 
 	if !enabled {
 		result.Status = editorCaptureDeclined
-		result.Note = "Editor extension declined (--no-editor-extension). No editor attention events for this session."
+		result.Note = "Editor extension declined. No editor attention events for this session."
 		return result
 	}
 
@@ -338,7 +397,9 @@ func printEditorCaptureLine(result editorCaptureResult) {
 		fmt.Printf("  %s  No VS Code or Cursor found — skipping the editor extension\n", info)
 		fmt.Printf("     %s\n", dim.Render("Your assessment is unaffected. The session records that editor attention capture was unavailable."))
 	case editorCaptureDeclined:
-		fmt.Printf("  %s  Editor extension skipped (--no-editor-extension)\n", info)
+		// Deliberately does not name the flag any more: since the install is
+		// prompted, the usual way this branch is reached is a candidate typing n.
+		fmt.Printf("  %s  Editor extension skipped\n", info)
 		fmt.Printf("     %s\n", dim.Render("Your assessment is unaffected. The session records that editor attention capture was declined."))
 	default:
 		fmt.Printf("  %s  Editor extension could not be installed — continuing without it\n", info)

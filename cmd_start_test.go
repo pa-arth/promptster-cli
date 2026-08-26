@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -90,4 +91,55 @@ func TestTaskRootWithinRepo(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestNextStepLaunchCodexCarriesCredential pins the asymmetry that fixes the
+// reported bug: `claude` is printed bare because its credential rides an
+// apiKeyHelper read at runtime, while codex is printed as `promptster codex`
+// because codex reads PROMPTSTER_PROXY_TOKEN from its process environment and
+// the shell that just ran `start` has never had it. Printing a bare `codex`
+// here is what produced "Missing environment variable: PROMPTSTER_PROXY_TOKEN".
+func TestNextStepLaunchCodexCarriesCredential(t *testing.T) {
+	t.Run("codex only", func(t *testing.T) {
+		cmd, desc, noun := nextStepLaunch(false, true)
+		if cmd != "promptster codex" {
+			t.Errorf("codex-only launch = %q, want %q", cmd, "promptster codex")
+		}
+		if !strings.Contains(desc, "credential") {
+			t.Errorf("codex launch description should say why it is not a bare codex; got %q", desc)
+		}
+		if noun != "Codex" {
+			t.Errorf("noun = %q, want Codex", noun)
+		}
+	})
+
+	t.Run("claude only stays bare", func(t *testing.T) {
+		cmd, desc, _ := nextStepLaunch(true, false)
+		if cmd != "claude" {
+			t.Errorf("claude-only launch = %q, want claude", cmd)
+		}
+		// The note is codex-specific; claude needs no explanation.
+		if strings.Contains(desc, "credential") {
+			t.Errorf("claude launch should not carry the codex note; got %q", desc)
+		}
+	})
+
+	t.Run("both", func(t *testing.T) {
+		cmd, _, noun := nextStepLaunch(true, true)
+		if !strings.Contains(cmd, "promptster codex") {
+			t.Errorf("combined launch must route codex through promptster; got %q", cmd)
+		}
+		if strings.Contains(cmd, "or: codex") {
+			t.Errorf("combined launch must not offer a bare codex; got %q", cmd)
+		}
+		if !strings.Contains(noun, "Codex") || !strings.Contains(noun, "Claude Code") {
+			t.Errorf("noun = %q, want both tools named", noun)
+		}
+	})
+
+	t.Run("neither falls back to claude", func(t *testing.T) {
+		if cmd, _, _ := nextStepLaunch(false, false); cmd != "claude" {
+			t.Errorf("fallback launch = %q, want claude", cmd)
+		}
+	})
 }
