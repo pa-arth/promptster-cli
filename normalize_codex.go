@@ -595,16 +595,86 @@ func unwrapCodexExec(args map[string]interface{}) (string, map[string]interface{
 	}
 }
 
-var codexToolsCallRe = regexp.MustCompile(`\btools\.([A-Za-z_][A-Za-z0-9_]*)\s*\(`)
+// codexFirstToolsCallAt returns the name of the first tools.* invocation that
+// appears in CODE position, and the offset just past its opening paren.
+//
+// The scan skips string literals, template literals and comments, because a
+// `tools.<name>(` occurring inside any of them is text the program prints or
+// greps for, not a call it makes — and both directions of that mistake are real:
+//
+//	tools.write_stdin({"chars":"run tools.exec_command(x)\n"})   ← payload names it
+//	const note = "calls tools.write_stdin(…)"; tools.exec_command({cmd:"ls"})
+//
+// A name-ordered `strings.Contains` sweep gets the first wrong and the second
+// right; a plain first-match gets the first right and the second wrong. Only
+// skipping non-code regions gets both.
+//
+// Template literals are treated as opaque strings. A `tools.*` call inside a
+// `${…}` substitution is therefore missed rather than misread — conservative in
+// the direction that costs a classification, never one that invents a call.
+func codexFirstToolsCallAt(input string) (string, int) {
+	const marker = "tools."
+	for i := 0; i < len(input); i++ {
+		switch c := input[i]; c {
+		case '"', '\'', '`':
+			// Skip to the matching close, honouring backslash escapes.
+			quote := c
+			i++
+			for i < len(input) && input[i] != quote {
+				if input[i] == '\\' {
+					i++
+				}
+				i++
+			}
+		case '/':
+			if i+1 >= len(input) {
+				continue
+			}
+			if input[i+1] == '/' {
+				for i < len(input) && input[i] != '\n' {
+					i++
+				}
+			} else if input[i+1] == '*' {
+				if end := strings.Index(input[i+2:], "*/"); end >= 0 {
+					i += 2 + end + 1
+				} else {
+					return "", -1
+				}
+			}
+		case 't':
+			// Must not be part of a longer identifier (e.g. `mytools.foo(`).
+			if i > 0 && isCodexIdentByte(input[i-1], false) {
+				continue
+			}
+			if !strings.HasPrefix(input[i:], marker) {
+				continue
+			}
+			j := i + len(marker)
+			start := j
+			for j < len(input) && isCodexIdentByte(input[j], j == start) {
+				j++
+			}
+			if j == start {
+				continue
+			}
+			name := input[start:j]
+			for j < len(input) && (input[j] == ' ' || input[j] == '\t' || input[j] == '\n' || input[j] == '\r') {
+				j++
+			}
+			if j < len(input) && input[j] == '(' {
+				return name, j + 1
+			}
+			i = j - 1
+		}
+	}
+	return "", -1
+}
 
 // codexFirstToolsCall returns the name of the first tools.* invocation in the
 // wrapper program, or "" when there is none.
 func codexFirstToolsCall(input string) string {
-	m := codexToolsCallRe.FindStringSubmatch(input)
-	if m == nil {
-		return ""
-	}
-	return m[1]
+	name, _ := codexFirstToolsCallAt(input)
+	return name
 }
 
 // extractJSCmdField pulls the `cmd:` string out of a tools.exec_command({...})
@@ -626,11 +696,11 @@ func codexFirstToolsCall(input string) string {
 // Failure stays quiet on purpose: an unrecoverable command returns "" so the
 // caller records the occurrence as a tool_use, never a command with empty text.
 func extractJSCmdField(input string) string {
-	m := codexToolsCallRe.FindStringIndex(input)
-	if m == nil {
+	_, argStart := codexFirstToolsCallAt(input)
+	if argStart < 0 {
 		return ""
 	}
-	rest := input[m[1]:]
+	rest := input[argStart:]
 	if open := strings.IndexByte(rest, '{'); open >= 0 {
 		if raw, ok := codexScanObjectLiteral(rest[open:]); ok {
 			var obj map[string]interface{}

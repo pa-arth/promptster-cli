@@ -74,3 +74,61 @@ func TestDispatchUsesTheFirstToolsCall(t *testing.T) {
 		})
 	}
 }
+
+// Greptile P1 on #35: a `tools.<name>(` occurring in a string, template or
+// comment BEFORE the real invocation must not be mistaken for the call. The
+// name-ordered Contains sweep this replaced got these right only by accident of
+// ordering, and a plain first-match got them wrong.
+func TestDispatchSkipsNonCodeRegions(t *testing.T) {
+	for _, tc := range []struct{ name, input, want string }{
+		{
+			"double-quoted string names another tool first",
+			`const note = "we call tools.write_stdin(x) later"; const r = await tools.exec_command({cmd:"ls"});`,
+			"exec_command",
+		},
+		{
+			"single-quoted string",
+			`const n = 'tools.update_plan(y)'; await tools.exec_command({cmd:"ls"});`,
+			"exec_command",
+		},
+		{
+			"template literal",
+			"const n = `see tools.apply_patch(z)`; await tools.exec_command({cmd:\"ls\"});",
+			"exec_command",
+		},
+		{
+			"line comment",
+			"// tools.write_stdin(a)\nawait tools.exec_command({cmd:\"ls\"});",
+			"exec_command",
+		},
+		{
+			"block comment",
+			`/* tools.write_stdin(a) */ await tools.exec_command({cmd:"ls"});`,
+			"exec_command",
+		},
+		{
+			"escaped quote inside the decoy string",
+			`const n = "tools.write_stdin(\" q)"; await tools.exec_command({cmd:"ls"});`,
+			"exec_command",
+		},
+		{
+			"longer identifier is not tools.",
+			`mytools.exec_command({cmd:"nope"}); await tools.write_stdin({"session_id":1});`,
+			"write_stdin",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := codexFirstToolsCall(tc.input); got != tc.want {
+				t.Errorf("tool = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// The command must be read from the real call's argument, not the decoy's.
+func TestCmdFieldIgnoresDecoyBeforeTheCall(t *testing.T) {
+	in := `const note = "tools.exec_command({cmd:\"DECOY\"})"; const r = await tools.exec_command({cmd:"echo real"});`
+	if got := extractJSCmdField(in); got != "echo real" {
+		t.Errorf("cmd = %q, want %q", got, "echo real")
+	}
+}
