@@ -6,6 +6,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf16"
+	"unicode/utf8"
 )
 
 // Codex instrumentation works by tailing the per-session rollout JSONL that the
@@ -38,7 +40,13 @@ type codexRolloutProcessor struct {
 	sessionID          string
 	consentToIntegrity bool
 	pending            map[string]codexPendingCall
-	lastTokenUsage     map[string]interface{}
+	// running holds shell calls the host DETACHED: exec_command answers with
+	// "Script running with cell ID N" instead of output, and the real result
+	// arrives later via one or more write_stdin calls. Keyed by cell ID. Without
+	// this, the handoff line parses as exitCode=0 and every long-running command
+	// is reported green regardless of how it actually ended.
+	running        map[string]codexPendingCall
+	lastTokenUsage map[string]interface{}
 }
 
 func newCodexRolloutProcessor(sessionID string, consentToIntegrity bool) *codexRolloutProcessor {
@@ -46,6 +54,7 @@ func newCodexRolloutProcessor(sessionID string, consentToIntegrity bool) *codexR
 		sessionID:          sessionID,
 		consentToIntegrity: consentToIntegrity,
 		pending:            map[string]codexPendingCall{},
+		running:            map[string]codexPendingCall{},
 	}
 }
 
@@ -291,13 +300,25 @@ func (p *codexRolloutProcessor) responseItem(payload map[string]interface{}, ts,
 	switch stringField(payload, "type") {
 	case "function_call", "custom_tool_call":
 		name := stringField(payload, "name")
+		args := parseCodexArgs(payload)
+		// Codex >= 0.149 exposes ONE generic custom tool named `exec`, whose input
+		// is a small JavaScript program calling the real tool (`tools.exec_command`,
+		// `tools.apply_patch`, `tools.update_plan`, ...). Unwrap the identity here
+		// or every shell run, test run and file edit collapses into an opaque
+		// tool_use — which is exactly what shipped: 23 of 23 tool calls landed as
+		// toolName="exec" and the fluency judge saw zero commands and zero diffs.
+		// Direct codex-cli calls keep their own names and are untouched.
+		if name == "exec" {
+			name, args = unwrapCodexExec(args)
+		}
 		// apply_patch is reported via the richer event_msg/patch_apply_end; skip
-		// the call line so we don't double-count file edits.
+		// the call line so we don't double-count file edits. Checked AFTER the
+		// unwrap so a direct call is still recognised; the wrapped form has no
+		// patch_apply_end companion and is emitted from the envelope instead.
 		if name == "apply_patch" {
 			return nil
 		}
 		callID := stringField(payload, "call_id")
-		args := parseCodexArgs(payload)
 		if callID != "" {
 			p.pending[callID] = codexPendingCall{name: name, args: args}
 		}
@@ -310,7 +331,30 @@ func (p *codexRolloutProcessor) responseItem(payload map[string]interface{}, ts,
 			return nil
 		}
 		delete(p.pending, callID)
-		output := stringField(payload, "output")
+		output := codexOutputText(payload["output"])
+		// A detached shell call answers with a cell ID, not a result. Hold it and
+		// emit when the completing write_stdin arrives.
+		if isCodexShellTool(call.name) {
+			if cellID := codexRunningCellID(output); cellID != "" {
+				p.running[cellID] = call
+				return nil
+			}
+		}
+		if call.name == "write_stdin" {
+			cellID := stringField(call.args, "session_id")
+			if held, ok := p.running[cellID]; ok {
+				// Still running: the host may hand back a new cell ID. Re-key and wait.
+				if nextID := codexRunningCellID(output); nextID != "" {
+					if nextID != cellID {
+						delete(p.running, cellID)
+						p.running[nextID] = held
+					}
+					return nil
+				}
+				delete(p.running, cellID)
+				return p.emitToolEvent(held, output, ts, raw)
+			}
+		}
 		return p.emitToolEvent(call, output, ts, raw)
 
 	default:
@@ -323,8 +367,24 @@ func (p *codexRolloutProcessor) responseItem(payload map[string]interface{}, ts,
 // canonical event, branching on the codex tool name.
 func (p *codexRolloutProcessor) emitToolEvent(call codexPendingCall, output, ts, raw string) []Event {
 	switch {
+	case call.name == "wrapped_apply_patch":
+		return p.emitWrappedPatch(call, ts, raw)
+
 	case isCodexShellTool(call.name):
 		cmd := codexCommandString(call.args)
+		// The backend's command schema requires a non-empty invocation. The
+		// wrapper occasionally builds argv indirectly, where the deliberately
+		// non-evaluating extractor cannot recover cmd. Record the occurrence
+		// rather than fabricating an empty command or retaining wrapper source.
+		if strings.TrimSpace(cmd) == "" {
+			e := p.newCodexEvent("tool_use", ts)
+			e.Data = map[string]interface{}{
+				"toolName": call.name,
+				"ok":       codexToolStatus(output) == "completed",
+			}
+			e.RawPayload = raw
+			return []Event{e}
+		}
 		exitCode, stdout := parseCodexExecOutput(output)
 		e := p.newCodexEvent("command", ts)
 		e.Provenance = aiProvenance()
@@ -396,6 +456,384 @@ func isCodexShellTool(name string) bool {
 		return true
 	}
 	return false
+}
+
+// unwrapCodexExec recovers the real tool identity from the JavaScript wrapper
+// used by Codex >= 0.149. Only narrowly-recognized calls are lifted; an
+// unrecognized program stays a generic `exec` tool_use. The wrapper SOURCE is
+// never emitted — only the recovered argument.
+func unwrapCodexExec(args map[string]interface{}) (string, map[string]interface{}) {
+	input := stringField(args, "input")
+	switch {
+	case strings.Contains(input, "tools.exec_command("):
+		out := map[string]interface{}{}
+		if cmd := extractJSCmdField(input); cmd != "" {
+			out["cmd"] = cmd
+		}
+		return "exec_command", out
+	case strings.Contains(input, "tools.update_plan("):
+		return "update_plan", map[string]interface{}{}
+	case strings.Contains(input, "tools.apply_patch("):
+		out := map[string]interface{}{}
+		if patch := extractJSCallStringArg(input, "tools.apply_patch"); patch != "" {
+			out["patch"] = patch
+		}
+		// Distinct from a direct apply_patch call: that one is skipped above
+		// because codex-cli also emits patch_apply_end, while the wrapped form has
+		// no such companion record and must derive its file_diffs from the
+		// envelope itself.
+		return "wrapped_apply_patch", out
+	case strings.Contains(input, "tools.write_stdin("):
+		out := map[string]interface{}{}
+		if id := extractJSNumericField(input, "session_id"); id != "" {
+			out["session_id"] = id
+		}
+		return "write_stdin", out
+	default:
+		return "exec", map[string]interface{}{}
+	}
+}
+
+var jsCmdFieldRe = regexp.MustCompile(`(?s)\bcmd\s*:\s*("(?:\\.|[^"\\])*")`)
+
+// extractJSCmdField pulls the `cmd:` string out of a tools.exec_command({...})
+// object literal. Deliberately narrow — it matches one pinned shape rather than
+// attempting to parse JavaScript.
+func extractJSCmdField(input string) string {
+	m := jsCmdFieldRe.FindStringSubmatch(input)
+	if m == nil {
+		return ""
+	}
+	s, ok := decodeJSDoubleQuoted(m[1])
+	if !ok {
+		return ""
+	}
+	return s
+}
+
+func extractJSNumericField(input, field string) string {
+	re := regexp.MustCompile(`\b` + regexp.QuoteMeta(field) + `\s*:\s*(\d+)`)
+	m := re.FindStringSubmatch(input)
+	if m == nil {
+		return ""
+	}
+	return m[1]
+}
+
+// extractJSCallStringArg extracts a JSON-style double-quoted first argument.
+// Refuses other JavaScript syntax rather than evaluating it or accidentally
+// retaining wrapper source.
+func extractJSCallStringArg(input, callee string) string {
+	start := strings.Index(input, callee+"(")
+	if start < 0 {
+		return ""
+	}
+	rest := strings.TrimSpace(input[start+len(callee)+1:])
+	if rest == "" {
+		return ""
+	}
+	if rest[0] != '"' {
+		// The wrapper commonly binds a large patch to a local first:
+		//   const patch = "..."; await tools.apply_patch(patch)
+		// Resolve only a plain identifier bound to a double-quoted literal. Never
+		// evaluate expressions or template strings.
+		end := 0
+		for end < len(rest) && ((rest[end] >= 'a' && rest[end] <= 'z') ||
+			(rest[end] >= 'A' && rest[end] <= 'Z') ||
+			(rest[end] >= '0' && rest[end] <= '9') || rest[end] == '_') {
+			end++
+		}
+		if end == 0 {
+			return ""
+		}
+		name := rest[:end]
+		for _, decl := range []string{"const ", "let ", "var "} {
+			assign := decl + name
+			idx := strings.Index(input, assign)
+			if idx < 0 {
+				continue
+			}
+			value := strings.TrimSpace(input[idx+len(assign):])
+			if !strings.HasPrefix(value, "=") {
+				continue
+			}
+			rest = strings.TrimSpace(strings.TrimPrefix(value, "="))
+			break
+		}
+	}
+	if rest == "" || rest[0] != '"' {
+		return ""
+	}
+	for i := 1; i < len(rest); i++ {
+		if rest[i] != '"' {
+			continue
+		}
+		backslashes := 0
+		for j := i - 1; j >= 0 && rest[j] == '\\'; j-- {
+			backslashes++
+		}
+		if backslashes%2 != 0 {
+			continue
+		}
+		s, ok := decodeJSDoubleQuoted(rest[:i+1])
+		if ok {
+			return s
+		}
+		return ""
+	}
+	return ""
+}
+
+// decodeJSDoubleQuoted decodes one JavaScript double-quoted string literal
+// without evaluating JavaScript. The wrapper is JavaScript source, not a Go
+// string: beyond JSON escapes it may legally carry \v, \xNN, identity escapes
+// or escaped line continuations, all of which strconv.Unquote rejects.
+func decodeJSDoubleQuoted(lit string) (string, bool) {
+	if len(lit) < 2 || lit[0] != '"' || lit[len(lit)-1] != '"' {
+		return "", false
+	}
+	var out strings.Builder
+	for i := 1; i < len(lit)-1; {
+		if lit[i] != '\\' {
+			r, size := utf8.DecodeRuneInString(lit[i : len(lit)-1])
+			if r == utf8.RuneError && size == 1 {
+				return "", false
+			}
+			out.WriteRune(r)
+			i += size
+			continue
+		}
+		i++
+		if i >= len(lit)-1 {
+			return "", false
+		}
+		switch lit[i] {
+		case '"', '\\', '/':
+			out.WriteByte(lit[i])
+			i++
+		case 'b':
+			out.WriteByte('\b')
+			i++
+		case 'f':
+			out.WriteByte('\f')
+			i++
+		case 'n':
+			out.WriteByte('\n')
+			i++
+		case 'r':
+			out.WriteByte('\r')
+			i++
+		case 't':
+			out.WriteByte('\t')
+			i++
+		case 'v':
+			out.WriteByte('\v')
+			i++
+		case '0':
+			// Numeric escapes are unsupported except JavaScript's unambiguous NUL
+			// escape (a following decimal digit makes it legacy octal syntax).
+			if i+1 < len(lit)-1 && lit[i+1] >= '0' && lit[i+1] <= '9' {
+				return "", false
+			}
+			out.WriteByte(0)
+			i++
+		case '\n':
+			i++ // line continuation contributes no character
+		case '\r':
+			i++
+			if i < len(lit)-1 && lit[i] == '\n' {
+				i++
+			}
+		case 'x':
+			v, next, ok := decodeJSHexEscape(lit, i+1, 2)
+			if !ok {
+				return "", false
+			}
+			out.WriteRune(rune(v))
+			i = next
+		case 'u':
+			v, next, ok := decodeJSUnicodeEscape(lit, i)
+			if !ok {
+				return "", false
+			}
+			i = next
+			if v >= 0xD800 && v <= 0xDBFF && i+2 < len(lit)-1 && lit[i] == '\\' && lit[i+1] == 'u' {
+				if low, after, lowOK := decodeJSUnicodeEscape(lit, i+1); lowOK && low >= 0xDC00 && low <= 0xDFFF {
+					out.WriteRune(utf16.DecodeRune(rune(v), rune(low)))
+					i = after
+					continue
+				}
+			}
+			if v >= 0xD800 && v <= 0xDFFF {
+				out.WriteRune(utf8.RuneError)
+			} else {
+				out.WriteRune(rune(v))
+			}
+		default:
+			// Identity escape: \q is the character q. Decode a full rune so
+			// non-ASCII identity escapes survive too.
+			r, size := utf8.DecodeRuneInString(lit[i : len(lit)-1])
+			if r == utf8.RuneError && size == 1 {
+				return "", false
+			}
+			out.WriteRune(r)
+			i += size
+		}
+	}
+	return out.String(), true
+}
+
+func decodeJSUnicodeEscape(lit string, u int) (int, int, bool) {
+	if u >= len(lit)-1 || lit[u] != 'u' {
+		return 0, u, false
+	}
+	if u+1 < len(lit)-1 && lit[u+1] == '{' {
+		end := strings.IndexByte(lit[u+2:len(lit)-1], '}')
+		if end < 0 || end == 0 || end > 6 {
+			return 0, u, false
+		}
+		end += u + 2
+		v, _, ok := decodeJSHexEscape(lit, u+2, end-(u+2))
+		if !ok || v > utf8.MaxRune {
+			return 0, u, false
+		}
+		return v, end + 1, true
+	}
+	return decodeJSHexEscape(lit, u+1, 4)
+}
+
+func decodeJSHexEscape(lit string, start, count int) (int, int, bool) {
+	if count <= 0 || start+count > len(lit)-1 {
+		return 0, start, false
+	}
+	v := 0
+	for _, c := range []byte(lit[start : start+count]) {
+		v *= 16
+		switch {
+		case c >= '0' && c <= '9':
+			v += int(c - '0')
+		case c >= 'a' && c <= 'f':
+			v += int(c-'a') + 10
+		case c >= 'A' && c <= 'F':
+			v += int(c-'A') + 10
+		default:
+			return 0, start, false
+		}
+	}
+	return v, start + count, true
+}
+
+// codexOutputText accepts both the legacy scalar output and the current
+// Responses-style content array: [{type:"input_text","text":"..."}, ...].
+// Without this the 0.149 array shape reads as "" and every exit code is lost.
+func codexOutputText(v interface{}) string {
+	switch out := v.(type) {
+	case string:
+		return out
+	case []interface{}:
+		parts := make([]string, 0, len(out))
+		for _, item := range out {
+			m, _ := item.(map[string]interface{})
+			if text := stringField(m, "text"); text != "" {
+				parts = append(parts, text)
+			}
+		}
+		return strings.Join(parts, "\n")
+	default:
+		return ""
+	}
+}
+
+func codexToolStatus(output string) string {
+	if strings.Contains(strings.ToLower(output), "script failed") {
+		return "failed"
+	}
+	return "completed"
+}
+
+var codexRunningCellRe = regexp.MustCompile(`^Script running with cell ID ([0-9]+)$`)
+
+// codexRunningCellID reports the cell ID when the host DETACHED a shell call.
+// The handoff is a control response containing only this line; searching
+// multiline stdout would misclassify a completed command that happened to print
+// the same text and suppress its event forever.
+func codexRunningCellID(output string) string {
+	m := codexRunningCellRe.FindStringSubmatch(strings.TrimSpace(output))
+	if m == nil {
+		return ""
+	}
+	return m[1]
+}
+
+var codexPatchFileHeaders = []struct {
+	prefix     string
+	changeType string
+}{
+	{"*** Add File: ", "add"},
+	{"*** Update File: ", "update"},
+	{"*** Delete File: ", "delete"},
+}
+
+// emitWrappedPatch derives one file_diff per changed file from a wrapped
+// apply_patch envelope, which arrives with no patch_apply_end companion.
+//
+// Unlike the teams normalizer — which is source-excluded and emits paths plus
+// line counts only — HIRING keeps the diff body: the replay renders it, and
+// `diffContent` is true for this surface. The per-file hunk lines are already
+// unified-diff shaped inside the envelope, so they are carried through as-is.
+func (p *codexRolloutProcessor) emitWrappedPatch(call codexPendingCall, ts, raw string) []Event {
+	patch := stringField(call.args, "patch")
+	if patch == "" {
+		return nil
+	}
+	type change struct {
+		path       string
+		changeType string
+		lines      []string
+	}
+	var changes []change
+	current := -1
+	for _, line := range strings.Split(patch, "\n") {
+		matched := false
+		for _, h := range codexPatchFileHeaders {
+			if strings.HasPrefix(line, h.prefix) {
+				changes = append(changes, change{
+					path:       strings.TrimSpace(strings.TrimPrefix(line, h.prefix)),
+					changeType: h.changeType,
+				})
+				current = len(changes) - 1
+				matched = true
+				break
+			}
+		}
+		if matched {
+			continue
+		}
+		// Envelope framing (*** Begin Patch / *** End Patch / *** Move to:) is not
+		// diff content. Everything else in a file section is.
+		if current < 0 || strings.HasPrefix(line, "*** ") {
+			continue
+		}
+		changes[current].lines = append(changes[current].lines, line)
+	}
+	events := make([]Event, 0, len(changes))
+	for _, c := range changes {
+		diff := strings.Join(c.lines, "\n")
+		added, removed := countDiffLines(diff)
+		e := p.newCodexEvent("file_diff", ts)
+		e.Provenance = aiProvenance()
+		e.Data = map[string]interface{}{
+			"path":         c.path,
+			"diff":         diff,
+			"linesAdded":   added,
+			"linesRemoved": removed,
+			"attribution":  "likely_ai",
+			"changeType":   c.changeType,
+		}
+		e.RawPayload = strPreview(diff, 500)
+		events = append(events, e)
+	}
+	return events
 }
 
 func isCodexMCPTool(name string) bool {
