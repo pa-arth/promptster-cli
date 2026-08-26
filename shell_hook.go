@@ -161,12 +161,23 @@ _promptster_in_workspace() {
 # almost certainly over.
 [ -n "${PROMPTSTER_PROXY_TOKEN:-}" ] && unset PROMPTSTER_PROXY_TOKEN
 
-_promptster_codex_real="$(command -v codex 2>/dev/null)"
-case "$_promptster_codex_real" in
+# Resolve into a SCRATCH variable, never straight into the one the wrapper
+# calls. On a re-source of this file in a shell that already has the wrapper
+# installed -- a 'source ~/.zshrc', a second RC read, an upgrade that
+# re-sources the hook -- 'command -v codex' answers with our own function's
+# NAME, not a
+# path. Assigning that to _promptster_codex_real turned the wrapper's fallback
+# branch into a call to itself: unbounded recursion, which zsh stops with
+# "maximum nested function level reached" and bash (FUNCNEST unset) does not
+# stop at all. Committing only an absolute path makes a re-source a no-op and
+# leaves the good path in place.
+_promptster_codex_found="$(command -v codex 2>/dev/null)"
+case "$_promptster_codex_found" in
   /*)
     # Only wrap a real binary. If 'codex' already resolves to a function or an
-    # alias, it is the user's, and shadowing it would be our second uninvited
-    # global change to their setup.
+    # alias, it is the user's (or ours from an earlier source), and shadowing it
+    # would be our second uninvited global change to their setup.
+    _promptster_codex_real="$_promptster_codex_found"
     codex() {
       if _promptster_resolve_ws && _promptster_in_workspace; then
         "$_promptster_bin" codex "$@"
@@ -176,6 +187,7 @@ case "$_promptster_codex_real" in
     }
     ;;
 esac
+unset _promptster_codex_found 2>/dev/null || _promptster_codex_found=""
 
 # TTL self-eviction (backgrounded, no output). 'promptster env' fires a
 # background cleanup when the session's local ExpiresAt has passed; otherwise

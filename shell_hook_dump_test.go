@@ -71,8 +71,18 @@ func TestShellHookScriptStructure(t *testing.T) {
 	}
 	//     And it must only wrap a real binary — never shadow the user's own
 	//     codex alias or function.
-	if !strings.Contains(script, `_promptster_codex_real="$(command -v codex 2>/dev/null)"`) {
+	if !strings.Contains(script, `_promptster_codex_found="$(command -v codex 2>/dev/null)"`) {
 		t.Errorf("codex launcher must resolve the real binary before wrapping")
+	}
+	//     That resolution must land in a SCRATCH variable. Once the wrapper is
+	//     installed, `command -v codex` names our own function rather than a
+	//     path, so a re-source that wrote the answer straight into the variable
+	//     the wrapper executes produced a function that called itself.
+	if strings.Contains(script, `_promptster_codex_real="$(command -v`) {
+		t.Errorf("codex launcher must not resolve into the variable it executes — a re-source makes it self-recursive")
+	}
+	if !strings.Contains(script, `_promptster_codex_real="$_promptster_codex_found"`) {
+		t.Errorf("codex launcher must commit only an absolute path to the variable it executes")
 	}
 
 	// 3. TTL self-eviction is preserved: a backgrounded `promptster env` fires
