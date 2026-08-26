@@ -559,16 +559,22 @@ func isCodexShellTool(name string) bool {
 // never emitted — only the recovered argument.
 func unwrapCodexExec(args map[string]interface{}) (string, map[string]interface{}) {
 	input := stringField(args, "input")
-	switch {
-	case strings.Contains(input, "tools.exec_command("):
+	// Dispatch on the FIRST tools.* call in the program, not on whichever name
+	// happens to appear anywhere in it. A `strings.Contains` scan tested in a
+	// fixed order reads the wrapper's own text: a write_stdin whose payload
+	// mentions `tools.exec_command(` — a candidate piping a command string, or
+	// grepping for the wrapper — is lifted as a shell command that never ran.
+	// Positional matching cannot invert like that.
+	switch codexFirstToolsCall(input) {
+	case "exec_command":
 		out := map[string]interface{}{}
 		if cmd := extractJSCmdField(input); cmd != "" {
 			out["cmd"] = cmd
 		}
 		return "exec_command", out
-	case strings.Contains(input, "tools.update_plan("):
+	case "update_plan":
 		return "update_plan", map[string]interface{}{}
-	case strings.Contains(input, "tools.apply_patch("):
+	case "apply_patch":
 		out := map[string]interface{}{}
 		if patch := extractJSCallStringArg(input, "tools.apply_patch"); patch != "" {
 			out["patch"] = patch
@@ -578,7 +584,7 @@ func unwrapCodexExec(args map[string]interface{}) (string, map[string]interface{
 		// no such companion record and must derive its file_diffs from the
 		// envelope itself.
 		return "wrapped_apply_patch", out
-	case strings.Contains(input, "tools.write_stdin("):
+	case "write_stdin":
 		out := map[string]interface{}{}
 		if id := extractJSNumericField(input, "session_id"); id != "" {
 			out["session_id"] = id
@@ -589,21 +595,138 @@ func unwrapCodexExec(args map[string]interface{}) (string, map[string]interface{
 	}
 }
 
-var jsCmdFieldRe = regexp.MustCompile(`(?s)\bcmd\s*:\s*("(?:\\.|[^"\\])*")`)
+var codexToolsCallRe = regexp.MustCompile(`\btools\.([A-Za-z_][A-Za-z0-9_]*)\s*\(`)
 
-// extractJSCmdField pulls the `cmd:` string out of a tools.exec_command({...})
-// object literal. Deliberately narrow — it matches one pinned shape rather than
-// attempting to parse JavaScript.
-func extractJSCmdField(input string) string {
-	m := jsCmdFieldRe.FindStringSubmatch(input)
+// codexFirstToolsCall returns the name of the first tools.* invocation in the
+// wrapper program, or "" when there is none.
+func codexFirstToolsCall(input string) string {
+	m := codexToolsCallRe.FindStringSubmatch(input)
 	if m == nil {
 		return ""
 	}
-	s, ok := decodeJSDoubleQuoted(m[1])
-	if !ok {
+	return m[1]
+}
+
+// extractJSCmdField pulls the `cmd:` string out of a tools.exec_command({...})
+// object literal.
+//
+// It reads the literal that belongs to THE CALL rather than scanning the whole
+// program for a `cmd:`, because both of the shapes a scan gets wrong occur in
+// real rollouts:
+//
+//   - Quoted keys. Codex writes {cmd:"…"} and {"cmd":"…"} interchangeably, and a
+//     regex anchored on `\bcmd\s*:` matches only the bare form — the quoted one
+//     has a `"` where it needs the colon. That silently dropped the command text
+//     on 92 of 635 exec_command calls (14.5%) in a 1,160-call corpus, which the
+//     empty-cmd guard then filed as an unclassified tool_use.
+//   - Batch loops. `const jobs = [{cmd:"a"},{cmd:"b"}]; for (…) tools.exec_command(j)`
+//     puts several `cmd:` fields in the program before the call site, and a
+//     first-match scan reports job A as though it were the whole batch.
+//
+// Failure stays quiet on purpose: an unrecoverable command returns "" so the
+// caller records the occurrence as a tool_use, never a command with empty text.
+func extractJSCmdField(input string) string {
+	m := codexToolsCallRe.FindStringIndex(input)
+	if m == nil {
 		return ""
 	}
-	return s
+	rest := input[m[1]:]
+	if open := strings.IndexByte(rest, '{'); open >= 0 {
+		if raw, ok := codexScanObjectLiteral(rest[open:]); ok {
+			var obj map[string]interface{}
+			if json.Unmarshal([]byte(raw), &obj) == nil {
+				if cmd, isStr := obj["cmd"].(string); isStr && cmd != "" {
+					return cmd
+				}
+			}
+		}
+	}
+	// The argument was not a decodable literal — an identifier from a batch loop,
+	// a template string, a concatenation. There is deliberately NO fallback scan
+	// here: the only thing a whole-program search for `cmd:` can find at this
+	// point is a literal belonging to some OTHER call site, and reporting job A's
+	// command as though it were this invocation is a worse record than admitting
+	// we could not read it. Returning "" files the call as a tool_use.
+	return ""
+}
+
+func isCodexIdentByte(c byte, first bool) bool {
+	switch {
+	case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z', c == '_', c == '$':
+		return true
+	case !first && c >= '0' && c <= '9':
+		return true
+	}
+	return false
+}
+
+// codexScanObjectLiteral reads one balanced {...} off the front of s, quoting
+// bare identifier keys as it goes so the result can be handed to a real JSON
+// decoder, and reports whether the object terminated. The scan is string- and
+// escape-aware so that braces, commas and colons inside a shell command
+// (`rg -n "a,b" --glob '!{x}'`) never move the parser.
+func codexScanObjectLiteral(s string) (string, bool) {
+	var b strings.Builder
+	var stack []byte // '{' or '[' — the container we are currently inside
+	inStr, esc, atKey := false, false, false
+
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inStr {
+			b.WriteByte(c)
+			switch {
+			case esc:
+				esc = false
+			case c == '\\':
+				esc = true
+			case c == '"':
+				inStr = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inStr, atKey = true, false
+			b.WriteByte(c)
+		case '{':
+			stack = append(stack, '{')
+			atKey = true
+			b.WriteByte(c)
+		case '[':
+			stack = append(stack, '[')
+			atKey = false
+			b.WriteByte(c)
+		case '}', ']':
+			if len(stack) == 0 {
+				return "", false
+			}
+			stack = stack[:len(stack)-1]
+			b.WriteByte(c)
+			if len(stack) == 0 {
+				return b.String(), true
+			}
+		case ',':
+			atKey = stack[len(stack)-1] == '{'
+			b.WriteByte(c)
+		case ' ', '\t', '\n', '\r':
+			b.WriteByte(c)
+		default:
+			if atKey && isCodexIdentByte(c, true) {
+				j := i
+				for j < len(s) && isCodexIdentByte(s[j], j == i) {
+					j++
+				}
+				b.WriteByte('"')
+				b.WriteString(s[i:j])
+				b.WriteByte('"')
+				i, atKey = j-1, false
+				continue
+			}
+			atKey = false
+			b.WriteByte(c)
+		}
+	}
+	return "", false
 }
 
 func extractJSNumericField(input, field string) string {
