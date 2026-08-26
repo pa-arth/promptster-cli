@@ -368,7 +368,7 @@ func (p *codexRolloutProcessor) responseItem(payload map[string]interface{}, ts,
 func (p *codexRolloutProcessor) emitToolEvent(call codexPendingCall, output, ts, raw string) []Event {
 	switch {
 	case call.name == "wrapped_apply_patch":
-		return p.emitWrappedPatch(call, ts, raw)
+		return p.emitWrappedPatch(call, output, ts, raw)
 
 	case isCodexShellTool(call.name):
 		cmd := codexCommandString(call.args)
@@ -745,7 +745,7 @@ func codexOutputText(v interface{}) string {
 }
 
 func codexToolStatus(output string) string {
-	if strings.Contains(strings.ToLower(output), "script failed") {
+	if codexScriptFailed(output) {
 		return "failed"
 	}
 	return "completed"
@@ -781,10 +781,25 @@ var codexPatchFileHeaders = []struct {
 // line counts only — HIRING keeps the diff body: the replay renders it, and
 // `diffContent` is true for this surface. The per-file hunk lines are already
 // unified-diff shaped inside the envelope, so they are carried through as-is.
-func (p *codexRolloutProcessor) emitWrappedPatch(call codexPendingCall, ts, raw string) []Event {
+func (p *codexRolloutProcessor) emitWrappedPatch(call codexPendingCall, output, ts, raw string) []Event {
 	patch := stringField(call.args, "patch")
 	if patch == "" {
 		return nil
+	}
+	// A patch envelope is the model's REQUEST, not a record of what landed. Both
+	// failures in the sampled rollout were rejected apply_patch calls ("Failed to
+	// find expected lines", "multiple operations target ..."), each followed by a
+	// retry. Emitting from the envelope alone invents file_diffs for edits that
+	// never touched the tree, and double-counts the retry — inflating exactly the
+	// number a reviewer reads as work done.
+	if codexScriptFailed(output) {
+		e := p.newCodexEvent("tool_use", ts)
+		e.Data = map[string]interface{}{
+			"toolName": "apply_patch",
+			"ok":       false,
+		}
+		e.RawPayload = raw
+		return []Event{e}
 	}
 	type change struct {
 		path       string
@@ -883,19 +898,42 @@ func parseCodexArgs(payload map[string]interface{}) map[string]interface{} {
 var codexExitCodeRe = regexp.MustCompile(`(?i)(?:exited with code|exit code:?)\s*(\d+)`)
 
 // parseCodexExecOutput pulls an exit code and the trailing stdout out of codex's
-// exec output blob, which looks like:
+// exec output blob. Two vocabularies exist and BOTH must be read:
 //
-//	Chunk ID: ...\nWall time: ...\nProcess exited with code 0\nOriginal token count: 2\nOutput:\n<stdout>
+//	pre-0.149:  Chunk ID: ...\nWall time: ...\nProcess exited with code 0\nOutput:\n<stdout>
+//	0.149+:     Script completed\nWall time 0.6 seconds\nOutput:\n<stdout>
+//	            Script failed\nWall time 1.5 seconds\nOutput:\n\nScript error:\n<err>
+//
+// The 0.149 form carries no number, so matching only the numeric shape left
+// exitCode at its 0 default for EVERY command. Measured on a real 430-line
+// rollout: 43 "Script completed" and 2 "Script failed", all reported as exit 0
+// — a fake green, which is worse than a blank because `cleanFirstPass` and the
+// red/green arc count are built on it and the judge grades a flawless run that
+// never happened.
 func parseCodexExecOutput(output string) (int, string) {
 	exitCode := 0
-	if m := codexExitCodeRe.FindStringSubmatch(output); m != nil {
+	switch {
+	case codexExitCodeRe.MatchString(output):
+		m := codexExitCodeRe.FindStringSubmatch(output)
 		fmt.Sscanf(m[1], "%d", &exitCode)
+	case codexScriptFailed(output):
+		// The status line reports failure without a code. 1 is the honest
+		// stand-in: non-zero is the fact the pipeline reads, and inventing a
+		// specific errno would be worse than a generic failure.
+		exitCode = 1
 	}
 	stdout := output
 	if idx := strings.Index(output, "Output:\n"); idx >= 0 {
 		stdout = output[idx+len("Output:\n"):]
 	}
 	return exitCode, stdout
+}
+
+// codexScriptFailed reports the 0.149 status line's failure form. Anchored to
+// the head of the blob: "Script failed" appearing inside captured stdout is the
+// command's own output, not this command's verdict.
+func codexScriptFailed(output string) bool {
+	return strings.HasPrefix(strings.TrimSpace(output), "Script failed")
 }
 
 // countDiffLines counts added/removed lines in a unified diff, excluding the

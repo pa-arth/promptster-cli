@@ -162,3 +162,68 @@ func TestCodexDirectToolCallsAreUnchanged(t *testing.T) {
 		t.Errorf("command = %q", got)
 	}
 }
+
+// --- 0.149 status vocabulary ------------------------------------------------
+//
+// Found by running a real 430-line rollout through the processor: 43 outputs
+// said "Script completed" and 2 said "Script failed", and the exit-code regex
+// matched NEITHER, so all 45 reported exitCode 0. A fake green is worse than a
+// blank — cleanFirstPass and the red/green arc count are built on it.
+
+func TestCodexScriptFailedIsNotExitZero(t *testing.T) {
+	code, _ := parseCodexExecOutput("Script failed\nWall time 1.5 seconds\nOutput:\n\nScript error:\nboom")
+	if code == 0 {
+		t.Fatal("a failed script must not report exitCode 0")
+	}
+}
+
+func TestCodexScriptCompletedIsExitZero(t *testing.T) {
+	code, stdout := parseCodexExecOutput("Script completed\nWall time 0.6 seconds\nOutput:\nall good")
+	if code != 0 {
+		t.Errorf("exitCode = %d, want 0", code)
+	}
+	if !strings.Contains(stdout, "all good") {
+		t.Errorf("stdout = %q", stdout)
+	}
+}
+
+func TestCodexNumericExitCodeStillWins(t *testing.T) {
+	// Pre-0.149 hosts still emit the numeric form; it must keep precedence.
+	code, _ := parseCodexExecOutput("Wall time: 1s\nProcess exited with code 3\nOutput:\nx")
+	if code != 3 {
+		t.Errorf("exitCode = %d, want 3", code)
+	}
+}
+
+func TestCodexScriptFailedInStdoutIsNotTheVerdict(t *testing.T) {
+	// The command's own output may print the phrase. Only the leading status
+	// line is this command's verdict.
+	code, _ := parseCodexExecOutput("Script completed\nWall time 0.1 seconds\nOutput:\nlog: Script failed earlier today")
+	if code != 0 {
+		t.Errorf("exitCode = %d, want 0 — the phrase was in stdout, not the status line", code)
+	}
+}
+
+// --- rejected patches -------------------------------------------------------
+
+func TestCodexRejectedPatchEmitsNoFileDiff(t *testing.T) {
+	// Both failures in the sampled rollout were rejected apply_patch calls, each
+	// followed by a retry. Emitting from the envelope alone invents file_diffs
+	// for edits that never touched the tree and double-counts the retry.
+	failed := `{"timestamp":"2026-08-26T13:26:10.5Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_2","output":"Script failed\nWall time 0.0 seconds\nOutput:\n\nScript error:\napply_patch verification failed: invalid patch"}}`
+
+	p := newCodexRolloutProcessor("sess-1", false)
+	events := feed(p, codexExecPatchCall, failed)
+
+	for _, e := range events {
+		if e.Kind == "file_diff" {
+			t.Fatalf("a rejected patch must not produce a file_diff: %+v", e.Data)
+		}
+	}
+	if len(events) != 1 || events[0].Kind != "tool_use" {
+		t.Fatalf("expected one tool_use recording the failed attempt, got %v", kindsOf(events))
+	}
+	if ok, _ := eventData(t, events[0])["ok"].(bool); ok {
+		t.Error("the failed apply_patch must be recorded as ok=false")
+	}
+}
