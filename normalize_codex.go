@@ -322,16 +322,55 @@ func (p *codexRolloutProcessor) cutToolName() string {
 // signal ("what did they think to look up"); the snippets are someone else's
 // copy. `raw` is not passed through for the same reason: it is the whole line,
 // results included.
+//
+// THE EVENT IS EMITTED EVEN WHEN THERE IS NO QUERY TO PUT ON IT. Codex logs two
+// shapes: `action.type = "search"` carries the query string, and
+// `action.type = "other"` — a page fetch — carries `{"type":"other"}` and
+// nothing else, no query and no url. 2 of the 6 web lookups in a 41-rollout
+// local sample are that second shape, and gating on a non-empty query dropped
+// every one of them. The KIND is the fact ("they went and looked something up"),
+// exactly as `context_compact` is emitted with an empty data map; a lookup that
+// happened must not be absent because codex declined to say what it was about.
+//
+// No url, deliberately. There is no url field on this payload in any of the 41
+// rollouts — the allowlist admitting one is not evidence that codex sends one,
+// and reaching into `results[]` for a plausible-looking link would both invent
+// the fact and ship the third-party content this function exists to keep out.
 func (p *codexRolloutProcessor) webSearchEnd(payload map[string]interface{}, ts string) []Event {
-	query := stringField(payload, "query")
-	if strings.TrimSpace(query) == "" {
-		return nil
-	}
 	e := p.newCodexEvent("web_lookup", ts)
 	e.Provenance = aiProvenance()
-	e.Data = map[string]interface{}{"query": query}
-	e.RawPayload = strPreview(query, 500)
+	data := map[string]interface{}{}
+	if query := codexSearchQuery(payload); query != "" {
+		data["query"] = query
+		// The query is the only thing on this event that can be previewed. Using
+		// the raw line here would defeat the whole point of dropping results[].
+		e.RawPayload = strPreview(query, 500)
+	}
+	e.Data = data
 	return []Event{e}
+}
+
+// codexSearchQuery pulls the search string off a web_search_end, preferring the
+// top-level `query` and falling back to the first entry of `action.queries` —
+// the same string, spelled twice, and the fallback costs nothing on the day one
+// build stops filling the top-level field.
+func codexSearchQuery(payload map[string]interface{}) string {
+	if q := strings.TrimSpace(stringField(payload, "query")); q != "" {
+		return q
+	}
+	action, _ := payload["action"].(map[string]interface{})
+	if action == nil {
+		return ""
+	}
+	queries, _ := action["queries"].([]interface{})
+	for _, raw := range queries {
+		if q, ok := raw.(string); ok {
+			if q = strings.TrimSpace(q); q != "" {
+				return q
+			}
+		}
+	}
+	return ""
 }
 
 // itemCompleted handles the codex ≥0.149 message stream. Only the two item types

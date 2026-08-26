@@ -60,11 +60,39 @@ func TestCodexWebSearchInventsNoUrl(t *testing.T) {
 	}
 }
 
-// A search with no query string is not evidence of a lookup, and the backend's
-// command-shaped schemas reject empty required fields besides.
-func TestCodexWebSearchWithoutQueryEmitsNothing(t *testing.T) {
-	empty := `{"timestamp":"2026-08-12T11:02:41.000Z","type":"event_msg","payload":{"type":"web_search_end","call_id":"call_x","query":"   ","results":[]}}`
-	if n := len(onlyKind(codexEvents(t, codexRolloutLines[0], empty), "web_lookup")); n != 0 {
-		t.Fatalf("got %d web_lookup events for an empty query, want 0", n)
+// A page fetch. Codex spells it `action.type = "other"` and puts NO query and no
+// url on it — 2 of the 6 web lookups in a 41-rollout local sample are this shape.
+// The kind is the fact; dropping it made a lookup that happened absent.
+func TestCodexQuerylessFetchStillEmitsWebLookup(t *testing.T) {
+	fetch := `{"timestamp":"2026-08-12T11:02:41.000Z","type":"event_msg","payload":{"type":"web_search_end","call_id":"call_x","query":"","action":{"type":"other"},"results":[{"type":"text_result","domain":"example.com","snippet":"THIRD PARTY PAGE TEXT that is nobody's work product","url":"https://example.com/x"}]}}`
+	lookups := onlyKind(codexEvents(t, codexRolloutLines[0], fetch), "web_lookup")
+	if len(lookups) != 1 {
+		t.Fatalf("got %d web_lookup events for a query-less fetch, want 1", len(lookups))
+	}
+	if v, ok := eventData(t, lookups[0])["query"]; ok {
+		t.Errorf("query = %v on a payload that carried none; absent beats invented", v)
+	}
+	// The results are still nobody's work product, query or no query.
+	blob, err := json.Marshal(lookups[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, leak := range []string{"THIRD PARTY PAGE TEXT", "example.com"} {
+		if strings.Contains(string(blob), leak) {
+			t.Fatalf("query-less web_lookup leaked %q from results[]: %s", leak, blob)
+		}
+	}
+}
+
+// The same string, spelled twice on the payload. The fallback costs nothing and
+// keeps the query if a future build stops filling the top-level field.
+func TestCodexWebSearchFallsBackToActionQueries(t *testing.T) {
+	line := `{"timestamp":"2026-08-12T11:02:41.000Z","type":"event_msg","payload":{"type":"web_search_end","call_id":"call_y","query":"  ","action":{"type":"search","queries":["redis sliding window"]},"results":[]}}`
+	lookups := onlyKind(codexEvents(t, codexRolloutLines[0], line), "web_lookup")
+	if len(lookups) != 1 {
+		t.Fatalf("got %d web_lookup events, want 1", len(lookups))
+	}
+	if got := eventData(t, lookups[0])["query"]; got != "redis sliding window" {
+		t.Errorf("query = %v, want the string recovered from action.queries", got)
 	}
 }
