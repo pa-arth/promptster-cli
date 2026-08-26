@@ -31,7 +31,22 @@ func codexSessionsDir() string {
 
 // codexWatcherState tracks the background rollout-tailing process.
 type codexWatcherState struct {
-	PID           int    `json:"pid"`
+	PID int `json:"pid"`
+	// SessionID and Workspace record WHICH session this watcher was booted for.
+	//
+	// They exist because a watcher resolves its session, its workspace root and
+	// its start cutoff ONCE at boot and never again — while the state file it
+	// heartbeats into is resolved per write, through the active-workspace
+	// pointer. So the moment a new `start` moves that pointer, last session's
+	// watcher begins stamping the NEW session's state file, `ensureCodexWatcher`
+	// sees a live PID and declines to launch, and the only watcher running is one
+	// matching rollouts against the PREVIOUS workspace. Every codex run in the new
+	// assessment is then classified "no match" and emits nothing — a candidate who
+	// worked for hours reads to a reviewer as a candidate who did nothing.
+	//
+	// Stamped so ownership is checkable instead of assumed.
+	SessionID     string `json:"sessionId,omitempty"`
+	Workspace     string `json:"workspace,omitempty"`
 	StartedAt     string `json:"startedAt"`
 	LogPath       string `json:"logPath,omitempty"`
 	LastHeartbeat string `json:"lastHeartbeat,omitempty"`
@@ -132,6 +147,26 @@ func clearCodexWatcherState() {
 	_ = os.Remove(codexWatchProgressPath())
 }
 
+// releaseCodexWatcherState clears our state on exit, but ONLY while the state on
+// disk is still ours. A watcher exiting because a new session took over must not
+// delete the incoming watcher's state file — nor its progress file, which would
+// make the new watcher rescan from byte zero and re-ingest everything it had
+// already sent.
+func releaseCodexWatcherState(pid int) {
+	if s, err := loadCodexWatcherState(); err == nil && s.PID != pid {
+		return
+	}
+	clearCodexWatcherState()
+}
+
+// codexWatcherOwns reports whether a live watcher was booted for this session.
+// An unstamped watcher (written by CLI ≤1.9) is treated as foreign: it predates
+// the stamp, so it cannot be shown to belong here, and the cost of being wrong
+// is a restart rather than a session that captures nothing.
+func codexWatcherOwns(state codexWatcherState, session Session) bool {
+	return state.SessionID != "" && state.SessionID == session.SessionID
+}
+
 func isCodexWatcherRunning() (codexWatcherState, bool) {
 	state, err := loadCodexWatcherState()
 	if err != nil || state.PID <= 0 {
@@ -144,10 +179,26 @@ func isCodexWatcherRunning() (codexWatcherState, bool) {
 	return codexWatcherState{}, false
 }
 
-// ensureCodexWatcher launches the codex rollout watcher if not already running.
-func ensureCodexWatcher() {
-	if _, ok := isCodexWatcherRunning(); ok {
-		return
+// ensureCodexWatcher launches the codex rollout watcher for this session,
+// replacing one left running by a previous session.
+//
+// "Already running" is not the same question as "running for THIS session", and
+// answering the first used to be enough to lose an entire assessment's capture:
+// last session's watcher keeps heartbeating into the new session's state file,
+// so the liveness check passed and nothing was launched, while the watcher
+// actually running was matching rollouts against the old workspace.
+func ensureCodexWatcher(session Session) {
+	if state, ok := isCodexWatcherRunning(); ok {
+		if codexWatcherOwns(state, session) {
+			return
+		}
+		verbosef("codex-watcher pid %d belongs to session %q, not %q — replacing it",
+			state.PID, state.SessionID, session.SessionID)
+		// stopCodexWatcher also drops the progress file, which is required here
+		// and not merely tidy: its per-file match cache holds "no" verdicts
+		// computed against the OLD workspace, and a cached "no" is never
+		// revisited.
+		stopCodexWatcher()
 	}
 	killStalePromptsterDaemons("promptster codex-watch")
 	if err := startCodexWatcherProcess(); err != nil {
@@ -205,11 +256,12 @@ func runCodexWatcher() error {
 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	if err := saveCodexWatcherState(codexWatcherState{
-		PID: os.Getpid(), StartedAt: now, LogPath: codexWatcherLogPath(), LastHeartbeat: now,
+		PID: os.Getpid(), SessionID: session.SessionID, Workspace: session.TaskRoot,
+		StartedAt: now, LogPath: codexWatcherLogPath(), LastHeartbeat: now,
 	}); err != nil {
 		return err
 	}
-	defer clearCodexWatcherState()
+	defer releaseCodexWatcherState(os.Getpid())
 
 	if os.Getenv("PROMPTSTER_API_URL") == "" && session.ApiURL != "" {
 		os.Setenv("PROMPTSTER_API_URL", session.ApiURL)
@@ -236,11 +288,24 @@ func runCodexWatcher() error {
 		codexSessionsDir(), codexWatchInterval, workspace)
 
 	for {
+		// The session, workspace and cutoff above were resolved once and cannot
+		// be re-derived — a rollout matched against the wrong root is worse than
+		// no watcher. So when a different session becomes the active one, this
+		// process stands down and lets `start` boot a watcher that knows it.
+		// Without this the stale watcher outlives the session that owns the
+		// state file it is writing into.
+		if cur, curErr := loadSession(); curErr != nil || cur.SessionID != session.SessionID {
+			fmt.Fprintf(os.Stderr, "codex-watcher: session %s is no longer active — exiting (sent %d events)\n",
+				session.SessionID, eventsSent)
+			return nil
+		}
+
 		sent := pollCodexRollouts(session, workspace, startCutoff, processors, client)
 		eventsSent += sent
 
 		_ = saveCodexWatcherState(codexWatcherState{
-			PID: os.Getpid(), StartedAt: now, LogPath: codexWatcherLogPath(),
+			PID: os.Getpid(), SessionID: session.SessionID, Workspace: session.TaskRoot,
+			StartedAt: now, LogPath: codexWatcherLogPath(),
 			LastHeartbeat: time.Now().UTC().Format(time.RFC3339Nano), EventsSent: eventsSent,
 		})
 

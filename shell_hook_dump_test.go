@@ -38,22 +38,41 @@ func TestShellHookScriptStructure(t *testing.T) {
 		}
 	}
 
-	// 2b. Codex has no credential helper, so its proxy token DOES ride the env —
-	//     but tightly scoped: only inside the workspace, only while our managed
-	//     codex provider block is present, sourced at runtime (never a literal),
-	//     and unset on leaving the workspace. Guard those properties so a future
-	//     edit can't silently widen the codex token's exposure.
-	if !strings.Contains(script, "PROMPTSTER_PROXY_TOKEN") {
-		t.Errorf("shell hook missing codex PROMPTSTER_PROXY_TOKEN sync")
+	// 2b. And as of 1.10.0 the CODEX token doesn't touch the shell either. It
+	//     used to: codex read its provider from a GLOBAL ~/.codex/config.toml
+	//     that `start` rewrote, so the credential had to be exported into the
+	//     environment of any shell that might run codex — and a session that
+	//     ended badly left that global config demanding a variable nothing would
+	//     ever export again. The hook now installs a PWD-gated `codex` function
+	//     that shells out to `promptster codex`, which puts the token in one
+	//     child process and nowhere else. No exported secret, nothing to unset,
+	//     nothing to strand.
+	if strings.Contains(script, "export PROMPTSTER_PROXY_TOKEN") {
+		t.Errorf("shell hook must not export the codex token; 'promptster codex' passes it to one child")
 	}
-	if !strings.Contains(script, "_promptster_codex_active") {
-		t.Errorf("codex token export must be gated on the managed provider block being present")
+	if strings.Contains(script, "_promptster_sync_codex_token") {
+		t.Errorf("the codex token sync is gone; its reappearance means the shell-leak class of bug is back")
 	}
-	if !strings.Contains(script, "unset PROMPTSTER_PROXY_TOKEN") {
-		t.Errorf("codex token must be unset when leaving the workspace")
+	if !strings.Contains(script, "codex() {") {
+		t.Errorf("shell hook missing the PWD-gated codex launcher")
 	}
-	if !strings.Contains(script, `auth-token`) {
-		t.Errorf("codex token must be sourced at runtime via auth-token, not baked in")
+	//     Inside the workspace it must route through us; outside it must run the
+	//     real binary and change nothing about it.
+	if !strings.Contains(script, `"$_promptster_bin" codex "$@"`) {
+		t.Errorf("codex launcher must route to 'promptster codex' inside the workspace")
+	}
+	if !strings.Contains(script, `"$_promptster_codex_real" "$@"`) {
+		t.Errorf("codex launcher must fall through to the real binary outside the workspace")
+	}
+	//     Dispatch per call, not per source: a shell open when the session ends
+	//     must go back to plain codex without being restarted.
+	if !strings.Contains(script, "if _promptster_resolve_ws && _promptster_in_workspace; then") {
+		t.Errorf("codex launcher must re-resolve the session on every call, not once at source time")
+	}
+	//     And it must only wrap a real binary — never shadow the user's own
+	//     codex alias or function.
+	if !strings.Contains(script, `_promptster_codex_real="$(command -v codex 2>/dev/null)"`) {
+		t.Errorf("codex launcher must resolve the real binary before wrapping")
 	}
 
 	// 3. TTL self-eviction is preserved: a backgrounded `promptster env` fires
@@ -75,15 +94,6 @@ func TestShellHookScriptStructure(t *testing.T) {
 	}
 	if !strings.Contains(script, "_promptster_ttl_check() {") {
 		t.Errorf("TTL self-eviction must be a function so it can re-arm when a session appears mid-shell")
-	}
-
-	// 3b. The codex token must be re-resolved every prompt, never cached on
-	//     "already exported". auth-token is what notices an expired session (it
-	//     prints nothing and fires cleanup), so short-circuiting on a non-empty
-	//     variable both strands a dead credential in the shell env and skips the
-	//     only expiry check that shell will ever make.
-	if strings.Contains(script, `if [ -z "${PROMPTSTER_PROXY_TOKEN:-}" ]; then`) {
-		t.Errorf("codex token must not be cached on already-exported; an expired credential would survive the shell")
 	}
 
 	// 4. Command capture is gated to the workspace tree.
@@ -114,9 +124,10 @@ func TestShellHookScriptStructure(t *testing.T) {
 	//    once at source time and `return 0` when no session was live. Because
 	//    `promptster start` runs inside a shell that is already open, that made
 	//    the candidate's own shell the one shell guaranteed to have registered
-	//    nothing — no command capture, and no PROMPTSTER_PROXY_TOKEN, which is
-	//    how `codex` died on "Missing environment variable" immediately after
-	//    start printed "Codex ready".
+	//    nothing — no command capture, and (before the launcher replaced the
+	//    export) no PROMPTSTER_PROXY_TOKEN, which is how `codex` died on
+	//    "Missing environment variable" immediately after start printed
+	//    "Codex ready".
 	//
 	//    Two properties keep that from coming back: resolution is a FUNCTION
 	//    (so it can be called again), and it is called from the per-prompt
@@ -137,9 +148,8 @@ func TestShellHookScriptStructure(t *testing.T) {
 			body = body[:end]
 		}
 		for _, call := range []string{
-			"_promptster_resolve_ws",       // workspace, per prompt
-			"_promptster_ttl_check",        // expiry eviction, armed when a session appears
-			"_promptster_sync_codex_token", // credential, re-read per prompt
+			"_promptster_resolve_ws", // workspace, per prompt
+			"_promptster_ttl_check",  // expiry eviction, armed when a session appears
 		} {
 			if !strings.Contains(body, call) {
 				t.Errorf("%s must call %s; a session started mid-shell is invisible otherwise", hook, call)

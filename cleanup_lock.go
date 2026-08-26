@@ -32,15 +32,12 @@ func cleanupLockPath() string {
 // shell hook runs the same command once per prompt, and `promptster codex`
 // runs it on launch. All three fire cleanup when ExpiresAt has passed, so the
 // moment a session expires they race — and cleanup is NOT safe to run twice at
-// once. revertCodexProxy() restores the user's own `model_provider` from a
-// state file it then deletes; a second runner that reads after that delete
-// finds no state, restores nothing, and silently leaves the user's personal
-// codex pointed at a dead provider. That is the exact failure the state file
-// was written to prevent.
-//
-// It is also the one place the two rails can break each other: cleanup tears
-// down BOTH <workspace>/.claude/settings.local.json and the ~/.codex block, so
-// a storm triggered by the codex path takes the Claude rail with it.
+// once. purgeLegacyCodexProxyBlock() restores the user's own `model_provider`
+// from a state file it then deletes; a second runner that reads after that
+// delete finds no state, restores nothing, and silently leaves the user's
+// personal codex pointed at a dead provider. That is the exact failure the state
+// file was written to prevent — and, on machines upgrading from ≤1.9, the last
+// chance to undo it.
 func acquireCleanupLock() (release func(), ok bool) {
 	path := cleanupLockPath()
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {

@@ -44,11 +44,11 @@ func cmdStatus(args []string) {
 
 	if jsonOutput {
 		out := map[string]interface{}{
-			"sessionId":      session.SessionID,
-			"startedAt":      session.StartedAt.UTC().Format(time.RFC3339),
-			"elapsedSeconds":  int(elapsed.Seconds()),
+			"sessionId":        session.SessionID,
+			"startedAt":        session.StartedAt.UTC().Format(time.RFC3339),
+			"elapsedSeconds":   int(elapsed.Seconds()),
 			"timeLimitMinutes": session.TimeLimitMinutes,
-			"taskRoot":        session.TaskRoot,
+			"taskRoot":         session.TaskRoot,
 		}
 
 		if session.TimeLimitMinutes > 0 {
@@ -100,6 +100,15 @@ func cmdStatus(args []string) {
 		rows = append(rows, row("Last explain:", sinceExplain.String()+" ago"))
 	}
 
+	if hasTool(session.Tools, toolCodex) {
+		// Codex capture is a background daemon, and its failure mode is silence:
+		// a watcher left running by a PREVIOUS session keeps the liveness check
+		// satisfied while matching every rollout against the old workspace, so
+		// nothing is captured and nothing says so. Report ownership, not just
+		// liveness — the distinction is the whole bug.
+		rows = append(rows, row("Codex:", codexCaptureStatus(session)))
+	}
+
 	if session.TimeLimitMinutes > 0 {
 		remaining := time.Duration(session.TimeLimitMinutes)*time.Minute - elapsed
 		if remaining < 0 {
@@ -124,4 +133,18 @@ func cmdStatus(args []string) {
 
 	fmt.Println()
 	fmt.Println(statusBoxStyle.Render(content))
+}
+
+// codexCaptureStatus describes the codex rollout watcher for THIS session in one
+// line: running for us, running for someone else, or not running at all.
+func codexCaptureStatus(session Session) string {
+	state, alive := isCodexWatcherRunning()
+	switch {
+	case !alive:
+		return "not running — codex work is NOT being recorded (fix: promptster start)"
+	case !codexWatcherOwns(state, session):
+		return fmt.Sprintf("pid %d belongs to another session — codex work is NOT being recorded (fix: promptster start)", state.PID)
+	default:
+		return fmt.Sprintf("watching (pid %d, %d events sent)", state.PID, state.EventsSent)
+	}
 }

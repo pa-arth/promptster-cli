@@ -36,9 +36,9 @@ func main() {
 	case "auth-token":
 		cmdAuthToken(os.Args[2:])
 	case "codex":
-		// Launches codex with PROMPTSTER_PROXY_TOKEN already in its environment.
-		// Everything after the subcommand is forwarded to codex verbatim, so no
-		// flag parsing happens here.
+		// Launches codex wired to the proxy for that one process: provider as
+		// `-c` overrides, credential in its environment. Everything after the
+		// subcommand is forwarded to codex verbatim, so no flag parsing here.
 		cmdCodex(os.Args[2:])
 	case "status":
 		cmdStatus(os.Args[2:])
@@ -189,8 +189,8 @@ Commands:
   status [--json]              Show current session info and live event count
   doctor                       Check setup and diagnose configuration issues
   explain [--last 20m]         Document your decision rationale for recent work
-  codex [args...]              Launch Codex with the session's proxy credential in
-                               its environment (args are forwarded to codex)
+  codex [args...]              Launch Codex wired to this session's proxy, for
+                               that process only (args forwarded to codex)
   verify [sessionId|PST-...]   Verify the signed event log for a session
   version                      Print version
   help                         Show this help message

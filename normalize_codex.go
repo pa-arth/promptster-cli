@@ -118,25 +118,7 @@ func (p *codexRolloutProcessor) sessionMeta(payload map[string]interface{}, ts, 
 func (p *codexRolloutProcessor) eventMsg(payload map[string]interface{}, ts, raw string) []Event {
 	switch stringField(payload, "type") {
 	case "user_message":
-		text := stringField(payload, "message")
-		e := p.newCodexEvent("prompt", ts)
-		e.Provenance = humanProvenance()
-		data := map[string]interface{}{"text": text}
-		// Cadence enrichment, opt-in only — mirrors normalizeClaudeCode.
-		if p.consentToIntegrity {
-			data["promptLengthChars"] = len(text)
-			if last := loadLastPromptTs(); !last.IsZero() {
-				deltaMs := time.Since(last).Milliseconds()
-				data["timeSinceLastPromptMs"] = deltaMs
-				if len(text) > 300 && deltaMs < 1000 {
-					data["likelyPaste"] = true
-				}
-			}
-		}
-		e.Data = data
-		e.RawPayload = raw
-		saveLastPromptTs()
-		return []Event{e}
+		return p.promptEvent(stringField(payload, "message"), ts, raw)
 
 	case "agent_message":
 		// Codex emits multiple agent_message lines per turn: "commentary" (interim
@@ -145,17 +127,25 @@ func (p *codexRolloutProcessor) eventMsg(payload map[string]interface{}, ts, raw
 		if stringField(payload, "phase") != "final_answer" {
 			return nil
 		}
-		e := p.newCodexEvent("ai_response", ts)
-		data := map[string]interface{}{
-			"lastAssistantMessage": stringField(payload, "message"),
-		}
-		p.attachTokenUsage(data)
-		if last := loadLastPromptTs(); !last.IsZero() {
-			data["turnDurationMs"] = time.Since(last).Milliseconds()
-		}
-		e.Data = data
-		e.RawPayload = raw
-		return []Event{e}
+		return p.aiResponseEvent(stringField(payload, "message"), ts, raw)
+
+	case "item_completed":
+		// Codex 0.149 renamed the message stream. The old per-message
+		// `user_message` / `agent_message` lines are gone; every item now arrives
+		// as `item_completed` with the text under item.content[].text and the
+		// agent phase under item.phase.
+		//
+		// Nothing here recognised that shape, so a candidate's prompts and the
+		// model's answers were BOTH dropped on every current codex build — the
+		// rollout still produced session_start and tool_use, so the session
+		// looked captured while containing no conversation at all.
+		//
+		// Handled here rather than from `response_item` (which carries the same
+		// messages) because response_item also carries the developer-role system
+		// preamble and codex's own `<recommended_plugins>` boilerplate as
+		// role="user" — capturing those as candidate prompts would be worse than
+		// capturing nothing. item_completed carries only real items.
+		return p.itemCompleted(payload, ts, raw)
 
 	case "patch_apply_end":
 		return p.patchApplyEnd(payload, ts, raw)
@@ -172,6 +162,93 @@ func (p *codexRolloutProcessor) eventMsg(payload map[string]interface{}, ts, raw
 	default:
 		return nil
 	}
+}
+
+// itemCompleted handles the codex ≥0.149 message stream. Only the two item types
+// that carry conversation are emitted: tool calls still arrive as
+// response_item/custom_tool_call pairs, so emitting CommandExecution here would
+// double-count every command the agent ran.
+func (p *codexRolloutProcessor) itemCompleted(payload map[string]interface{}, ts, raw string) []Event {
+	item, _ := payload["item"].(map[string]interface{})
+	if item == nil {
+		return nil
+	}
+	switch stringField(item, "type") {
+	case "UserMessage":
+		return p.promptEvent(codexItemText(item), ts, raw)
+	case "AgentMessage":
+		// Same rule as the pre-0.149 agent_message: commentary is interim
+		// narration, only final_answer is the turn-end assistant message.
+		if stringField(item, "phase") != "final_answer" {
+			return nil
+		}
+		return p.aiResponseEvent(codexItemText(item), ts, raw)
+	default:
+		return nil
+	}
+}
+
+// codexItemText joins the text runs of an item_completed content array. Codex
+// spells the run type "Text" here and "text"/"input_text"/"output_text"
+// elsewhere, so the type is not filtered on — any run carrying "text" counts.
+func codexItemText(item map[string]interface{}) string {
+	content, _ := item["content"].([]interface{})
+	var parts []string
+	for _, rawPart := range content {
+		part, _ := rawPart.(map[string]interface{})
+		if part == nil {
+			continue
+		}
+		if t := stringField(part, "text"); t != "" {
+			parts = append(parts, t)
+		}
+	}
+	return strings.Join(parts, "")
+}
+
+// promptEvent builds the candidate `prompt` event, shared by the pre- and
+// post-0.149 rollout shapes.
+func (p *codexRolloutProcessor) promptEvent(text, ts, raw string) []Event {
+	if strings.TrimSpace(text) == "" {
+		return nil
+	}
+	e := p.newCodexEvent("prompt", ts)
+	e.Provenance = humanProvenance()
+	data := map[string]interface{}{"text": text}
+	// Cadence enrichment, opt-in only — mirrors normalizeClaudeCode.
+	if p.consentToIntegrity {
+		data["promptLengthChars"] = len(text)
+		if last := loadLastPromptTs(); !last.IsZero() {
+			deltaMs := time.Since(last).Milliseconds()
+			data["timeSinceLastPromptMs"] = deltaMs
+			if len(text) > 300 && deltaMs < 1000 {
+				data["likelyPaste"] = true
+			}
+		}
+	}
+	e.Data = data
+	e.RawPayload = raw
+	saveLastPromptTs()
+	return []Event{e}
+}
+
+// aiResponseEvent builds the turn-end `ai_response` event, shared by the pre-
+// and post-0.149 rollout shapes.
+func (p *codexRolloutProcessor) aiResponseEvent(text, ts, raw string) []Event {
+	if strings.TrimSpace(text) == "" {
+		return nil
+	}
+	e := p.newCodexEvent("ai_response", ts)
+	data := map[string]interface{}{
+		"lastAssistantMessage": text,
+	}
+	p.attachTokenUsage(data)
+	if last := loadLastPromptTs(); !last.IsZero() {
+		data["turnDurationMs"] = time.Since(last).Milliseconds()
+	}
+	e.Data = data
+	e.RawPayload = raw
+	return []Event{e}
 }
 
 // patchApplyEnd emits one file_diff per changed file. The payload carries a

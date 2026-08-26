@@ -519,33 +519,26 @@ func cmdStart(args []string) {
 		configureProxyEnv(hookRoot, proxyURL, session.SessionToken)
 	}
 
-	// Codex BYOK proxy — route codex's Responses-API traffic through Promptster
-	// for capture + metering. codex config is GLOBAL (no workspace scoping, no
-	// apiKeyHelper), so we write a marker-fenced provider block into
-	// ~/.codex/config.toml and select it via model_provider; configureCodexProxy
-	// is idempotent and records prior state for an exact revert on done/abort.
-	// The credential is NOT written to the file — it rides PROMPTSTER_PROXY_TOKEN,
-	// exported PWD-gated by the shell hook from the 0600 session.json.
-	codexProxyURL := apiURL() + "/v1/proxy/openai/v1"
+	// Codex BYOK proxy — codex's Responses-API traffic is routed through
+	// Promptster for capture + metering by `promptster codex`, which passes the
+	// provider as `-c` overrides on the launch it performs (codex_proxy.go).
+	//
+	// NOTHING IS CONFIGURED HERE, and that is the point. `start` used to write a
+	// marker-fenced provider block plus `model_provider = "promptster"` into the
+	// user's GLOBAL ~/.codex/config.toml, because codex will not scope a provider
+	// to a workspace. That hijacked every codex on the machine for the length of
+	// the session, and outlived it entirely whenever teardown did not run — a
+	// crash, a closed laptop, an expired key nobody came back to — leaving the
+	// candidate's own codex demanding a PROMPTSTER_PROXY_TOKEN that no longer
+	// existed anywhere. Per-launch overrides have no such failure mode: there is
+	// no state, so there is nothing to strand.
+	//
+	// The purge below is the migration path for machines a 1.9-or-earlier session
+	// already broke.
+	codexProxyURL := codexProxyBaseURL()
+	purgeLegacyCodexProxyBlock()
 	if useCodex {
-		verbosef("configuring codex model_provider=%s base_url=%s in %s", codexProxyProviderID, codexProxyURL, codexConfigPath())
-		if err := configureCodexProxy(codexProxyURL); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: could not configure Codex proxy: %v\n", err)
-		}
-		// The smoke test below authenticates with session.SessionToken over a
-		// direct HTTP call, so it proves the proxy and the org key are healthy
-		// and proves NOTHING about whether codex will find a credential. Those
-		// came apart in exactly one place and it was the place that mattered:
-		// this shell predates the session, so it has no PROMPTSTER_PROXY_TOKEN,
-		// and a candidate who read "Codex ready" and typed `codex` got
-		// "Missing environment variable: PROMPTSTER_PROXY_TOKEN".
-		//
-		// Say it here rather than let step 2 look like an arbitrary detour.
-		// `promptster codex` carries the credential itself (cmd_codex.go), which
-		// is why it is what gets printed.
-		if os.Getenv("PROMPTSTER_PROXY_TOKEN") == "" {
-			verbosef("no PROMPTSTER_PROXY_TOKEN in this shell — 'promptster codex' will supply it")
-		}
+		verbosef("codex will launch via 'promptster codex' with model_provider=%s base_url=%s (no changes to %s)", codexProxyProviderID, codexProxyURL, codexConfigPath())
 	}
 
 	// No subscription-logout step: the apiKeyHelper out-ranks a logged-in
@@ -759,12 +752,12 @@ func cmdStart(args []string) {
 	endStep(7, 7, "Optional /explain ready", "commentary on your decisions, only if you want")
 
 	// Start background git diff watcher for capturing manual edits
-	ensureGitWatcher()
+	ensureGitWatcher(session)
 
 	// Start background codex rollout watcher to capture codex CLI activity.
 	if useCodex {
 		verbosef("starting codex rollout watcher (sessions dir: %s)", codexSessionsDir())
-		ensureCodexWatcher()
+		ensureCodexWatcher(session)
 	}
 
 	// Transcript-capture mode: start the Claude Code transcript watcher. It
@@ -772,7 +765,7 @@ func cmdStart(args []string) {
 	// the basis for estimated cost in BYO mode); hooks fall back when it dies.
 	if useClaude && session.CaptureMode == "transcript" {
 		verbosef("starting claude transcript watcher (projects dir: %s)", claudeProjectsDir())
-		ensureClaudeWatcher()
+		ensureClaudeWatcher(session)
 	}
 
 	// Task brief display ──────────────────────────────────────────────────────
