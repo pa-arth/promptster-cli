@@ -164,6 +164,9 @@ func (p *codexRolloutProcessor) eventMsg(payload map[string]interface{}, ts, raw
 		// capturing nothing. item_completed carries only real items.
 		return p.itemCompleted(payload, ts, raw)
 
+	case "context_compacted":
+		return p.contextCompacted(ts, raw)
+
 	case "patch_apply_end":
 		return p.patchApplyEnd(payload, ts, raw)
 
@@ -179,6 +182,34 @@ func (p *codexRolloutProcessor) eventMsg(payload map[string]interface{}, ts, raw
 	default:
 		return nil
 	}
+}
+
+// contextCompacted converts the rollout's compaction marker into a
+// context_compact event — the same kind the Claude PreCompact hook emits, from
+// the rail we were already reading and simply never looked at.
+//
+// Codex has always had /compact; our capture just never reported one, and a
+// candidate was graded `context_hygiene: developing` for "zero clears or
+// compactions" on a session whose tool could not have shown us one.
+//
+// Keyed off `event_msg`/`context_compacted`, NOT the sibling `type:"compacted"`
+// record. The two arrive 1:1, so either counts the same resets — but
+// `compacted`'s payload is the whole `replacement_history` (every prior turn
+// verbatim, base64 image data included), and `context_compacted` is an
+// `EventMsg` variant, so it survives the 0.149 rename that moved user and agent
+// messages under `item_completed` and is handled here rather than there.
+//
+// No `trigger` and no token counts. Claude's PreCompact carries
+// `context_window_used_pct` and the transcript's compact_boundary carries
+// auto-vs-manual; the codex rollout carries neither, and it logs no slash
+// commands at all, so any value here would be invented — the same manufactured
+// fact that produced the false `developing` in the first place.
+func (p *codexRolloutProcessor) contextCompacted(ts, raw string) []Event {
+	e := p.newCodexEvent("context_compact", ts)
+	e.Actor = systemActor()
+	e.Data = map[string]interface{}{}
+	e.RawPayload = raw
+	return []Event{e}
 }
 
 // itemCompleted handles the codex ≥0.149 message stream. Only the two item types
