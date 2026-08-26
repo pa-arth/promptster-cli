@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -90,7 +91,15 @@ type submitCodePayload struct {
 // submitWorkspaceCode bundles the candidate's workspace as a tar.gz, uploads
 // it to Supabase Storage, and then notifies the API via /v1/candidate/submit-code.
 // Returns true on success.
-func submitWorkspaceCode(session Session, autoSubmit bool) bool {
+// submitWorkspaceCode bundles and delivers the candidate's workspace.
+//
+// Returns (uploaded, closedByServer). `uploaded` is true only when bytes were
+// ACCEPTED — it is what gates the irreversible codespace teardown, so it must
+// never be true for a path where the work did not reach us. `closedByServer`
+// says the refusal was the server's ordinary close of an expired assessment
+// rather than a failure, which is the difference between telling the candidate
+// "submitted" and telling them their work was lost.
+func submitWorkspaceCode(session Session, autoSubmit bool) (bool, bool) {
 	dim := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 	success := lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
 
@@ -100,7 +109,7 @@ func submitWorkspaceCode(session Session, autoSubmit bool) bool {
 
 	if !isGitRepository(taskRoot) {
 		fmt.Fprintf(os.Stderr, "  error: workspace is not a git repository, cannot bundle\n")
-		return false
+		return false, false
 	}
 
 	// Stage everything so the bundle (git ls-files) reflects the candidate's
@@ -108,7 +117,7 @@ func submitWorkspaceCode(session Session, autoSubmit bool) bool {
 	addArgs := append([]string{"add", "-A"}, gitAddExcludePathspecs(taskRoot)...)
 	if _, err := runCommand(taskRoot, "git", addArgs...); err != nil {
 		fmt.Fprintf(os.Stderr, "  error: git add failed: %v\n", err)
-		return false
+		return false, false
 	}
 	// Commit for audit trail. Disable gpgsign + skip hooks: a candidate's global
 	// commit.gpgsign=true or a repo pre-commit hook would otherwise fail this
@@ -165,7 +174,7 @@ func submitWorkspaceCode(session Session, autoSubmit bool) bool {
 		if stranded := detectStrandedWork(taskRoot, base, session.RepoURL); len(stranded) > 0 {
 			reportStrandedWork(taskRoot, stranded)
 			if !autoSubmit {
-				return false
+				return false, false
 			}
 			// --auto is the time-limit path. Refusing here would strand the
 			// session open forever, so submit and let the loud block above stand
@@ -181,15 +190,22 @@ func submitWorkspaceCode(session Session, autoSubmit bool) bool {
 	bundle, err := bundleWorkspace(taskRoot, base)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "  error: %v\n", err)
-		return false
+		return false, false
 	}
 	defer os.Remove(bundle.Path)
 
 	// Request a signed PUT URL.
 	urlResp, err := apiGetUploadURL(session.SessionToken, session.SessionID)
 	if err != nil {
+		// The server has already closed this assessment and the delivery window
+		// has passed. Nothing here failed; there is simply nowhere to put the
+		// bytes any more. Say so quietly and let the caller report the outcome —
+		// `uploaded` stays FALSE, because nothing was accepted.
+		if errors.Is(err, errAssessmentClosed) {
+			return false, true
+		}
 		fmt.Fprintf(os.Stderr, "  error: could not get upload URL: %v\n", err)
-		return false
+		return false, false
 	}
 
 	// Upload the tarball.
@@ -198,7 +214,7 @@ func submitWorkspaceCode(session Session, autoSubmit bool) bool {
 		dim.Render("●"), sizeMB, bundle.FileCount)
 	if err := uploadBundle(urlResp.UploadURL, bundle.Path, bundle.Size); err != nil {
 		fmt.Fprintf(os.Stderr, "  error: upload failed: %v\n", err)
-		return false
+		return false, false
 	}
 
 	// Notify the API.
@@ -215,13 +231,16 @@ func submitWorkspaceCode(session Session, autoSubmit bool) bool {
 		BundleSHA256: bundle.SHA256Hex,
 	}
 	if err := apiSubmitCode(session.SessionToken, payload); err != nil {
+		if errors.Is(err, errAssessmentClosed) {
+			return false, true
+		}
 		fmt.Fprintf(os.Stderr, "  error: submit-code failed: %v\n", err)
-		return false
+		return false, false
 	}
 
 	fmt.Printf("  %s Code submitted (%d files, %.1f MB)\n",
 		success.Render("✓"), bundle.FileCount, sizeMB)
-	return true
+	return true, false
 }
 
 // hasHeadParent returns true when HEAD has a reachable parent commit.
@@ -257,6 +276,9 @@ func apiSubmitCode(token string, payload submitCodePayload) error {
 
 	if resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		if apiErrorCode(body) == "assessment_closed" {
+			return errAssessmentClosed
+		}
 		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	return nil
