@@ -1,12 +1,14 @@
 package main
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 // The codex launcher is the whole codex rail on the terminal side, and it is
@@ -39,16 +41,31 @@ func runHookScript(t *testing.T, shell, home, pathDir, preamble, body string) st
 	// -i because the hook deliberately no-ops in non-interactive shells (it
 	// installs a DEBUG trap, which breaks scp and friends). --norc/-f so the
 	// developer's own rc files stay out of it.
-	args := []string{"-i", "-c", preamble + "\n. " + script + "\n" + body}
+	//
+	// _promptster_hook_script is for the bodies that need to source the hook a
+	// SECOND time — the re-source path, where a self-recursive wrapper would
+	// otherwise be born.
+	args := []string{"-i", "-c",
+		"_promptster_hook_script=" + script + "\n" + preamble + "\n. " + script + "\n" + body}
 	if shell == "bash" {
 		args = append([]string{"--norc", "--noprofile"}, args...)
 	} else {
 		args = append([]string{"-f"}, args...)
 	}
 
-	cmd := exec.Command(bin, args...)
-	cmd.Env = append(os.Environ(), "HOME="+home, "PATH="+pathDir+":/usr/bin:/bin")
+	// A regression in the launcher is a runaway, not a wrong answer: the wrapper
+	// calls itself, and bash with FUNCNEST unset recurses until the machine
+	// gives out. Bound both — FUNCNEST so bash reports instead of spinning, and
+	// the context so any other hang fails the test rather than wedging the suite.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd.Env = append(os.Environ(), "HOME="+home, "PATH="+pathDir+":/usr/bin:/bin", "FUNCNEST=50")
 	out, _ := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		t.Fatalf("%s hung on the hook (30s):\n%s", shell, out)
+	}
 	return string(out)
 }
 
@@ -169,6 +186,30 @@ func TestCodexLauncherAbsentWhenCodexIsNotInstalled(t *testing.T) {
 		out := runHookScript(t, shell, home, binDir, "", "type codex 2>&1 | head -1")
 		if strings.Contains(out, "function") {
 			t.Errorf("hook defined a codex function with no codex installed:\n%s", out)
+		}
+	})
+}
+
+// Sourcing the hook twice in one shell must leave a working `codex`, not a
+// function that calls itself. `command -v codex` answers with our own function
+// NAME once the wrapper is installed, so a second source that wrote that answer
+// straight into the variable the wrapper calls produced unbounded recursion —
+// zsh aborts with "maximum nested function level reached", bash (FUNCNEST
+// unset) never stops. Every `source ~/.zshrc` after an rc edit hit this.
+func TestCodexLauncherSurvivesBeingSourcedTwice(t *testing.T) {
+	eachShell(t, func(t *testing.T, shell string) {
+		home, ws, elsewhere, binDir := codexLauncherFixture(t)
+		out := runHookScript(t, shell, home, binDir, "", `
+. "$_promptster_hook_script"
+_promptster_bin=`+filepath.Join(binDir, "fakepromptster")+`
+cd `+ws+` && printf 'inside:'  && codex hello
+cd `+elsewhere+` && printf 'outside:' && codex hello
+`)
+		if !strings.Contains(out, "inside:VIA-PROMPTSTER codex hello") {
+			t.Errorf("after a re-source, inside the workspace codex did not route through promptster:\n%s", out)
+		}
+		if !strings.Contains(out, "outside:REAL-CODEX hello") {
+			t.Errorf("after a re-source, codex outside the workspace did not reach the real binary:\n%s", out)
 		}
 	})
 }
