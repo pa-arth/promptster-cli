@@ -53,6 +53,20 @@ func cmdCleanup(args []string) {
 		fmt.Fprintf(os.Stderr, "promptster cleanup (reason=%s)\n", *reason)
 	}
 
+	// Single-flight across processes. The three fireBackgroundCleanup callers
+	// are all per-request or per-prompt, so an expired session fires this
+	// concurrently from several places at once — and the teardown below is not
+	// safe to run twice (see acquireCleanupLock for what breaks). Yielding is
+	// correct: the holder is doing the same work.
+	release, ok := acquireCleanupLock()
+	if !ok {
+		if *verbose {
+			fmt.Fprintln(os.Stderr, "promptster cleanup: another cleanup is already running — nothing to do")
+		}
+		return
+	}
+	defer release()
+
 	removeShellHook()
 	stopDecisionWatchers()
 	stopGitWatcher()
