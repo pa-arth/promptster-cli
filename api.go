@@ -147,8 +147,41 @@ func apiRedeem(key, candidateName, signingPubKey string) (RedeemResponse, error)
 
 // CompleteResponse is the response from POST /v1/candidate/complete.
 type CompleteResponse struct {
-	OK          bool   `json:"ok"`
-	CompletedAt string `json:"completedAt"`
+	OK              bool   `json:"ok"`
+	CompletedAt     string `json:"completedAt"`
+	AlreadyComplete bool   `json:"alreadyCompleted"`
+}
+
+// errAssessmentClosed means the SERVER has already closed this assessment —
+// normally because the time limit expired and `session-auto-submit` fired.
+//
+// WHY THIS IS A DISTINCT ERROR. It is not a submission failure, and reporting it
+// as one is how a candidate whose clock simply ran out got told, repeatedly,
+// that their assessment was "NOT marked complete". The two cases arrive as the
+// same HTTP status carrying the same human-readable string, so the server now
+// also returns a machine-readable `code` and this is where it is recognised.
+// Everything else stays fatal: a refusal that is NOT this one means the work did
+// not reach us, and the candidate must be told so.
+var errAssessmentClosed = errors.New("assessment already closed by the server")
+
+// isAssessmentClosed reports whether an error is the server's ordinary close of
+// an expired assessment, as opposed to a submission that failed.
+func isAssessmentClosed(err error) bool {
+	return errors.Is(err, errAssessmentClosed)
+}
+
+// apiErrorCode extracts the machine-readable `code` from an error response body,
+// falling back to "" for older servers that do not send one. A server without
+// the field can only be treated as a generic failure, which is the behaviour
+// this client already had.
+func apiErrorCode(body []byte) string {
+	var parsed struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return ""
+	}
+	return parsed.Code
 }
 
 func apiComplete(sessionID, key string) (CompleteResponse, error) {
@@ -167,8 +200,23 @@ func apiComplete(sessionID, key string) (CompleteResponse, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		// The server closed this assessment already — the ordinary outcome when
+		// the time limit expired. Surface it as such rather than as a failure;
+		// the caller decides what to print, and it is not "your work was lost".
+		if apiErrorCode(respBody) == "assessment_closed" {
+			var closed struct {
+				CompletedAt string `json:"completedAt"`
+			}
+			json.Unmarshal(respBody, &closed) //nolint:errcheck
+			return CompleteResponse{
+				OK:              true,
+				CompletedAt:     closed.CompletedAt,
+				AlreadyComplete: true,
+			}, errAssessmentClosed
+		}
 		var errBody map[string]interface{}
-		json.NewDecoder(resp.Body).Decode(&errBody) //nolint:errcheck
+		json.Unmarshal(respBody, &errBody) //nolint:errcheck
 		msg, _ := errBody["error"].(string)
 		if msg == "" {
 			msg = fmt.Sprintf("HTTP %d", resp.StatusCode)
@@ -439,6 +487,9 @@ func apiGetUploadURL(sessionToken, sessionID string) (UploadURLResponse, error) 
 
 	if resp.StatusCode != 200 {
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		if apiErrorCode(respBody) == "assessment_closed" {
+			return UploadURLResponse{}, errAssessmentClosed
+		}
 		return UploadURLResponse{}, fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
 	}
 

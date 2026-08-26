@@ -221,7 +221,8 @@ func runGitWatcher() error {
 		// Stand down when a different session becomes the active one: TaskRoot
 		// was resolved once, so continuing would diff the previous assessment's
 		// tree and post it under the previous session's id.
-		if cur, curErr := loadSession(); curErr != nil || cur.SessionID != session.SessionID {
+		cur, curErr := loadSession()
+		if curErr != nil || cur.SessionID != session.SessionID {
 			fmt.Fprintf(os.Stderr, "git-watcher: session %s is no longer active — exiting (sent %d diffs)\n",
 				session.SessionID, diffsSent)
 			return nil
@@ -244,13 +245,45 @@ func runGitWatcher() error {
 			DiffsSent:     diffsSent,
 		})
 
+		// THE SESSION CLOCK LIVES HERE. `checkTimeLimit` used to be reachable only
+		// from a hook handler, so the client noticed its own deadline had passed
+		// when the agent next spoke — which for a candidate who had stopped
+		// typing was never. This daemon runs for every session and every lane and
+		// already re-reads the session file above, so it is the one place that can
+		// promise a bound. `cur` is that fresh read, not the stale `session`.
+		checkTimeLimitFromWatcher()
+		maybeSnapshotBeforeDeadline(cur)
+
 		select {
 		case <-signals:
 			fmt.Fprintf(os.Stderr, "git-watcher: shutting down (sent %d diffs)\n", diffsSent)
 			return nil
-		case <-time.After(gitWatchInterval):
+		case <-time.After(nextWakeIn(cur)):
 		}
 	}
+}
+
+// nextWakeIn is the poll interval, shortened so the loop wakes ON the deadline
+// (and on the pre-deadline snapshot lead) rather than up to a full interval past
+// it. Without this the detection bound would be gitWatchInterval; with it, the
+// ordinary case is ~0 and the interval is only the ceiling.
+func nextWakeIn(session Session) time.Duration {
+	wake := gitWatchInterval
+	deadline, ok := sessionDeadline(session)
+	if !ok {
+		return wake
+	}
+	for _, target := range []time.Time{deadline.Add(-preDeadlineSnapshotLead), deadline} {
+		d := time.Until(target)
+		if d > 0 && d < wake {
+			wake = d
+		}
+	}
+	// Never busy-loop if the clock is already at the target.
+	if wake < time.Second {
+		wake = time.Second
+	}
+	return wake
 }
 
 // pollGitDiffs runs `git diff` against the last known state and sends any

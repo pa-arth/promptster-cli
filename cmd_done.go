@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -47,22 +48,41 @@ func cmdDone(args []string) {
 	// succeed before we mark the session complete — otherwise the candidate
 	// thinks they shipped but no code reached us. Treat any failure path as
 	// fatal and bail before /complete is called.
+	//
+	// EXCEPT one path, which is not a failure: the server has already closed this
+	// assessment because the time limit expired, and its delivery window has
+	// passed. Nothing broke — there is simply nowhere left to put the bytes. That
+	// used to print "code submission failed — assessment NOT marked complete" and
+	// exit 1, on a loop, at a candidate whose clock had merely run out.
+	//
+	// `uploadConfirmed` stays FALSE on that path, deliberately. It gates the
+	// codespace teardown at the bottom of this function, and deleting a box whose
+	// work never reached us destroys the only copy.
 	uploadConfirmed := false
+	closedByServer := false
 	if session.TaskRoot != "" && session.SessionToken != "" {
-		if !submitWorkspaceCode(session, *autoSubmit) {
+		uploaded, closed := submitWorkspaceCode(session, *autoSubmit)
+		closedByServer = closed
+		if !uploaded && !closed {
 			fmt.Fprintln(os.Stderr)
 			fmt.Fprintln(os.Stderr, "error: code submission failed — assessment NOT marked complete")
 			fmt.Fprintln(os.Stderr, "  Fix the issue above and retry `promptster done --auto`.")
 			os.Exit(1)
 		}
-		uploadConfirmed = true
+		uploadConfirmed = uploaded
 	}
 
 	fmt.Println("Submitting your assessment...")
 	resp, err := apiComplete(session.SessionID, session.Key)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
+		// Already closed by the server is the ordinary end of a timed assessment,
+		// not an error. The response still carries `completedAt`, so the box below
+		// prints the same thing it would have printed had we closed it ourselves.
+		if !errors.Is(err, errAssessmentClosed) {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		closedByServer = true
 	}
 
 	_ = deleteSession()
@@ -106,6 +126,16 @@ func cmdDone(args []string) {
 	fmt.Println()
 	fmt.Println(doneBox.Render(heading + "\n\n" + details))
 	fmt.Println()
+	// Truthful about the one case that matters: the assessment IS submitted, and
+	// the very last edits did not make it. Saying nothing here would let a
+	// candidate believe bytes were delivered that were not; saying "submission
+	// failed" would be worse, because the assessment did complete.
+	if closedByServer && !uploadConfirmed {
+		fmt.Println(dim.Render(
+			"Note: the time limit had already closed this assessment, so your most recent\n" +
+				"local edits were not included. Everything captured before the deadline was."))
+		fmt.Println()
+	}
 	fmt.Println("Thank you for completing the assessment.")
 	fmt.Println(dim.Render("Your results will be available shortly."))
 	hosted := hostedLaneActive(session)
