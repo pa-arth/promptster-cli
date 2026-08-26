@@ -58,7 +58,15 @@ func claudeProjectsDir() string {
 
 // claudeWatcherState tracks the background transcript-tailing process.
 type claudeWatcherState struct {
-	PID           int    `json:"pid"`
+	PID int `json:"pid"`
+	// SessionID and Workspace record WHICH session this watcher was booted for.
+	// Same reason as the codex watcher (cmd_codex_watch.go): the session and
+	// workspace are resolved once at boot, the state file is resolved per write
+	// through the active-workspace pointer, so a watcher from the previous
+	// session keeps heartbeating into the new session's state file and the
+	// liveness check declines to launch the watcher that would actually work.
+	SessionID     string `json:"sessionId,omitempty"`
+	Workspace     string `json:"workspace,omitempty"`
 	StartedAt     string `json:"startedAt"`
 	LogPath       string `json:"logPath,omitempty"`
 	LastHeartbeat string `json:"lastHeartbeat,omitempty"`
@@ -149,6 +157,23 @@ func clearClaudeWatcherState() {
 	_ = os.Remove(claudeWatchProgressPath())
 }
 
+// releaseClaudeWatcherState clears our state on exit, but ONLY while the state
+// on disk is still ours — a watcher standing down for a new session must not
+// delete the incoming watcher's state or progress.
+func releaseClaudeWatcherState(pid int) {
+	if s, err := loadClaudeWatcherState(); err == nil && s.PID != pid {
+		return
+	}
+	clearClaudeWatcherState()
+}
+
+// claudeWatcherOwns reports whether a live watcher was booted for this session.
+// Unstamped (CLI ≤1.9) counts as foreign: the cost of being wrong is a restart,
+// and the cost of assuming is a session that captures nothing.
+func claudeWatcherOwns(state claudeWatcherState, session Session) bool {
+	return state.SessionID != "" && state.SessionID == session.SessionID
+}
+
 func isClaudeWatcherRunning() (claudeWatcherState, bool) {
 	state, err := loadClaudeWatcherState()
 	if err != nil || state.PID <= 0 {
@@ -230,10 +255,18 @@ func suppressForTranscriptCapture(session Session, e *Event) bool {
 	return false
 }
 
-// ensureClaudeWatcher launches the transcript watcher if not already running.
-func ensureClaudeWatcher() {
-	if _, ok := isClaudeWatcherRunning(); ok {
-		return
+// ensureClaudeWatcher launches the transcript watcher for this session,
+// replacing one left running by a previous session. "Already running" and
+// "running for THIS session" are different questions; answering only the first
+// leaves the new assessment with a watcher pointed at the old workspace.
+func ensureClaudeWatcher(session Session) {
+	if state, ok := isClaudeWatcherRunning(); ok {
+		if claudeWatcherOwns(state, session) {
+			return
+		}
+		verbosef("claude-watcher pid %d belongs to session %q, not %q — replacing it",
+			state.PID, state.SessionID, session.SessionID)
+		stopClaudeWatcher()
 	}
 	killStalePromptsterDaemons("promptster claude-watch")
 	if err := startClaudeWatcherProcess(); err != nil {
@@ -291,11 +324,12 @@ func runClaudeWatcher() error {
 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	if err := saveClaudeWatcherState(claudeWatcherState{
-		PID: os.Getpid(), StartedAt: now, LogPath: claudeWatcherLogPath(), LastHeartbeat: now,
+		PID: os.Getpid(), SessionID: session.SessionID, Workspace: session.TaskRoot,
+		StartedAt: now, LogPath: claudeWatcherLogPath(), LastHeartbeat: now,
 	}); err != nil {
 		return err
 	}
-	defer clearClaudeWatcherState()
+	defer releaseClaudeWatcherState(os.Getpid())
 
 	if os.Getenv("PROMPTSTER_API_URL") == "" && session.ApiURL != "" {
 		os.Setenv("PROMPTSTER_API_URL", session.ApiURL)
@@ -326,6 +360,16 @@ func runClaudeWatcher() error {
 		claudeProjectsDir(), claudeWatchInterval, workspace)
 
 	for {
+		// Stand down when a different session becomes the active one: the
+		// workspace and cutoff above were resolved once and cannot be
+		// re-derived, and a transcript matched against the wrong root is worse
+		// than no watcher. `start` boots one that knows the new session.
+		if cur, curErr := loadSession(); curErr != nil || cur.SessionID != session.SessionID {
+			fmt.Fprintf(os.Stderr, "claude-watcher: session %s is no longer active — exiting (sent %d events)\n",
+				session.SessionID, eventsSent)
+			return nil
+		}
+
 		// While degraded, hooks own emission — the watcher keeps PARSING (to
 		// detect recovery and advance offsets) but discards events: hooks were
 		// live for that window and already emitted them. The first poll that
@@ -348,7 +392,7 @@ func runClaudeWatcher() error {
 		}
 
 		_ = saveClaudeWatcherState(claudeWatcherState{
-			PID: os.Getpid(), StartedAt: now, LogPath: claudeWatcherLogPath(),
+			PID: os.Getpid(), SessionID: session.SessionID, Workspace: session.TaskRoot, StartedAt: now, LogPath: claudeWatcherLogPath(),
 			LastHeartbeat: time.Now().UTC().Format(time.RFC3339Nano),
 			EventsSent:    eventsSent,
 			BytesConsumed: bytesConsumed,

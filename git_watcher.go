@@ -28,7 +28,15 @@ const codexTurnAttributionWindow = gitWatchInterval + 30*time.Second
 
 // gitWatcherState tracks the background git-diff polling process.
 type gitWatcherState struct {
-	PID           int    `json:"pid"`
+	PID int `json:"pid"`
+	// SessionID and Workspace record WHICH session this watcher was booted for.
+	// Same reason as the two capture watchers (cmd_codex_watch.go): the session
+	// is resolved once at boot while the state file is resolved per write
+	// through the active-workspace pointer, so a watcher from the previous
+	// session keeps the new session's liveness check satisfied while diffing the
+	// old workspace and posting under the old session id.
+	SessionID     string `json:"sessionId,omitempty"`
+	Workspace     string `json:"workspace,omitempty"`
 	StartedAt     string `json:"startedAt"`
 	LogPath       string `json:"logPath,omitempty"`
 	LastHeartbeat string `json:"lastHeartbeat,omitempty"`
@@ -82,6 +90,22 @@ func clearGitWatcherState() {
 	_ = os.Remove(lastDiffRefPath())
 }
 
+// releaseGitWatcherState clears our state on exit, but ONLY while the state on
+// disk is still ours — a watcher standing down for a new session must not delete
+// the incoming watcher's state or its last-diff reference.
+func releaseGitWatcherState(pid int) {
+	if s, err := loadGitWatcherState(); err == nil && s.PID != pid {
+		return
+	}
+	clearGitWatcherState()
+}
+
+// gitWatcherOwns reports whether a live watcher was booted for this session.
+// Unstamped (CLI ≤1.9) counts as foreign.
+func gitWatcherOwns(state gitWatcherState, session Session) bool {
+	return state.SessionID != "" && state.SessionID == session.SessionID
+}
+
 func isGitWatcherRunning() (gitWatcherState, bool) {
 	state, err := loadGitWatcherState()
 	if err != nil || state.PID <= 0 {
@@ -94,12 +118,17 @@ func isGitWatcherRunning() (gitWatcherState, bool) {
 	return gitWatcherState{}, false
 }
 
-// ensureGitWatcher launches the git watcher background process if not already running.
-// Sweeps orphaned daemons before spawning so duplicates don't accumulate when
-// a prior session's state file was lost.
-func ensureGitWatcher() {
-	if _, ok := isGitWatcherRunning(); ok {
-		return
+// ensureGitWatcher launches the git watcher for this session, replacing one left
+// running by a previous session. Sweeps orphaned daemons before spawning so
+// duplicates don't accumulate when a prior session's state file was lost.
+func ensureGitWatcher(session Session) {
+	if state, ok := isGitWatcherRunning(); ok {
+		if gitWatcherOwns(state, session) {
+			return
+		}
+		verbosef("git-watcher pid %d belongs to session %q, not %q — replacing it",
+			state.PID, state.SessionID, session.SessionID)
+		stopGitWatcher()
 	}
 	killStalePromptsterDaemons("promptster diff-watch")
 	if err := startGitWatcherProcess(); err != nil {
@@ -161,13 +190,15 @@ func runGitWatcher() error {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	if err := saveGitWatcherState(gitWatcherState{
 		PID:           os.Getpid(),
+		SessionID:     session.SessionID,
+		Workspace:     session.TaskRoot,
 		StartedAt:     now,
 		LogPath:       gitWatcherLogPath(),
 		LastHeartbeat: now,
 	}); err != nil {
 		return err
 	}
-	defer clearGitWatcherState()
+	defer releaseGitWatcherState(os.Getpid())
 
 	// Restore API URL from session (background process may not have env vars)
 	if os.Getenv("PROMPTSTER_API_URL") == "" && session.ApiURL != "" {
@@ -187,6 +218,15 @@ func runGitWatcher() error {
 	fmt.Fprintf(os.Stderr, "git-watcher: started, polling every %s in %s\n", gitWatchInterval, session.TaskRoot)
 
 	for {
+		// Stand down when a different session becomes the active one: TaskRoot
+		// was resolved once, so continuing would diff the previous assessment's
+		// tree and post it under the previous session's id.
+		if cur, curErr := loadSession(); curErr != nil || cur.SessionID != session.SessionID {
+			fmt.Fprintf(os.Stderr, "git-watcher: session %s is no longer active — exiting (sent %d diffs)\n",
+				session.SessionID, diffsSent)
+			return nil
+		}
+
 		sent, err := pollGitDiffs(session, client)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "git-watcher: poll error: %v\n", err)
@@ -196,6 +236,8 @@ func runGitWatcher() error {
 		// Update heartbeat
 		_ = saveGitWatcherState(gitWatcherState{
 			PID:           os.Getpid(),
+			SessionID:     session.SessionID,
+			Workspace:     session.TaskRoot,
 			StartedAt:     now,
 			LogPath:       gitWatcherLogPath(),
 			LastHeartbeat: time.Now().UTC().Format(time.RFC3339Nano),

@@ -752,12 +752,12 @@ func cmdStart(args []string) {
 	endStep(7, 7, "Optional /explain ready", "commentary on your decisions, only if you want")
 
 	// Start background git diff watcher for capturing manual edits
-	ensureGitWatcher()
+	ensureGitWatcher(session)
 
 	// Start background codex rollout watcher to capture codex CLI activity.
 	if useCodex {
 		verbosef("starting codex rollout watcher (sessions dir: %s)", codexSessionsDir())
-		ensureCodexWatcher()
+		ensureCodexWatcher(session)
 	}
 
 	// Transcript-capture mode: start the Claude Code transcript watcher. It
@@ -765,7 +765,7 @@ func cmdStart(args []string) {
 	// the basis for estimated cost in BYO mode); hooks fall back when it dies.
 	if useClaude && session.CaptureMode == "transcript" {
 		verbosef("starting claude transcript watcher (projects dir: %s)", claudeProjectsDir())
-		ensureClaudeWatcher()
+		ensureClaudeWatcher(session)
 	}
 
 	// Task brief display ──────────────────────────────────────────────────────
