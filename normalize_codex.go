@@ -55,6 +55,13 @@ type codexRolloutProcessor struct {
 	// envelope has to stand in for a host that does not emit FileChange.
 	sawFileChange  bool
 	lastTokenUsage map[string]interface{}
+	// pendingInterruptID is the ID of an emitted interrupt still waiting for the
+	// prompt that follows it, so that prompt can be flagged `followsInterrupt`
+	// and back-linked. Mirrors claudeTranscriptProcessor. Without the flag the
+	// backend cannot separate a redirect (cut the run and steered it) from an
+	// abort (cut it and walked away), and every codex interrupt lands as
+	// neither.
+	pendingInterruptID string
 }
 
 func newCodexRolloutProcessor(sessionID string, consentToIntegrity bool) *codexRolloutProcessor {
@@ -75,7 +82,7 @@ func (p *codexRolloutProcessor) newCodexEvent(kind, ts string) Event {
 	e := newEvent(kind, p.sessionID)
 	e.Source = "codex"
 	switch kind {
-	case "prompt":
+	case "prompt", "interrupt":
 		e.Actor = humanActor()
 	case "session_start", "session_end":
 		e.Actor = systemActor()
@@ -167,6 +174,12 @@ func (p *codexRolloutProcessor) eventMsg(payload map[string]interface{}, ts, raw
 	case "context_compacted":
 		return p.contextCompacted(ts, raw)
 
+	case "turn_aborted":
+		return p.turnAborted(payload, ts, raw)
+
+	case "web_search_end":
+		return p.webSearchEnd(payload, ts)
+
 	case "patch_apply_end":
 		return p.patchApplyEnd(payload, ts, raw)
 
@@ -209,6 +222,115 @@ func (p *codexRolloutProcessor) contextCompacted(ts, raw string) []Event {
 	e.Actor = systemActor()
 	e.Data = map[string]interface{}{}
 	e.RawPayload = raw
+	return []Event{e}
+}
+
+// turnAborted converts the rollout's `turn_aborted` marker into the same
+// `interrupt` event Claude Code emits when the candidate hits ESC. It was being
+// dropped, so on codex a candidate who watched the agent go wrong and stopped it
+// was indistinguishable from one who sat there and let it finish — the exact
+// judgement the interrupt counters exist to make.
+//
+// SUBTYPE IS DERIVED FROM THE WIRE, NOT ASSUMED. Claude classifies action (a
+// tool call was cut) vs generation (a text reply was cut) from the last
+// assistant record; codex says only that the turn ended. But a cut tool call
+// never receives its `function_call_output` line, so it is still sitting in
+// `pending` when the abort arrives — and a turn cut while the model was writing
+// prose has an empty `pending`, because every call it made was already answered.
+// Verified against a real rollout: the interrupted turn's last exec completed
+// (exit 0, output line present) and the abort followed an assistant `message`,
+// which is `generation` and is what this returns for it.
+//
+// `running` counts too. Codex's own post-abort developer note says "any running
+// unified exec processes may still be running in the background", so a detached
+// cell in flight at abort time is an action that was cut.
+//
+// Only `pending` is cleared. Those calls can never be answered — the turn is
+// over — and leaving them would let a later call reusing the id inherit the
+// wrong tool name. `running` is deliberately left alone for the same reason the
+// note gives: a backgrounded process can still complete and still be reported.
+//
+// Consecutive aborts collapse. Codex can log more than one for a single burst,
+// and a second interrupt while the first has no prompt after it yet is the same
+// intervention counted twice.
+func (p *codexRolloutProcessor) turnAborted(payload map[string]interface{}, ts, raw string) []Event {
+	if p.pendingInterruptID != "" {
+		return nil
+	}
+
+	data := map[string]interface{}{}
+	// `reason` is codex's own word for why the turn ended ("interrupted"). Kept
+	// under `variant` — the field Claude uses for which sentinel matched — so the
+	// two rails answer "what kind of stop was this" in one place.
+	if reason := stringField(payload, "reason"); reason != "" {
+		data["variant"] = reason
+	}
+
+	subtype := "generation"
+	if cut := p.cutToolName(); cut != "" {
+		subtype = "action"
+		data["cutTool"] = cut
+	}
+	data["subtype"] = subtype
+	p.pending = map[string]codexPendingCall{}
+
+	e := p.newCodexEvent("interrupt", ts)
+	e.Provenance = humanProvenance()
+	e.Data = data
+	e.RawPayload = raw
+	p.pendingInterruptID = e.ID
+	return []Event{e}
+}
+
+// cutToolName returns the name of a tool call that was in flight when the turn
+// ended, or "" if none was. Map iteration is randomised and a turn can have more
+// than one call outstanding, so the name is taken in sorted call-id order rather
+// than whichever the runtime hands back first — an event that reports a
+// different tool on every re-derivation of the same rollout is worse than one
+// that reports a stable arbitrary choice.
+func (p *codexRolloutProcessor) cutToolName() string {
+	pick := func(m map[string]codexPendingCall) string {
+		ids := make([]string, 0, len(m))
+		for id := range m {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		for _, id := range ids {
+			if name := m[id].name; name != "" {
+				return name
+			}
+		}
+		return ""
+	}
+	if name := pick(p.pending); name != "" {
+		return name
+	}
+	return pick(p.running)
+}
+
+// webSearchEnd converts a completed codex web search into the `web_lookup`
+// event Claude emits for WebSearch/WebFetch. Codex runs the search host-side,
+// so it never appears in the `function_call` stream this file reads for tools —
+// it arrives only as this event_msg, which nothing here handled. Every web
+// lookup a codex candidate made was therefore invisible, and "did they check
+// the docs or guess" had no answer on one of the two rails.
+//
+// THE QUERY IS KEPT AND THE RESULTS ARE NOT, and that is not a size decision.
+// `results[]` is fetched page content — titles, urls, snippets of third-party
+// text, thumbnail urls — none of which is the candidate's work or the agent's,
+// and all of which would ride into our store as raw payload. The query is the
+// signal ("what did they think to look up"); the snippets are someone else's
+// copy. `raw` is not passed through for the same reason: it is the whole line,
+// results included.
+func (p *codexRolloutProcessor) webSearchEnd(payload map[string]interface{}, ts string) []Event {
+	query := stringField(payload, "query")
+	if strings.TrimSpace(query) == "" {
+		return nil
+	}
+	e := p.newCodexEvent("web_lookup", ts)
+	e.Provenance = aiProvenance()
+	e.Data = map[string]interface{}{"query": query}
+	e.RawPayload = strPreview(query, 500)
 	return []Event{e}
 }
 
@@ -345,6 +467,16 @@ func (p *codexRolloutProcessor) promptEvent(text, ts, raw string) []Event {
 	e := p.newCodexEvent("prompt", ts)
 	e.Provenance = humanProvenance()
 	data := map[string]interface{}{"text": text}
+	// This prompt is the first thing the candidate said after cutting a run, so
+	// it is the evidence that they redirected rather than abandoned it. The
+	// backend classifies redirect-vs-abort off this flag alone and clears the
+	// interrupt either way, so the flag must be set exactly once, on the FIRST
+	// prompt after the interrupt.
+	if p.pendingInterruptID != "" {
+		e.RelatedEventIDs = append(e.RelatedEventIDs, p.pendingInterruptID)
+		data["followsInterrupt"] = true
+		p.pendingInterruptID = ""
+	}
 	// Cadence enrichment, opt-in only — mirrors normalizeClaudeCode.
 	if p.consentToIntegrity {
 		data["promptLengthChars"] = len(text)
