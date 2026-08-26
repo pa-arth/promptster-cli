@@ -56,14 +56,34 @@ func TestShellHookScriptStructure(t *testing.T) {
 		t.Errorf("codex token must be sourced at runtime via auth-token, not baked in")
 	}
 
-	// 3. TTL self-eviction is preserved: a backgrounded `promptster env` at
-	//    shell start fires cleanup for an expired session. Now gated on a live
-	//    session, since the hook installs into shells that have none.
+	// 3. TTL self-eviction is preserved: a backgrounded `promptster env` fires
+	//    cleanup for an expired session.
 	if !strings.Contains(script, `( "$_promptster_bin" env >/dev/null 2>&1 & )`) {
 		t.Errorf("shell hook missing backgrounded TTL self-eviction trigger")
 	}
-	if !strings.Contains(script, `[ -n "$_promptster_ws" ] && ( "$_promptster_bin" env`) {
+	//    It must still cost nothing in a sessionless shell...
+	if !strings.Contains(script, `[ -n "$_promptster_ws" ] || return 0`) {
 		t.Errorf("TTL self-eviction should not spawn a process in every sessionless shell")
+	}
+	//    ...but the gate must be a FUNCTION re-evaluated per prompt, not a bare
+	//    source-time test. A source-time gate spawns nothing in the shell that
+	//    ran `promptster start` — which, since start runs inside an already-open
+	//    shell, is the one shell the candidate is actually using. That is the
+	//    same resolve-once bug as §8, and it lived one line below the fix for it.
+	if strings.Contains(script, `[ -n "$_promptster_ws" ] && ( "$_promptster_bin" env`) {
+		t.Errorf("TTL self-eviction must not be gated once at source time; the start-shell would never arm it")
+	}
+	if !strings.Contains(script, "_promptster_ttl_check() {") {
+		t.Errorf("TTL self-eviction must be a function so it can re-arm when a session appears mid-shell")
+	}
+
+	// 3b. The codex token must be re-resolved every prompt, never cached on
+	//     "already exported". auth-token is what notices an expired session (it
+	//     prints nothing and fires cleanup), so short-circuiting on a non-empty
+	//     variable both strands a dead credential in the shell env and skips the
+	//     only expiry check that shell will ever make.
+	if strings.Contains(script, `if [ -z "${PROMPTSTER_PROXY_TOKEN:-}" ]; then`) {
+		t.Errorf("codex token must not be cached on already-exported; an expired credential would survive the shell")
 	}
 
 	// 4. Command capture is gated to the workspace tree.
@@ -116,8 +136,14 @@ func TestShellHookScriptStructure(t *testing.T) {
 		if end := strings.Index(body, "\n  }"); end != -1 {
 			body = body[:end]
 		}
-		if !strings.Contains(body, "_promptster_resolve_ws") {
-			t.Errorf("%s must re-resolve the workspace; a session started mid-shell is invisible otherwise", hook)
+		for _, call := range []string{
+			"_promptster_resolve_ws",       // workspace, per prompt
+			"_promptster_ttl_check",        // expiry eviction, armed when a session appears
+			"_promptster_sync_codex_token", // credential, re-read per prompt
+		} {
+			if !strings.Contains(body, call) {
+				t.Errorf("%s must call %s; a session started mid-shell is invisible otherwise", hook, call)
+			}
 		}
 	}
 

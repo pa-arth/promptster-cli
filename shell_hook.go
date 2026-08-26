@@ -54,10 +54,17 @@ func shellHookPath() string {
 //     PROMPTSTER_PROXY_TOKEN". A shell that DID have the hook loaded was no
 //     better: it held the workspace path captured before `start` ran.
 //
-//  2. TTL self-eviction — a single backgrounded `promptster env` at shell start.
-//     It exports nothing now; its only job is to fire `promptster cleanup` when
-//     the session's local TTL has passed, so an abandoned session's RC line +
-//     shell hook disappear on the next new terminal.
+//  2. TTL self-eviction — a backgrounded `promptster env`, armed when a session
+//     first becomes visible to the shell (not once at shell start, for the same
+//     reason as above: the shell that ran `start` had none when its RC was
+//     read). It exports nothing; its only job is to fire `promptster cleanup`
+//     when the session's local TTL has passed, so an abandoned session's RC
+//     line + shell hook disappear on the next new terminal.
+//
+//  3. Codex proxy token — re-resolved from `auth-token` on EVERY prompt while
+//     inside the workspace, and unset the moment `auth-token` goes quiet. It is
+//     not cached on "already exported": that would strand an expired credential
+//     in the shell and skip the one call that notices the expiry.
 func shellHookScript() string {
 	bin := promptsterBin()
 	return fmt.Sprintf(`#!/bin/sh
@@ -141,10 +148,21 @@ _promptster_codex_active() {
 }
 _promptster_sync_codex_token() {
   if _promptster_in_workspace && _promptster_codex_active; then
-    if [ -z "${PROMPTSTER_PROXY_TOKEN:-}" ]; then
-      PROMPTSTER_PROXY_TOKEN="$("$_promptster_bin" auth-token 2>/dev/null)"
-      [ -n "$PROMPTSTER_PROXY_TOKEN" ] && export PROMPTSTER_PROXY_TOKEN
+    # Re-resolved EVERY prompt, never cached on "already exported". auth-token
+    # is the single source of truth: it prints the token for a live session,
+    # prints NOTHING for an expired one, and fires the background cleanup on
+    # its way out. Short-circuiting while the variable is non-empty would keep
+    # an expired credential exported for the life of the shell AND skip the
+    # only call that ever notices the expiry — the same resolve-once bug this
+    # hook exists to fix, one branch lower down.
+    _promptster_tok="$("$_promptster_bin" auth-token 2>/dev/null)"
+    if [ -n "$_promptster_tok" ]; then
+      PROMPTSTER_PROXY_TOKEN="$_promptster_tok"
+      export PROMPTSTER_PROXY_TOKEN
+    elif [ -n "${PROMPTSTER_PROXY_TOKEN:-}" ]; then
+      unset PROMPTSTER_PROXY_TOKEN
     fi
+    unset _promptster_tok
   elif [ -n "${PROMPTSTER_PROXY_TOKEN:-}" ]; then
     unset PROMPTSTER_PROXY_TOKEN
   fi
@@ -154,13 +172,27 @@ _promptster_sync_codex_token
 
 # TTL self-eviction (backgrounded, no output). 'promptster env' fires a
 # background cleanup when the session's local ExpiresAt has passed; otherwise
-# it does nothing. Detached so shell start never blocks on the spawn.
+# it does nothing. Detached so the prompt never blocks on the spawn.
 #
-# Gated on a live session. The old early-return meant this only ever ran in a
-# shell that had one; now that the hook installs unconditionally, spawning it
-# from every interactive shell on the machine would be one process per shell for
-# a command that returns immediately when there is no session to evict.
-[ -n "$_promptster_ws" ] && ( "$_promptster_bin" env >/dev/null 2>&1 & ) 2>/dev/null
+# Armed when a session first becomes VISIBLE to this shell, re-armed if a
+# different workspace shows up later — not once at source time. A source-time
+# gate spawns nothing in a shell that had no session when its RC was read, and
+# 'promptster start' runs inside an already-open shell, so that is precisely
+# the one shell the candidate is standing in: it would never schedule the
+# eviction for its entire life. Same resolve-once bug as the workspace lookup
+# above, so it gets the same treatment — resolve per prompt, act on change.
+#
+# Keyed on the workspace rather than fired every prompt so a live session costs
+# one spawn per shell, not one per command, and a shell with no session still
+# costs nothing at all.
+_promptster_ttl_armed=""
+_promptster_ttl_check() {
+  [ -n "$_promptster_ws" ] || return 0
+  [ "$_promptster_ws" = "$_promptster_ttl_armed" ] && return 0
+  _promptster_ttl_armed="$_promptster_ws"
+  ( "$_promptster_bin" env >/dev/null 2>&1 & ) 2>/dev/null
+}
+_promptster_ttl_check
 
 if [ -n "$ZSH_VERSION" ]; then
   # ── zsh: preexec receives the full command line as $1 ──
@@ -179,6 +211,7 @@ if [ -n "$ZSH_VERSION" ]; then
     # Before anything reads $_promptster_ws: a session may have been started
     # (or ended) since the last prompt, in this very shell.
     _promptster_resolve_ws || :
+    _promptster_ttl_check
     _promptster_sync_codex_token
     _promptster_in_workspace || return 0
     if [ -n "$_promptster_last_cmd" ]; then
@@ -217,6 +250,7 @@ elif [ -n "$BASH_VERSION" ]; then
     local exit_code=$?
     # Same as zsh's precmd: re-resolve before anything reads $_promptster_ws.
     _promptster_resolve_ws || :
+    _promptster_ttl_check
     _promptster_sync_codex_token
     _promptster_in_workspace || return 0
     if [ -n "$_promptster_last_cmd" ]; then
