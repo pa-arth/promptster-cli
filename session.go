@@ -104,6 +104,39 @@ type Session struct {
 	// as a RECORD of what the server said, not as a switch: nothing in the CLI
 	// branches on it any more. See openspec changes/employer-supplied-model-key.
 	AuthMode string `json:"authMode,omitempty"`
+	// NoSelfEvict disarms TTL SELF-EVICTION for this session.
+	//
+	// ⛔ What it prevents, measured: on a session whose ExpiresAt has passed,
+	// ONE interactive shell — a candidate clicking TERMINAL — wipes
+	// `.claude/settings.local.json`, `.promptster/session.json`,
+	// `active-workspace`, the codex provider block, the shell hook and its RC
+	// line. The shell hook backgrounds `promptster env`, which fires
+	// `cmdCleanup`; `promptster auth-token` fires it too, and the apiKeyHelper
+	// **is** `auth-token` — so Claude Code triggers the teardown itself, once per
+	// API request.
+	//
+	// That is CORRECT on a candidate's own laptop: an abandoned session must not
+	// leave our hooks in their shell forever. It is wrong in a box WE provisioned
+	// and own, where the same code destroys the environment rather than tidying
+	// up after itself, and the candidate's next action is a support ticket.
+	//
+	// Two guards ship together and this is the second one. The first is an
+	// `expiresAt` seeded to outlive the assessment window — a value someone can
+	// get wrong. This is what stops a wrong value from being destructive.
+	//
+	// ⚠ The default is deliberately the NEGATIVE. Absent (a laptop session, a
+	// session.json written by any older CLI) means self-eviction stays armed,
+	// exactly as before. Only a seeded start turns it off, and only for the box
+	// it seeded. Read it through `selfEvictArmed()`, never directly.
+	//
+	// openspec private-problem-sandbox-lane design.md §8.6, task 2.5e.
+	NoSelfEvict bool `json:"noSelfEvict,omitempty"`
+	// SeededAt records that this session arrived on disk as BYTES written by the
+	// provisioning worker rather than through `promptster redeem` on this
+	// machine. Kept as a record, not a switch — nothing branches on it — because
+	// "the CLI never redeemed here" is the fact that explains every other unusual
+	// thing about such a session to whoever reads it next.
+	SeededAt time.Time `json:"seededAt,omitempty"`
 	// CaptureMode selects the Claude Code capture channel:
 	//   ""/"hooks"   — hook-driven capture (default)
 	//   "transcript" — claude-watch tails the transcript JSONL; hooks fall
@@ -112,6 +145,26 @@ type Session struct {
 	// "transcript" is no longer a configuration. It is armed at start when the
 	// proxy smoke test fails, i.e. when proxy capture would produce nothing.
 	CaptureMode string `json:"captureMode,omitempty"`
+}
+
+// selfEvictArmed reports whether an expired session may tear itself down.
+//
+// Every caller that fires `fireBackgroundCleanup` on expiry must go through
+// this, and there are three of them on hot paths: the shell hook
+// (`promptster env`, once per prompt), the Claude Code apiKeyHelper
+// (`promptster auth-token`, once per API request) and `promptster codex` on
+// launch. A guard added to two of the three is not a guard.
+func (s Session) selfEvictArmed() bool {
+	return !s.NoSelfEvict
+}
+
+// expired reports whether the local TTL has passed.
+//
+// A zero ExpiresAt means "no local TTL" — a session.json written by a
+// pre-feature CLI has nothing to compare against, and treating unknown as
+// expired would evict working sessions on upgrade.
+func (s Session) expired() bool {
+	return !s.ExpiresAt.IsZero() && time.Now().After(s.ExpiresAt)
 }
 
 func sessionPath() string {
