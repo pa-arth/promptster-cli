@@ -1,6 +1,6 @@
 {
   "name": "@promptster/cli",
-  "version": "1.10.1",
+  "version": "1.10.2",
   "description": "Promptster CLI — capture and submit developer assessments",
   "keywords": [
     "promptster",
