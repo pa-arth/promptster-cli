@@ -7,50 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
-
-func TestInCodespaceDetection(t *testing.T) {
-	cases := []struct {
-		name       string
-		codespaces string
-		nameVar    string
-		want       bool
-	}{
-		{"unset", "", "", false},
-		{"codespaces true", "true", "", true},
-		{"codespaces TRUE", "TRUE", "", true},
-		{"codespaces 1", "1", "", true},
-		{"codespaces false but name set", "false", "fluffy-space-doodle", true},
-		{"name only", "", "fluffy-space-doodle", true},
-		{"codespaces false, no name", "false", "", false},
-		{"blank name", "", "   ", false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Setenv("CODESPACES", tc.codespaces)
-			t.Setenv("CODESPACE_NAME", tc.nameVar)
-			if got := inCodespace(); got != tc.want {
-				t.Fatalf("inCodespace() = %v, want %v", got, tc.want)
-			}
-		})
-	}
-}
-
-// The whole point of --adopt defaulting on is that the candidate types the same
-// command on both lanes. If this ever needs a lane-specific flag, the hosted lane
-// has re-added the setup step it exists to delete.
-func TestHostedLaneNeedsNoExtraFlag(t *testing.T) {
-	t.Setenv("CODESPACES", "true")
-	t.Setenv("CODESPACE_NAME", "fluffy-space-doodle")
-	if !inCodespace() {
-		t.Fatal("hosted lane not detected from env — --adopt would not default on")
-	}
-	t.Setenv("CODESPACES", "")
-	t.Setenv("CODESPACE_NAME", "")
-	if inCodespace() {
-		t.Fatal("local lane detected as hosted — --adopt would default on for laptops")
-	}
-}
 
 func TestEvaluateAdoptedTree(t *testing.T) {
 	const sha = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
@@ -257,78 +215,28 @@ func TestResolveAdoptWorkspaceUsesFlagToplevel(t *testing.T) {
 
 func TestResolveAdoptWorkspaceRejectsNonRepo(t *testing.T) {
 	dir := t.TempDir()
-	t.Setenv("CODESPACE_VSCODE_FOLDER", "")
 	if _, err := resolveAdoptWorkspace(dir); err == nil {
 		t.Fatal("adopted a path that is not a git checkout")
 	}
 }
 
-func TestHostedSetupMarker(t *testing.T) {
-	dir := t.TempDir()
-	marker := filepath.Join(dir, "hosted-setup-complete")
-	t.Setenv("PROMPTSTER_HOSTED_SETUP_MARKER", marker)
-
-	if hostedSetupCompleted() {
-		t.Fatal("reported setup complete with no marker on disk")
+// 2.4i replaced `hostedLaneActive` (session flag OR `inCodespace()`) with
+// `seededSession`, which reads only the session. The property that mattered
+// survives the swap and is the reason this test does: `done`, `abort` and
+// `doctor` routinely run from a shell that inherited no environment at all —
+// a bare `sh -c`, a detached process — and the answer must not change.
+//
+// The old predicate needed a session flag precisely BECAUSE it also consulted
+// the environment and the environment could vanish. Reading the session alone
+// makes that structural rather than remembered.
+func TestSeededSessionSurvivesStrippedEnv(t *testing.T) {
+	os.Unsetenv("CODESPACES")
+	os.Unsetenv("CODESPACE_NAME")
+	if seededSession(Session{}) {
+		t.Fatal("a session with no SeededAt reported as seeded")
 	}
-	if _, ok := readHostedSetupMarker(); ok {
-		t.Fatal("read a marker that does not exist")
-	}
-
-	// The §3.9 body: key=value lines, exactly as scripts/lib/devcontainer.mjs
-	// emits them.
-	written := "schema=1\nstartedAt=2026-08-23T10:00:00Z\ncompletedAt=2026-08-23T10:00:42Z\n" +
-		"setupSeconds=42\nprebuildEnvRaw=\nprebuildEnvSet=no\n" +
-		"codespaceName=octocat-space-1\nissueId=prometheus-prometheus-15141\n"
-	if err := os.WriteFile(marker, []byte(written), 0o644); err != nil {
-		t.Fatalf("write marker: %v", err)
-	}
-	if !hostedSetupCompleted() {
-		t.Fatal("marker present but setup reported incomplete")
-	}
-	body, ok := readHostedSetupMarker()
-	if !ok {
-		t.Fatal("marker present but not read")
-	}
-	if body.Schema != 1 {
-		t.Fatalf("schema = %d, want 1", body.Schema)
-	}
-	if body.SetupSeconds == nil || *body.SetupSeconds != 42 {
-		t.Fatalf("setupSeconds = %v, want 42", body.SetupSeconds)
-	}
-	if body.CompletedAt != "2026-08-23T10:00:42Z" {
-		t.Fatalf("completedAt = %q", body.CompletedAt)
-	}
-	if body.IssueID != "prometheus-prometheus-15141" {
-		t.Fatalf("issueId = %q", body.IssueID)
-	}
-	// Evidence, never a verdict: an unset CODESPACE_PREBUILD must not read as a
-	// statement that this was not a prebuild.
-	if body.PrebuildEnvSet {
-		t.Fatal("prebuildEnvSet true for an unset variable")
-	}
-
-	// An empty (touched) marker still means the setup command finished. Presence
-	// is the signal; the body is extra.
-	if err := os.WriteFile(marker, nil, 0o644); err != nil {
-		t.Fatalf("truncate marker: %v", err)
-	}
-	if _, ok := readHostedSetupMarker(); !ok {
-		t.Fatal("an empty marker was treated as absent")
-	}
-}
-
-func TestHostedLaneActiveSurvivesStrippedEnv(t *testing.T) {
-	t.Setenv("CODESPACES", "")
-	t.Setenv("CODESPACE_NAME", "")
-	if hostedLaneActive(Session{}) {
-		t.Fatal("local session reported as hosted")
-	}
-	// `done` can run from a shell that never inherited the codespace env. The
-	// session flag is what keeps the commit suppression and the wind-down from
-	// silently reverting to local-lane behaviour.
-	if !hostedLaneActive(Session{HostedLane: true}) {
-		t.Fatal("hosted session lost its lane when the env was stripped")
+	if !seededSession(Session{SeededAt: time.Now()}) {
+		t.Fatal("a seeded session lost that fact when the env was stripped")
 	}
 }
 
@@ -395,13 +303,6 @@ func TestPromptForAssessmentKeyGivesUpOnEOF(t *testing.T) {
 	}
 }
 
-func TestDeleteHostingCodespaceRefusesWithoutName(t *testing.T) {
-	t.Setenv("CODESPACE_NAME", "")
-	if err := deleteHostingCodespace(); err == nil {
-		t.Fatal("attempted a delete with no codespace name")
-	}
-}
-
 func TestHostedBriefSaysWhatChanges(t *testing.T) {
 	lines := strings.Join(hostedBriefLines(), " ")
 	for _, want := range []string{"do not need to commit", "promptster done"} {
@@ -425,14 +326,17 @@ func TestSystemShellInitSourcesHookReadsRealPaths(t *testing.T) {
 	}
 }
 
-// The submission commit is what triggers GitHub's automatic PUBLIC FORK under a
-// candidate's own account when they commit from a read-only mirror codespace —
-// a repo named after the assessment problem, on their profile. Suppressing it is
-// the fork-prevention mechanism, so assert on the commit graph, not on a flag.
-func TestSubmissionCommitSuppressedOnHostedLane(t *testing.T) {
-	t.Setenv("CODESPACES", "")
-	t.Setenv("CODESPACE_NAME", "")
-
+// ⛔ THIS TEST IS INVERTED BY 2.4i, and the inversion is the point.
+//
+// It used to assert that `recordSubmissionCommit` made NO commit on the hosted
+// lane. That suppression was a privacy mechanism (design.md §2): committing from
+// a read-only GitHub Codespace makes GitHub create a public fork under the
+// candidate's account, naming the assessment problem on their profile.
+//
+// The Codespace is gone, so the fork mechanism is gone, and suppressing the
+// audit-trail commit on the lane that will carry most assessments would now be
+// protecting against nothing at a real cost. The commit runs everywhere.
+func TestSubmissionCommitRunsOnEveryLane(t *testing.T) {
 	countCommits := func(dir string) string {
 		out, err := exec.Command("git", "-C", dir, "rev-list", "--count", "HEAD").Output()
 		if err != nil {
@@ -441,30 +345,27 @@ func TestSubmissionCommitSuppressedOnHostedLane(t *testing.T) {
 		return strings.TrimSpace(string(out))
 	}
 
-	hosted := t.TempDir()
-	gitInitSeeded(t, hosted)
-	before := countCommits(hosted)
-	if recordSubmissionCommit(Session{HostedLane: true}, hosted) {
-		t.Fatal("recordSubmissionCommit reported an attempt on the hosted lane")
-	}
-	if after := countCommits(hosted); after != before {
-		t.Fatalf("hosted lane made a commit: %s -> %s", before, after)
-	}
-
-	local := t.TempDir()
-	gitInitSeeded(t, local)
-	before = countCommits(local)
-	if !recordSubmissionCommit(Session{}, local) {
-		t.Fatal("recordSubmissionCommit skipped the commit on the local lane")
-	}
-	if after := countCommits(local); after == before {
-		t.Fatalf("local lane made no commit: still %s", after)
+	for _, name := range []string{"seeded", "local"} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			gitInitSeeded(t, dir)
+			before := countCommits(dir)
+			recordSubmissionCommit(dir)
+			if after := countCommits(dir); after == before {
+				t.Fatalf("no submission commit was made: still %s", after)
+			}
+		})
 	}
 }
 
-// The suppression must not cost the submission anything: the bundle reads the
-// INDEX and the diff compares the WORKING TREE to the base, so both still see
-// the candidate's work with no commit in between.
+// The commit must not be LOad-BEARING: the bundle reads the INDEX and the diff
+// compares the WORKING TREE to the base, so both see the candidate's work with
+// no commit in between.
+//
+// This is what made suppressing the commit free before 2.4i, and it is what
+// makes restoring it safe now — a `git commit` that fails (a read-only home, a
+// hook that rejects, a missing identity) must not cost the candidate their
+// submission. So the property is asserted with NO commit made at all.
 func TestWorkIsStillVisibleWithNoSubmissionCommit(t *testing.T) {
 	dir := t.TempDir()
 	gitInitSeeded(t, dir)
@@ -480,9 +381,8 @@ func TestWorkIsStillVisibleWithNoSubmissionCommit(t *testing.T) {
 	if out, err := exec.Command("git", "-C", dir, "add", "-A").CombinedOutput(); err != nil {
 		t.Fatalf("git add: %v: %s", err, out)
 	}
-	if recordSubmissionCommit(Session{HostedLane: true}, dir) {
-		t.Fatal("commit was attempted")
-	}
+	// Deliberately NOT calling recordSubmissionCommit: this asserts the diff and
+	// the file list stand on their own.
 
 	diff, err := exec.Command("git", "-C", dir, "diff", baseSha).Output()
 	if err != nil {
@@ -501,9 +401,9 @@ func TestWorkIsStillVisibleWithNoSubmissionCommit(t *testing.T) {
 }
 
 // --adopt must be READ-ONLY. prepareWorkspaceCheckout rewrites origin and
-// detaches HEAD; run against a codespace's checkout it would silently move the
-// candidate off the ref their container was built from. The adopt path may only
-// look.
+// detaches HEAD; run against a seeded checkout it would silently move the
+// candidate off the tree the provisioner wrote — and off the tree
+// `snapshot_tree_sha` was asserted against. The adopt path may only look.
 func TestAdoptDoesNotMutateTheCheckout(t *testing.T) {
 	root := t.TempDir()
 	gitInitSeeded(t, root)

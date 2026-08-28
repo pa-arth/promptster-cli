@@ -98,9 +98,6 @@ func cmdStart(args []string) {
 
 	seeded := *seededFlag
 	adopt := *adoptFlag
-	if !fs.Changed("adopt") {
-		adopt = inCodespace()
-	}
 	if seeded {
 		if msg := seededArgsRefusal(fs.Args()); msg != "" {
 			fmt.Fprint(os.Stderr, msg)
@@ -124,16 +121,13 @@ func cmdStart(args []string) {
 		}
 	}
 
-	// hostedLane is deliberately NOT `adopt && inCodespace()`. The fork hazard
-	// (design.md §2) and the wrong-instructions hazard (§3.2) are properties of
-	// being in a read-only codespace, not of how the workspace was resolved — so
-	// `--adopt=false` inside a codespace must still suppress the commit and the
-	// clone-and-checkout text. Tying the copy to the flag would let one override
-	// silently switch off a privacy mechanism.
-	hostedLane := inCodespace()
-	if hostedLane {
-		verbosef("hosted lane detected: CODESPACE_NAME=%s", codespaceName())
-	}
+	// ⛔ 2.4i deleted `hostedLane := inCodespace()` and everything downstream of
+	// it. There is no environment probe here any more, and adding one back would
+	// be a mistake: the hazards it gated were properties of being in a read-only
+	// GitHub Codespace — automatic fork on first commit (design.md §2), the
+	// candidate's own storage allowance, `gh codespace delete` — and none of them
+	// exist in a box we provision. `--seeded` is now the only way in, and it says
+	// what it means: the worker wrote this session and this tree.
 
 	// Check for CLI updates (non-blocking, best-effort)
 	checkForUpdate()
@@ -206,11 +200,13 @@ func cmdStart(args []string) {
 	verbosef("sessionId=%s assessmentId=%s", saved.SessionID, saved.AssessmentID)
 	endStep(1, 7, "Loading saved session", "")
 	session = saved
-	// Recorded from the ENVIRONMENT, not from the assessment's hostingLane: the
-	// assessment carries the recruiter's OFFER, and a candidate offered the
-	// hosted lane can still clone locally. This is what keeps `done`, `abort` and
-	// `doctor` on the right lane in a shell that never inherited the codespace env.
-	session.HostedLane = hostedLane
+	// ⛔ `session.HostedLane = hostedLane` used to be here (2.4i removed both). It
+	// recorded the ENVIRONMENT rather than the assessment's `hostingLane`,
+	// because the assessment carries the recruiter's OFFER and a candidate
+	// offered the hosted lane can still clone locally. That distinction is intact
+	// — `SeededAt` below is what `done`, `abort` and `doctor` read now, and it is
+	// likewise a fact about how this invocation started, not about what was
+	// offered.
 	if seeded {
 		// ⛔ 2.5e. This session lives in a box we provisioned and own, so the TTL
 		// self-eviction path must not arm. Set BEFORE anything can fire it: the
@@ -569,14 +565,14 @@ func cmdStart(args []string) {
 	// system line is actually there — see systemShellInitSourcesHook.
 	//
 	// The failure is non-fatal on BOTH lanes and always was: `start` warns and
-	// carries on. Worth stating rather than changing, because a hosted box has a
-	// read-only-ish home in some configurations and a fatal shell-hook failure
-	// there would kill an assessment over terminal capture, which is one signal
-	// among many.
+	// carries on. Worth stating rather than changing, because a provisioned box
+	// has a read-only-ish home in some configurations and a fatal shell-hook
+	// failure there would kill an assessment over terminal capture, which is one
+	// signal among many.
 	injectRC := true
-	if hostedLane && systemShellInitSourcesHook() {
+	if seeded && systemShellInitSourcesHook() {
 		injectRC = false
-		verbosef("hosted lane: system shell init already sources the hook — skipping RC injection")
+		verbosef("seeded: system shell init already sources the hook — skipping RC injection")
 	}
 	_, shellErr := installShellHookWithRC(injectRC)
 	if shellErr != nil {
@@ -793,34 +789,6 @@ func cmdStart(args []string) {
 		}
 	}
 
-	// Hosted-lane boot report (§3.9). Started here, and not earlier, because it
-	// needs session.TreeVerification from the adopt step above and the session
-	// token saved just now.
-	//
-	// Started, not awaited. session.StartedAt is already set, so everything from
-	// this point is on the candidate's clock, and the report makes TWO sequential
-	// network calls — GitHub, then our API — each with httpClient's 15s timeout.
-	// Run inline that is up to 30 seconds of assessment time spent before the
-	// watchers are up and the brief is on screen, for telemetry the candidate
-	// cannot act on. It now overlaps the rest of `start` and is joined at the end
-	// with a short grace; see awaitHostedBootReport.
-	//
-	// The session is passed by value rather than captured, so nothing here shares
-	// mutable state with the rest of start.
-	//
-	// Unlike the device check this prints NOTHING on failure. A candidate cannot
-	// act on our telemetry and the clock is theirs; and an absent report is
-	// already a first-class server-side state (`uninstrumented-start`), so
-	// silence here is visible over there rather than lost.
-	var hostedBootDone chan struct{}
-	if hostedLane {
-		hostedBootDone = make(chan struct{})
-		go func(s Session) {
-			defer close(hostedBootDone)
-			reportHostedBoot(s)
-		}(session)
-	}
-
 	startStep(7, 7, "Enabling optional /explain...")
 	initNudgeState()
 	endStep(7, 7, "Optional /explain ready", "commentary on your decisions, only if you want")
@@ -860,20 +828,20 @@ func cmdStart(args []string) {
 		fmt.Println()
 	}
 	// setupInstructions is DISPLAY-ONLY on every lane — the CLI never executes it,
-	// it just prints it — which is exactly why it is dangerous here. On the hosted
-	// lane the stored text tells the candidate to clone and check out, and a
+	// it just prints it — which is exactly why it is dangerous here. In a seeded
+	// box the stored text tells the candidate to clone and check out, and a
 	// candidate who follows it lands in a second checkout that `done` does not
 	// bundle. Backend #789 already serves lane-aware text (§3.2); this is the
 	// defense in depth behind it, and it is reliable in a way it would not be on
-	// the local lane because the hosted image bakes this binary in — no version skew.
-	if strings.TrimSpace(session.SetupInstructions) != "" && !hostedLane {
+	// the local lane because the box image bakes this binary in — no version skew.
+	if strings.TrimSpace(session.SetupInstructions) != "" && !seeded {
 		fmt.Printf("  %s\n", infoLabel.Render("Setup / How to run:"))
 		for _, line := range strings.Split(session.SetupInstructions, "\n") {
 			fmt.Printf("  %s\n", infoText.Render(line))
 		}
 		fmt.Println()
 	}
-	if hostedLane {
+	if seeded {
 		fmt.Printf("  %s\n", infoLabel.Render("Your environment:"))
 		for _, line := range hostedBriefLines() {
 			fmt.Printf("  %s\n", infoText.Render(line))
@@ -916,12 +884,12 @@ func cmdStart(args []string) {
 	warnBody := lipgloss.NewStyle().
 		Foreground(cWarnText)
 	var warnContent strings.Builder
-	if hostedLane {
+	if seeded {
 		// The local-lane warning tells the candidate not to open their editor
-		// somewhere else. In a codespace there IS nowhere else — the terminal they
-		// are reading this in is already in the workspace — and the mistake that
-		// actually happens here is the opposite one: making a second checkout.
-		warnContent.WriteString(warnHeading.Render("⚠  Work here, in this codespace"))
+		// somewhere else. In a prepared box there IS nowhere else — the editor
+		// they are reading this in is already in the workspace — and the mistake
+		// that actually happens here is the opposite one: making a second checkout.
+		warnContent.WriteString(warnHeading.Render("⚠  Work here, in this workspace"))
 		warnContent.WriteString("\n")
 		warnContent.WriteString(warnBody.Render(strings.Join(wordWrap(
 			"Do not clone the repository again. Promptster submits the working tree "+
@@ -949,34 +917,6 @@ func cmdStart(args []string) {
 	fmt.Printf("  %s\n", dimText.Render("The task brief is also saved in TASK.md in your workspace."))
 	fmt.Println()
 
-	// Last thing before the process exits, so the report gets the whole of the
-	// output above as free overlap and holds the candidate's terminal for at most
-	// the grace below.
-	awaitHostedBootReport(hostedBootDone)
-}
-
-// hostedBootGrace bounds how long `start` will hold the terminal waiting
-// for our own telemetry once everything the candidate needs is on screen.
-//
-// A grace is needed at all because `start` exits when it returns: with no wait,
-// a report launched moments earlier would be killed mid-flight on nearly every
-// run and the lane would look uninstrumented for a reason that has nothing to do
-// with the box. It is deliberately far below httpClient's 15s per-call timeout —
-// abandoning a slow report costs a data point, and the sentinel is only written
-// after the POST succeeds, so the next `start` retries. Waiting costs the
-// candidate their clock, and that trade is not close.
-const hostedBootGrace = 3 * time.Second
-
-// awaitHostedBootReport joins the in-flight hosted-boot report, or gives up.
-func awaitHostedBootReport(done <-chan struct{}) {
-	if done == nil {
-		return
-	}
-	select {
-	case <-done:
-	case <-time.After(hostedBootGrace):
-		verbosef("hosted-boot: still in flight after %s — abandoning it; the sentinel is unwritten, so the next start retries", hostedBootGrace)
-	}
 }
 
 // nextStepLaunch returns the launch command, its description, and the tool

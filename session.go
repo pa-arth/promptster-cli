@@ -46,10 +46,6 @@ type Session struct {
 	// (design.md §5). Empty when the server does not send it — that is an
 	// unverified adopt, reported loudly, never a silent pass.
 	ExpectedTreeSha string `json:"expectedTreeSha,omitempty"`
-	// HostedLane records that this session adopted a hosted checkout, so `done`,
-	// `abort` and `doctor` still know the lane in a shell whose environment has
-	// been stripped.
-	HostedLane bool `json:"hostedLane,omitempty"`
 	// TreeVerification is the adopt verdict for the record: "verified",
 	// "unverified", or absent on the local lane. The two fatal states never
 	// reach a saved session — `start` exits on them.
@@ -133,9 +129,16 @@ type Session struct {
 	NoSelfEvict bool `json:"noSelfEvict,omitempty"`
 	// SeededAt records that this session arrived on disk as BYTES written by the
 	// provisioning worker rather than through `promptster redeem` on this
-	// machine. Kept as a record, not a switch — nothing branches on it — because
-	// "the CLI never redeemed here" is the fact that explains every other unusual
-	// thing about such a session to whoever reads it next.
+	// machine. It is the fact that explains every other unusual thing about such
+	// a session to whoever reads it next.
+	//
+	// ⚠ It BRANCHES now, which it did not before. 2.4i deleted `HostedLane` and
+	// the `inCodespace()` probe behind it, and the two places that read the old
+	// flag for a reason that was never about GitHub — "is this a machine the
+	// candidate owns and has to clean up?" — read this instead, through
+	// `seededSession`. Everything else the flag gated WAS about Codespaces (the
+	// automatic-fork-on-commit hazard, `gh codespace delete`, the storage
+	// allowance) and is gone rather than moved.
 	SeededAt time.Time `json:"seededAt,omitempty"`
 	// CaptureMode selects the Claude Code capture channel:
 	//   ""/"hooks"   — hook-driven capture (default)
@@ -279,4 +282,23 @@ func cleanupPromptsterState(taskRoot string) {
 		// .cursor/hooks.json at all (openspec changes/employer-supplied-model-key),
 		// so there is nothing of ours left in the candidate's workspace to restore.
 	}
+}
+
+// seededSession reports whether this session was written by the provisioning
+// worker into a box we own — as opposed to redeemed by a candidate on a machine
+// that is theirs.
+//
+// This is the successor to `hostedLaneActive`, narrowed on purpose. The old
+// predicate answered "are we on the hosted lane", ORed an env probe over a
+// session flag, and gated four unrelated behaviours. Three of those four existed
+// only because the machine was a GitHub Codespace and went with it. What is left
+// is the one question that still has two answers: does the candidate own this
+// machine and have to clean it up afterwards? In a seeded box they do not.
+//
+// Reads the SESSION rather than the environment. There is no `CODESPACES`
+// equivalent to probe for inside a box, and the session file is the stronger
+// signal anyway — it survives a `done` or `doctor` run in a bare `sh -c` whose
+// environment carries nothing.
+func seededSession(s Session) bool {
+	return !s.SeededAt.IsZero()
 }

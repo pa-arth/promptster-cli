@@ -34,19 +34,24 @@ func cmdCleanup(args []string) {
 	fs := flag.NewFlagSet("cleanup", flag.ContinueOnError)
 	reason := fs.String("reason", "manual", "Why cleanup is running (logged, surfaces in --verbose)")
 	verbose := fs.Bool("verbose", false, "Print each step")
-	// abort NEVER deletes the codespace on its own (openspec §2.5). Abort is the
-	// path where nothing was uploaded, so the box holds the only copy of whatever
-	// the candidate did — and one of abort's three callers is the shell hook's
-	// unattended TTL self-eviction, which would otherwise delete a running
+	// abort NEVER tears the workspace down on its own (openspec §2.5). Abort is
+	// the path where nothing was uploaded, so the box holds the only copy of
+	// whatever the candidate did — and one of abort's three callers is the shell
+	// hook's unattended TTL self-eviction, which would otherwise destroy a running
 	// candidate's machine out from under them the moment their key aged out.
-	deleteCodespace := fs.Bool("delete-codespace", false, "Also delete the GitHub Codespace this is running in (hosted lane; off by default — abort does not upload)")
+	//
+	// 2.4i made this structural rather than a decision we keep making: the
+	// `--delete-codespace` flag that could opt into it is gone with the host, and
+	// the box's lifecycle belongs to the provisioner, not to the CLI inside it.
 	fs.Parse(args) //nolint:errcheck
 
 	// Best-effort session load — cleanup must work even if session.json is
 	// corrupt or missing (otherwise the abandoned-session case can't recover).
 	var taskRoot string
+	var session Session
 	if s, err := loadSession(); err == nil {
 		taskRoot = s.TaskRoot
+		session = s
 	}
 
 	if *verbose {
@@ -78,11 +83,14 @@ func cmdCleanup(args []string) {
 	if *verbose {
 		fmt.Fprintln(os.Stderr, "promptster cleanup: done")
 	}
-	if !inCodespace() {
+	// 2.4i removed the `--delete-codespace` arm that used to follow this. The
+	// hint is suppressed on a SEEDED box for the reason it was suppressed in a
+	// codespace: it warns that a personal shell has been left carrying assessment
+	// proxy env, and there is no personal shell in a machine we own and discard.
+	// The box's teardown is ours — the provisioner pauses it and E2B's lifecycle
+	// reaps it — so there is nothing for the candidate to delete and no flag to
+	// ask them for.
+	if !seededSession(session) {
 		printShellProxyEnvClearHint()
-	}
-
-	if *deleteCodespace && inCodespace() {
-		printCodespaceWindDown(deleteHostingCodespace())
 	}
 }

@@ -70,13 +70,15 @@ type RedeemResponse struct {
 	RepoSubdir        string `json:"repoSubdir"`
 	// HostingLane is "hosted" or "local" (backend #789). Read but NOT acted on:
 	// it is the RECRUITER's offer, and a candidate offered the hosted lane can
-	// still clone locally. What lane this session is actually on is decided by
-	// the environment the CLI finds itself in (see inCodespace), which is the
-	// same reasoning the backend applies when a boot report arrives.
+	// still clone locally. What this invocation actually does is decided by how
+	// it was started — `--seeded` means the provisioner already wrote the session
+	// and the tree — which is the same reasoning the backend applies when a boot
+	// report arrives.
 	HostingLane string `json:"hostingLane,omitempty"`
-	// HostedLaunchUrl is the codespaces.new deep link for the mirror (backend
-	// #789). Carried so `doctor` can point a candidate at the right box.
-	HostedLaunchUrl string `json:"hostedLaunchUrl,omitempty"`
+	// ⛔ `HostedLaunchUrl` is GONE (2.4i, backend #852). It held a `codespaces.new`
+	// deep link and the server no longer sends the field. Nothing replaces it: on
+	// the box the CLI is already INSIDE the workspace, so a URL that opens one is
+	// not a thing it could ever need.
 	// ExpectedTreeSha is the mirror tree `start --adopt` verifies against.
 	//
 	// ⚠ THE BACKEND DOES NOT SEND THIS YET. `oss_issues` has `mirror_repo_slug`
