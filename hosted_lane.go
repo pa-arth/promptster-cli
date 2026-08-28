@@ -12,21 +12,35 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-// The hosted lane — a GitHub Codespace created from a per-problem mirror repo,
-// where the container the candidate is sitting in ALREADY contains the
-// assessment tree (openspec changes/codespaces-hosted-assessment §2).
+// Adopting a workspace that already exists (openspec
+// changes/codespaces-hosted-assessment §2, and `private-problem-sandbox-lane`
+// §8.4's `start --seeded`).
 //
-// The single fact that shapes everything here: on this lane there is nothing to
+// The single fact that shapes everything here: sometimes there is nothing to
 // clone. `prepareWorkspaceCheckout` would materialise a SECOND tree beside the
-// mirror the container was built from, and TaskRoot would follow it — the
-// candidate then works in one tree while `done` bundles another, and the loss is
-// silent because an empty diff and an untouched tree look identical. So the
-// hosted lane ADOPTS the checkout it is sitting in and verifies it by content.
+// one the candidate is looking at, and TaskRoot would follow it — the candidate
+// then works in one tree while `done` bundles another, and the loss is silent
+// because an empty diff and an untouched tree look identical. So this path
+// ADOPTS the checkout it is pointed at and verifies it by content.
 //
-// Verification is by TREE, never by remote. GitHub reassigns `origin` to the
+// ⚠ WRITTEN FOR GITHUB CODESPACES, WHICH IS GONE. 2.4i repointed the hosted lane
+// onto the E2B box (2026-08-27) and the Codespaces halves of this file went with
+// it: `inCodespace`, `codespaceName`, the `/workspaces` probe, `gh codespace
+// delete`, the `doctor` section, and the whole `hosted_boot.go` reporter — which
+// read boot facts off GitHub's codespaces API and has no successor here, because
+// the box's boot is reported by the WORKER that provisioned it.
+//
+// What survived is everything that was never about the host. `--seeded` lands in
+// a box whose tree was written from the published snapshot, and it faces the
+// identical hazard for the identical reason.
+//
+// Verification is by TREE, never by remote — and that outlived its original
+// justification. It was chosen because GitHub reassigns `origin` to the
 // candidate's automatic fork the moment a commit is made from a read-only
-// codespace (design.md §2), so a remote-based check would start failing for a
-// reason that has nothing to do with whether the tree is right.
+// codespace (design.md §2), so a remote check would fail for a reason unrelated
+// to whether the tree was right. The box has no such behaviour, and the choice
+// is still correct: a remote is a claim about where bytes came from, and the
+// question is what bytes are here.
 
 // Tree-verification states for an adopted checkout. The three failing states are
 // deliberately distinct: "the tree is wrong" and "nobody told us what the tree
@@ -45,35 +59,6 @@ const (
 	// submit from a path that is not a repository.
 	hostedTreeUnreadable = "unreadable"
 )
-
-// inCodespace reports whether this process is running inside a GitHub Codespace.
-//
-// Both variables are checked because they fail in opposite directions:
-// `CODESPACES` is the documented boolean but is easy to shadow, and
-// `CODESPACE_NAME` is the one `gh codespace delete` needs anyway — a box that
-// has the name but not the flag is still a box we can act on.
-func inCodespace() bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("CODESPACES"))) {
-	case "true", "1", "yes":
-		return true
-	}
-	return strings.TrimSpace(os.Getenv("CODESPACE_NAME")) != ""
-}
-
-// codespaceName returns $CODESPACE_NAME, the handle `gh codespace` addresses.
-func codespaceName() string {
-	return strings.TrimSpace(os.Getenv("CODESPACE_NAME"))
-}
-
-// hostedLaneActive reports whether this session is running on the hosted lane.
-//
-// The env is the authority while we are inside the box; the session flag carries
-// the fact into a `done`/`doctor` run whose environment has been stripped (a
-// bare `sh -c`, a detached process), so a hosted session never silently reverts
-// to local-lane behaviour halfway through.
-func hostedLaneActive(s Session) bool {
-	return s.HostedLane || inCodespace()
-}
 
 // adoptOutcome is the result of checking an adopted checkout against the tree
 // the session says the assessment is.
@@ -190,20 +175,6 @@ func singleSubdirectory(root string) string {
 	return found
 }
 
-// codespaceWorkspaceCandidates lists paths that may hold the mirror checkout,
-// most-authoritative first. Only consulted when the cwd is not itself a
-// checkout — a candidate who ran `promptster start` from somewhere else.
-func codespaceWorkspaceCandidates() []string {
-	var out []string
-	if f := strings.TrimSpace(os.Getenv("CODESPACE_VSCODE_FOLDER")); f != "" {
-		out = append(out, f)
-	}
-	if only := singleSubdirectory("/workspaces"); only != "" {
-		out = append(out, only)
-	}
-	return out
-}
-
 // resolveAdoptWorkspace finds the checkout to adopt. It never prompts and never
 // creates anything: on this lane the tree already exists, and a path we had to
 // invent is by definition not the one the container was built from.
@@ -221,37 +192,7 @@ func resolveAdoptWorkspace(flagValue string) (string, error) {
 			return top, nil
 		}
 	}
-	for _, c := range codespaceWorkspaceCandidates() {
-		if top, err := gitToplevel(c); err == nil {
-			return top, nil
-		}
-	}
 	return "", fmt.Errorf("could not find the assessment checkout to adopt — run promptster start from inside it, or pass --workspace PATH")
-}
-
-// hostedSetupMarkerPath is where the devcontainer's onCreateCommand records that
-// it ran to completion (openspec §1.3 generates the lifecycle command; this is
-// the file it must touch as its last step).
-//
-// Deliberately OUTSIDE the workspace: anything written inside the repo shows up
-// in the candidate's diff and in the bundle, so a health marker would become
-// evidence in their submission.
-func hostedSetupMarkerPath() string {
-	if p := strings.TrimSpace(os.Getenv("PROMPTSTER_HOSTED_SETUP_MARKER")); p != "" {
-		return p
-	}
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".promptster", "hosted-setup-complete")
-}
-
-// hostedSetupCompleted reports whether the onCreateCommand marker is present.
-//
-// Absent is NOT reported as "setup failed" by the caller: an image built before
-// this marker contract existed also has no marker. The two are distinguished in
-// the copy, not collapsed into a verdict we cannot support.
-func hostedSetupCompleted() bool {
-	_, err := os.Stat(hostedSetupMarkerPath())
-	return err == nil
 }
 
 // dirsSkippedInNestedScan are directories that legitimately contain vendored
@@ -320,71 +261,36 @@ func nestedGitCheckouts(root string, maxDepth int) []string {
 	return found
 }
 
-// deleteHostingCodespace attempts to delete the codespace this process is running
-// in (design.md §7: delete, never stop — a stopped codespace keeps consuming the
-// candidate's 15 GB-month allowance for up to 30 days).
-//
-// Best-effort BY CONSTRUCTION, not by politeness. Two things are unmeasured
-// (task 0.2, not run): whether the ambient GITHUB_TOKEN carries codespace scope
-// at all, and whether a codespace can delete itself while running. Nothing may
-// depend on this succeeding, which is why the caller prints the manual link
-// either way and why this is the very last thing `done` does.
-func deleteHostingCodespace() error {
-	name := codespaceName()
-	if name == "" {
-		return fmt.Errorf("CODESPACE_NAME is not set")
-	}
-	if _, err := exec.LookPath("gh"); err != nil {
-		return fmt.Errorf("gh CLI not found in PATH")
-	}
-	out, err := exec.Command("gh", "codespace", "delete", "--codespace", name, "--force").CombinedOutput()
-	if err != nil {
-		msg := strings.TrimSpace(string(out))
-		if msg == "" {
-			return err
-		}
-		return fmt.Errorf("%v: %s", err, msg)
-	}
-	return nil
-}
-
-const codespacesListURL = "https://github.com/codespaces"
-
-// printCodespaceWindDown says what happened to the box, in one line either way.
-//
-// The manual link is printed on SUCCESS too. Self-deletion is unverified, so a
-// zero exit is not proof the box is gone, and a candidate who is told nothing
-// after a successful-looking delete has no way to check.
-func printCodespaceWindDown(deleteErr error) {
-	dim := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-	link := lipgloss.NewStyle().Foreground(lipgloss.Color("12")).Underline(true)
-	fmt.Println()
-	if deleteErr == nil {
-		fmt.Println(dim.Render("This codespace has been deleted so it stops using your GitHub storage allowance."))
-	} else {
-		fmt.Println(dim.Render(fmt.Sprintf("Could not delete this codespace automatically (%v).", deleteErr)))
-		fmt.Println(dim.Render("Please delete it yourself — a stopped codespace keeps using your storage allowance for up to 30 days."))
-	}
-	fmt.Printf("%s %s\n", dim.Render("Your codespaces:"), link.Render(codespacesListURL))
-}
-
-// hostedBriefLines is the hosted lane's replacement for the local lane's
+// hostedBriefLines is the seeded box's replacement for the local lane's
 // clone-and-open guidance. Every line here is false on the local lane, and the
-// two lines it replaces are false on this one.
+// two lines it replaces are false in a box.
+//
+// The third line CHANGED with 2.4i and the change is not cosmetic. It used to
+// promise that `done` "deletes this codespace" — true, and load-bearing, because
+// the machine was the candidate's and kept billing their storage allowance for
+// 30 days if merely stopped. The box is ours and the provisioner pauses it, so
+// the CLI no longer tears anything down and must not say it does. A promise the
+// binary has stopped keeping is worse than no promise: the candidate who
+// believes it goes looking for a machine to clean up and finds nothing.
 func hostedBriefLines() []string {
 	return []string{
-		"This codespace IS your workspace — there is nothing to clone or set up.",
+		"This workspace IS your assessment — there is nothing to clone or set up.",
 		"You do not need to commit. `promptster done` captures your working tree.",
-		"When you are finished, run `promptster done`: it submits your work and then deletes this codespace.",
+		"When you are finished, run `promptster done`: it submits your work. The machine is ours and shuts down on its own.",
 	}
 }
 
-// The marker body and its reader now live in hosted_boot.go (§3.9).
+// ⛔ The setup marker and its reader are GONE with hosted_boot.go (2.4i). They
+// belonged to the Codespaces devcontainer's `onCreateCommand`, and the box's
+// equivalent — did setup finish, and was the tree seeded correctly — is observed
+// by the WORKER at provision time and written to `candidate_keys.metadata`,
+// where it is durable and not a file the candidate could delete.
 //
-// This file previously declared it as `{prebuilt, bootSeconds}` — a placeholder
-// written before §1.3 existed, and the wrong two fields. `onCreateCommand`
-// cannot know either: it finishes before there is a terminal to time the boot
-// to, and on a prebuilt box it ran days earlier in a different container
+// The historical note, kept because it is the reason the shape was what it was:
+// this file once declared the marker as `{prebuilt, bootSeconds}` — a
+// placeholder written before §1.3 existed, and the wrong two fields.
+// `onCreateCommand` cannot know either: it finishes before there is a terminal
+// to time the boot to, and on a prebuilt box it ran days earlier in a different container
 // generation, so it cannot say whether THIS container came from a prebuild.
 // Both are GitHub's to answer. Nothing ever wrote that shape — there are no
 // mirrors yet — so this replaces a guess, not a producer.
@@ -505,112 +411,4 @@ func diffBaseFor(s Session) string {
 		return strings.TrimSpace(s.DiffBaseCommit)
 	}
 	return s.RepoCommit
-}
-
-// doctorHostedLane prints the hosted-lane section of `promptster doctor`.
-//
-// Every check here answers the same question — is the candidate about to spend
-// 75 minutes working somewhere that will not be submitted — and answers it at
-// minute one. The nested-checkout check is the one that earns the section: a
-// second clone is invisible while you work, produces an empty diff at the end,
-// and by then the assessment is over.
-func doctorHostedLane(session Session, sessionErr error) {
-	if !inCodespace() && !(sessionErr == nil && session.HostedLane) {
-		return
-	}
-
-	fmt.Println("Hosted lane (GitHub Codespaces)")
-
-	check("Codespace detected", func() (string, string) {
-		if name := codespaceName(); name != "" {
-			return name, ""
-		}
-		if inCodespace() {
-			return "yes (CODESPACE_NAME not set)", ""
-		}
-		// The session says hosted but this shell is not in a codespace. Said
-		// plainly rather than failed: a manager reproducing a candidate's session
-		// on a laptop is a legitimate reason to be here.
-		return "", "this session was started on the hosted lane, but this shell is not inside a codespace\n" +
-			"    Nothing is broken; hosted-lane checks below cannot be run from here."
-	})
-
-	check("Setup command completed", func() (string, string) {
-		marker, ok := readHostedSetupMarker()
-		if !ok {
-			// TWO causes, and they must not be merged. `onCreateCommand` may have
-			// failed — in which case the task's dependencies are missing and this
-			// is the most important line in the output — or the image may predate
-			// the marker contract, in which case nothing is wrong. Reporting a
-			// confident "setup failed" for the second would be a false alarm on
-			// every older box; reporting a green for the first is the collapse
-			// §3.4 names by hand (no telemetry read as no problems).
-			return "", "no completion marker at " + hostedSetupMarkerPath() + "\n" +
-				"    Either the environment's setup command did not finish, or this image\n" +
-				"    predates the marker. If dependencies are missing, that is the first cause.\n" +
-				"    Fix: re-create the codespace, or run the assessment's setup command by hand."
-		}
-		detail := "yes"
-		if marker.SetupSeconds != nil {
-			// SETUP time, and labelled as such. It is not the boot budget: on a
-			// prebuilt box this elapsed on GitHub's clock during the prebuild, not
-			// on the candidate's.
-			detail += fmt.Sprintf(" (setup took %ds)", *marker.SetupSeconds)
-		}
-		return detail, ""
-	})
-
-	if sessionErr == nil && strings.TrimSpace(session.TaskRoot) != "" {
-		root := session.TaskRoot
-
-		check("Workspace tree matches the assessment", func() (string, string) {
-			actual, err := readTreeSha(root)
-			o := evaluateAdoptedTree(session.ExpectedTreeSha, actual, err)
-			switch o.State {
-			case hostedTreeVerified:
-				return o.Actual, ""
-			case hostedTreeUnverified:
-				return "", "this assessment did not say which tree to expect — the check could not run\n" +
-					"    this tree: " + o.Actual + "\n" +
-					"    Not a pass. If the task brief does not describe the code here, stop and report it."
-			case hostedTreeMismatch:
-				return "", "this workspace is NOT the assessment's code\n" +
-					"    expected " + o.Expected + "\n" +
-					"      actual " + o.Actual + "\n" +
-					"    Fix: report this — the environment was built from the wrong source."
-			default:
-				return "", "could not read the tree at " + root + "\n    Fix: report this; your work could not be submitted from here."
-			}
-		})
-
-		check("No nested git repository under the workspace", func() (string, string) {
-			nested := nestedGitCheckouts(root, 4)
-			if len(nested) == 0 {
-				return "none", ""
-			}
-			var b strings.Builder
-			b.WriteString("a second checkout exists inside your workspace:\n")
-			for _, p := range nested {
-				b.WriteString("      " + p + "\n")
-			}
-			b.WriteString("    Work done in there is NOT captured and will NOT be submitted — only\n")
-			b.WriteString("    " + root + " is.\n")
-			b.WriteString("    Fix: move your changes into the workspace above and delete the second copy.")
-			return "", b.String()
-		})
-	}
-
-	check("Terminal capture hook active", func() (string, string) {
-		if systemShellInitSourcesHook() {
-			return "system shell init", ""
-		}
-		for _, rc := range shellRCPathsForInstall() {
-			if alreadyHasHook(rc) {
-				return rc, ""
-			}
-		}
-		return "", "the shell hook is not sourced anywhere — terminal commands will not be captured\n    Fix: re-run promptster start"
-	})
-
-	fmt.Println()
 }

@@ -94,8 +94,10 @@ type submitCodePayload struct {
 // submitWorkspaceCode bundles and delivers the candidate's workspace.
 //
 // Returns (uploaded, closedByServer). `uploaded` is true only when bytes were
-// ACCEPTED — it is what gates the irreversible codespace teardown, so it must
-// never be true for a path where the work did not reach us. `closedByServer`
+// ACCEPTED, so it must never be true for a path where the work did not reach us.
+// It used to gate the irreversible codespace teardown; 2.4i removed that
+// teardown, and the rule stands on its own — `done` tells the candidate they
+// submitted, and that sentence must be true. `closedByServer`
 // says the refusal was the server's ordinary close of an expired assessment
 // rather than a failure, which is the difference between telling the candidate
 // "submitted" and telling them their work was lost.
@@ -124,20 +126,25 @@ func submitWorkspaceCode(session Session, autoSubmit bool) (bool, bool) {
 	// silently. The diff below does NOT depend on this commit succeeding —
 	// it diffs the working tree directly — so a failure here is non-fatal.
 	//
-	// NOT RUN ON THE HOSTED LANE, and that is a privacy mechanism rather than a
-	// tidy-up (design.md §2). The candidate has read-only access to the mirror,
-	// and GitHub creates a PUBLIC FORK under their account when a commit is made
-	// from such a codespace — a repo named after the assessment problem, on their
-	// profile, disclosing their job search to their current employer. Suppressing
-	// our own commit is the one half of that we control.
+	// ⛔ THIS USED TO BE SUPPRESSED ON THE HOSTED LANE, and 2.4i is what makes it
+	// run everywhere. The suppression was a privacy mechanism, not a tidy-up
+	// (design.md §2): the candidate had read-only access to the mirror, and GitHub
+	// creates a PUBLIC FORK under their account when a commit is made from such a
+	// codespace — a repo named after the assessment problem, on their profile,
+	// disclosing their job search to their current employer.
 	//
-	// It costs nothing because the commit was already best-effort by design:
-	// `git ls-files` reads the INDEX (after `git add -A` above) and `git diff
-	// <base>` compares the WORKING TREE to the base, so neither the bundle nor
-	// the diff has ever depended on a commit existing.
-	if !recordSubmissionCommit(session, taskRoot) {
-		fmt.Printf("  %s Capturing your working tree (no commit needed on this lane)...\n", dim.Render("●"))
-	}
+	// **That hazard is GitHub's, and it left with GitHub.** A provisioned box has
+	// no `origin` we do not control, no account attached to the candidate, and
+	// nothing that forks on commit. Keeping the suppression would have cost the
+	// audit-trail commit on the lane that will carry most assessments, to protect
+	// against a mechanism that is no longer in the picture.
+	//
+	// Restoring it also costs nothing, for the same reason suppressing it did:
+	// the commit is best-effort by design. `git ls-files` reads the INDEX (after
+	// `git add -A` above) and `git diff <base>` compares the WORKING TREE to the
+	// base, so neither the bundle nor the diff has ever depended on a commit
+	// existing.
+	recordSubmissionCommit(taskRoot)
 
 	// Unified diff: compare the *working tree* (== index after `git add -A`)
 	// to the known base commit. Crucially this does NOT require the commit
@@ -164,13 +171,13 @@ func submitWorkspaceCode(session Session, autoSubmit bool) (bool, bool) {
 	// by following setupInstructions). Those are opposite outcomes and must not
 	// look identical, so go looking before accepting the empty result.
 	if diff == "" {
-		// Same base the diff and the bundle used, NOT session.RepoCommit. On the
-		// hosted lane RepoCommit is upstream's brokenSha and names no object in
-		// the mirror, so isAssessmentCheckout's commit signal never fires and its
-		// URL signal compares upstream against the mirror's origin — the guard
-		// would be silently inert on the one lane where a second checkout is
-		// easiest to create. Off the hosted lane diffBaseFor returns RepoCommit,
-		// so this is the same value it always was.
+		// Same base the diff and the bundle used, NOT session.RepoCommit. On an
+		// adopted checkout RepoCommit is upstream's brokenSha and names no object
+		// in the seeded tree, so isAssessmentCheckout's commit signal never fires
+		// and its URL signal compares upstream against a different origin — the
+		// guard would be silently inert on the one lane where a second checkout is
+		// easiest to create. Off that lane diffBaseFor returns RepoCommit, so this
+		// is the same value it always was.
 		if stranded := detectStrandedWork(taskRoot, base, session.RepoURL); len(stranded) > 0 {
 			reportStrandedWork(taskRoot, stranded)
 			if !autoSubmit {
@@ -284,13 +291,13 @@ func apiSubmitCode(token string, payload submitCodePayload) error {
 	return nil
 }
 
-// recordSubmissionCommit makes the audit-trail commit, and reports whether it
-// was attempted at all. Returns false on the hosted lane, where the commit is
-// deliberately not made — see the comment at its call site.
-func recordSubmissionCommit(session Session, taskRoot string) bool {
-	if hostedLaneActive(session) {
-		return false
-	}
+// recordSubmissionCommit makes the audit-trail commit.
+//
+// It no longer takes the session, and no longer returns whether it ran: the one
+// caller that made it conditional was the Codespaces fork hazard, retired by
+// 2.4i. See the comment at the call site for why that is safe rather than merely
+// simpler.
+func recordSubmissionCommit(taskRoot string) {
 	if _, err := runCommand(taskRoot,
 		"git",
 		"-c", "user.name=Promptster Candidate",
@@ -300,5 +307,4 @@ func recordSubmissionCommit(session Session, taskRoot string) bool {
 	); err != nil {
 		fmt.Fprintf(os.Stderr, "  warning: git commit failed (continuing — diff is taken from working tree): %v\n", err)
 	}
-	return true
 }

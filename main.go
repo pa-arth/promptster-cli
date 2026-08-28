@@ -203,7 +203,7 @@ Flags for start:
   --accept-tos      Accept terms of service non-interactively (scripted use)
   --workspace PATH  Use PATH as workspace directory (skip interactive prompt)
   --adopt           Use the checkout that is already here instead of cloning one
-                    (defaults ON inside a GitHub Codespace; --adopt=false forces a clone)
+                    (implied by --seeded; --adopt=false forces a clone)
   --seeded          Start from a session the provisioning worker already wrote to
                     disk: no redeem, no consent prompt, no key argument
   --restart         Offer to restart running editors so they reload hooks
@@ -211,10 +211,6 @@ Flags for start:
 
 Flags for done:
   --auto            Auto-submit mode (skip pending-decision check)
-
-Flags for abort:
-  --delete-codespace  Delete the GitHub Codespace too (hosted lane; off by default —
-                      abort uploads nothing, so the box holds the only copy)
 
 Flags for redeem:
   --accept-tos      Accept terms of service non-interactively (scripted use)

@@ -138,27 +138,32 @@ func cmdDone(args []string) {
 	}
 	fmt.Println("Thank you for completing the assessment.")
 	fmt.Println(dim.Render("Your results will be available shortly."))
-	hosted := hostedLaneActive(session)
-	if session.TaskRoot != "" && !hosted {
+	// 2.4i: the question is no longer "which lane" but "does the candidate own
+	// this machine and have to clean it up". In a box we provisioned, they do not.
+	ours := seededSession(session)
+	if session.TaskRoot != "" && !ours {
 		fmt.Printf("\n%s %s\n",
 			dim.Render("You can safely delete your workspace when you're done:"),
 			lipgloss.NewStyle().Foreground(lipgloss.Color("14")).Render(session.TaskRoot))
 	}
-	if !hosted {
-		// Suppressed on the hosted lane: this warns that a PERSONAL shell has been
+	if !ours {
+		// Suppressed in a box we own: this warns that a PERSONAL shell has been
 		// left carrying assessment proxy env, and there is no personal shell in a
-		// disposable VM that is about to be deleted. Everything it protects —
-		// the marker fences, the sidecar state, the legacy purge above — still runs.
+		// disposable VM. Everything it protects — the marker fences, the sidecar
+		// state, the legacy purge above — still runs.
 		printShellProxyEnvClearHint()
 	}
 
-	// LAST, and only now. Deleting the codespace tears down the process printing
-	// this, so nothing may follow it, and it is gated on an upload that actually
-	// succeeded: `submitWorkspaceCode` returning true and `/complete` returning.
-	// Deleting a box whose work never reached us destroys the only copy.
-	if hosted && uploadConfirmed && inCodespace() {
-		printCodespaceWindDown(deleteHostingCodespace())
-	}
+	// ⛔ 2.4i deleted the teardown that used to be the last thing here:
+	// `gh codespace delete`, gated on a confirmed upload because deleting a box
+	// whose work never reached us destroys the only copy.
+	//
+	// It is not replaced, and the gate it needed is gone with it. The box's
+	// lifecycle belongs to the provisioner — `boxProvision.ts` pauses it and E2B's
+	// configured lifecycle reaps it — so the CLI inside it has nothing to tear
+	// down and no reason to hold the process open to try. A codespace was the
+	// candidate's, billed to them, and had to be deleted from inside because
+	// nothing else could reach it. This box is ours.
 }
 
 // copyToClipboard copies text to the system clipboard. Returns true on success.
