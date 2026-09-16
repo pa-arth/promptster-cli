@@ -8,4 +8,8 @@ promptster-cli
 npm/binaries/
 node_modules/
 .DS_Store
-.claude/
+# Contents, not the directory: `.claude/` wholesale also hid `.claude/skills/`,
+# which is where the verify-cli symlink lives. Worktrees and local settings stay
+# ignored; a re-include cannot work if the parent directory itself is excluded.
+.claude/*
+!.claude/skills/
