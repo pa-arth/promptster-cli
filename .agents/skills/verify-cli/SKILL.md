@@ -108,6 +108,11 @@ and measures nothing:
 - **`tools`** — `claude` / `codex` installed. `start --tools X` will not keep a
   tool whose binary is absent, so its flow **cannot** be verified on this
   machine. Say that; do not report a pass.
+- **`sessionLive`** — the sandbox session is still inside
+  `startedAt + timeLimitMinutes`. Past that, the CLI auto-submits, kills its own
+  watchers and deletes the session (`time_limit.go`); capture stops and the next
+  drive reports a confident **false FAIL** against a CLI that is working. Seen
+  for real on a sandbox left idle between drives. Run `down` then `up`.
 - **`processes.foreign`** — promptster processes belonging to the real install.
 
 ## 3. Drive

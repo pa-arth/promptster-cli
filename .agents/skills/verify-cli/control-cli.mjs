@@ -421,19 +421,40 @@ async function main() {
       checks.realSessionPresent = realSession;
       if (realSession) hints.push("This machine has a real active-workspace pointer. Never kill a promptster process outside the sandbox — it may be a live candidate's capture daemon.");
 
-      // 4. Which flows are verifiable at all on this machine?
+      // 4. Has the sandbox session aged out?
+      // Observed for real: a sandbox left idle past StartedAt + TimeLimitMinutes
+      // auto-submits (time_limit.go), which tears the session down and shuts the
+      // watchers off. Capture then stops, and the next drive reports a confident
+      // FALSE FAIL against a CLI that is working perfectly.
+      let sess = null;
+      try { sess = JSON.parse(fs.readFileSync(path.join(st.sbx, "state", "session.json"), "utf8")); } catch {}
+      if (sess?.startedAt && sess?.timeLimitMinutes > 0) {
+        const remainingMin = (new Date(sess.startedAt).getTime() + sess.timeLimitMinutes * 60_000 - Date.now()) / 60_000;
+        checks.sessionRemainingMinutes = Math.round(remainingMin);
+        checks.sessionLive = remainingMin > 5;
+        if (!checks.sessionLive) {
+          hints.push(remainingMin > 0
+            ? `The sandbox session has ${Math.round(remainingMin)} min left. Past the deadline the CLI auto-submits, kills the watchers and deletes the session — capture stops and the next drive reports a false FAIL. Run \`down\` then \`up\`.`
+            : "The sandbox session is PAST its deadline. The CLI has auto-submitted and torn itself down; anything you measure now is measuring that, not the feature. Run `down` then `up`.");
+        }
+      } else {
+        checks.sessionLive = null;
+      }
+
+      // 5. Which flows are verifiable at all on this machine?
       checks.tools = { claude: which("claude"), codex: which("codex"), cursor: which("cursor"), go: which("go"), git: which("git"), python3: which("python3") };
       for (const [t, p] of Object.entries(checks.tools)) {
         if (!p && ["go", "git", "python3"].includes(t)) hints.push(`${t} is not installed and is required. Install it.`);
         if (!p && ["claude", "codex"].includes(t)) hints.push(`${t} is not installed — \`start --tools ${t}\` will not keep that tool, so its flow cannot be verified here. Say so rather than reporting a pass.`);
       }
 
-      // 5. Processes
+      // 6. Processes
       const procs = st ? promptsterProcesses(st) : { ours: [], foreign: [] };
       checks.processes = procs;
       if (procs.foreign.length) hints.push(`${procs.foreign.length} promptster process(es) belong to the REAL install. They are not ours. \`down\` will not touch them and neither should you.`);
 
-      const healthy = checks.sandboxExists && checks.binaryCurrent && checks.binaryUnmodified && checks.sandboxIsolated && checks.realStateUnchanged;
+      const healthy = checks.sandboxExists && checks.binaryCurrent && checks.binaryUnmodified
+        && checks.sandboxIsolated && checks.realStateUnchanged && checks.sessionLive !== false;
       out({ healthy, sandbox: st?.sbx ?? null, evidence: EVIDENCE, checks, hints });
       if (!healthy) process.exit(1);
       return;
