@@ -198,42 +198,32 @@ function lastFrame(raw) {
 }
 
 // ptyRun drives a command under a real PTY so TUIs believe they have a terminal.
-// `script` is the stdlib answer here: no node-pty, no native build step.
+//
+// The PTY comes from pty-drive.py (python3 stdlib). `script(1)` was the obvious
+// choice and does not work: BSD script calls tcgetattr on its own stdin and dies
+// with "Operation not supported on socket" whenever an agent runs it with a pipe
+// for stdin, which is always. Verified on macOS 25.5.
+const PTY_DRIVE = path.join(HERE, "pty-drive.py");
+
 function ptyRun(st, args, { keys = [], timeoutMs = 15_000, settleMs = 1200 }) {
-  return new Promise((resolve) => {
-    guardArgs(args);
-    const quoted = [st.bin, ...args].map((a) => `'${String(a).replace(/'/g, `'\\''`)}'`).join(" ");
-    const [c, a] = process.platform === "darwin"
-      ? ["script", ["-q", "/dev/null", "/bin/sh", "-c", quoted]]   // BSD
-      : ["script", ["-qfec", quoted, "/dev/null"]];                // util-linux
-
-    const t0 = Date.now();
-    let raw = "";
-    let done = false;
-    const child = spawn(c, a, { env: envFor(st), cwd: path.join(st.sbx, "ws"), stdio: ["pipe", "pipe", "pipe"] });
-    child.stdout.on("data", (d) => (raw += d.toString("utf8")));
-    child.stderr.on("data", (d) => (raw += d.toString("utf8")));
-
-    const finish = (why) => {
-      if (done) return;
-      done = true;
-      clearTimeout(hard);
-      try { child.kill("SIGKILL"); } catch {}
-      resolve({ argv: args, raw, screen: lastFrame(raw), ms: Date.now() - t0, endedBy: why });
-    };
-    const hard = setTimeout(() => finish("timeout"), timeoutMs);
-    child.on("close", () => finish("exit"));
-    child.on("error", (e) => { raw += `\n[spawn error] ${e.message}\n`; finish("error"); });
-
-    // Let the first frame paint, then send keystrokes with a beat between them.
-    setTimeout(async () => {
-      for (const k of keys) {
-        if (done) break;
-        try { child.stdin.write(k === "\\n" ? "\n" : k); } catch {}
-        await new Promise((r) => setTimeout(r, 300));
-      }
-    }, settleMs);
+  guardArgs(args);
+  const t0 = Date.now();
+  const r = spawnSync("python3", [
+    PTY_DRIVE,
+    "--keys", keys.join(","),
+    "--settle", String(settleMs),
+    "--timeout", String(timeoutMs),
+    "--", st.bin, ...args,
+  ], {
+    env: envFor(st),
+    cwd: path.join(st.sbx, "ws"),
+    encoding: "buffer",
+    timeout: timeoutMs + 10_000,
+    maxBuffer: 32 * 1024 * 1024,
   });
+  const raw = (r.stdout || Buffer.alloc(0)).toString("utf8");
+  const diag = (r.stderr || Buffer.alloc(0)).toString("utf8").trim();
+  return { argv: args, raw, screen: lastFrame(raw), ms: Date.now() - t0, driver: diag };
 }
 
 // ---------------------------------------------------------------- evidence
@@ -432,9 +422,9 @@ async function main() {
       if (realSession) hints.push("This machine has a real active-workspace pointer. Never kill a promptster process outside the sandbox — it may be a live candidate's capture daemon.");
 
       // 4. Which flows are verifiable at all on this machine?
-      checks.tools = { claude: which("claude"), codex: which("codex"), cursor: which("cursor"), go: which("go"), git: which("git"), script: which("script") };
+      checks.tools = { claude: which("claude"), codex: which("codex"), cursor: which("cursor"), go: which("go"), git: which("git"), python3: which("python3") };
       for (const [t, p] of Object.entries(checks.tools)) {
-        if (!p && ["go", "git", "script"].includes(t)) hints.push(`${t} is not installed and is required. Install it.`);
+        if (!p && ["go", "git", "python3"].includes(t)) hints.push(`${t} is not installed and is required. Install it.`);
         if (!p && ["claude", "codex"].includes(t)) hints.push(`${t} is not installed — \`start --tools ${t}\` will not keep that tool, so its flow cannot be verified here. Say so rather than reporting a pass.`);
       }
 
@@ -487,9 +477,9 @@ async function main() {
     case "tui": {
       const st = requireSandbox();
       if (!positional.length) die("tui needs a subcommand", "e.g. `tui brief --here --keys q` or `tui explain`");
-      if (!which("script")) die("script(1) is not available", "The PTY driver needs `script`. Without it a TUI sees a pipe, takes its non-interactive branch, and you verify the fallback instead of the TUI.");
+      if (!which("python3")) die("python3 is not available", "The PTY driver (pty-drive.py) needs python3. Without a PTY a TUI sees a pipe, takes its non-interactive branch, and you verify the fallback instead of the TUI.");
       const keys = flags.keys ? String(flags.keys).split(",") : [];
-      const res = await ptyRun(st, positional, {
+      const res = ptyRun(st, positional, {
         keys,
         timeoutMs: Number(flags.timeout || 15_000),
         settleMs: Number(flags.settle || 1200),
