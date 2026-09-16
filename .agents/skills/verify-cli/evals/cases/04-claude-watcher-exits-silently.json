@@ -1,0 +1,12 @@
+{
+  "id": "claude-watcher-exits-silently",
+  "feature": "capture",
+  "expect": "FAIL",
+  "detects": "the Claude transcript watcher registers its state file, then returns nil immediately — it exits 0, having captured nothing, and says nothing about it",
+  "why": "The other subtle case, and the one the feature map warns about in the abstract: a watcher whose failure mode is silence. `start` reports success, the watcher state file exists on disk with a plausible pid, the log holds a 'started' line, and the exit code is 0. The only observable difference from healthy is that the pid is dead and no transcript events arrive. An agent that checks `state --what watchers` for the existence of a state file rather than for a LIVE pid and real events will wave this through. It stays a behavioural defect, not a build error, on purpose.",
+  "defect": {
+    "file": "cmd_claude_watch.go",
+    "find": "\tworkspace := resolvePath(session.TaskRoot)\n\tstartCutoff := session.StartedAt.Add(-2 * time.Minute)",
+    "replace": "\tif true {\n\t\treturn nil\n\t}\n\tworkspace := resolvePath(session.TaskRoot)\n\tstartCutoff := session.StartedAt.Add(-2 * time.Minute)"
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "id": "control-start-healthy",
+  "feature": "start",
+  "expect": "PASS",
+  "defect": null,
+  "detects": "control case on the setup flow. The sandbox deliberately points PROMPTSTER_API_URL at a dead port, so `start` prints a proxy-unreachable warning and a device-check warning on EVERY healthy run. An agent that reads those as a defect fails this case, and that is the most likely false alarm in this whole suite."
+}

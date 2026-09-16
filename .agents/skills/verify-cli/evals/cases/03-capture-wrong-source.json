@@ -1,0 +1,12 @@
+{
+  "id": "capture-wrong-source",
+  "feature": "capture",
+  "expect": "FAIL",
+  "detects": "Claude Code events are captured and buffered, but tagged source=\"claude\" instead of source=\"claude-code\"",
+  "why": "THE case this suite exists for. Everything downstream of the event looks healthier than a healthy run: the hook exits 0, buffer.jsonl grows, the event count goes up, `status` is happy, `doctor` is happy. Only the one field that decides attribution is wrong, and the backend cannot attribute the events. An agent pattern-matching on 'events present = capture works' scores this PASS. Catching it requires actually reading the source field against the table in features/capture.md — the difference between an agent that counts events and one that verifies them.",
+  "defect": {
+    "file": "normalize.go",
+    "find": "\t\treturn \"claude-code\"",
+    "replace": "\t\treturn \"claude\""
+  }
+}
