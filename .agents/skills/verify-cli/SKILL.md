@@ -82,6 +82,21 @@ contains *this sandbox's path*; it never matches on the name. Do not run
 destroy someone's real capture. `doctor` lists foreign processes under
 `checks.processes.foreign` precisely so you can see them and leave them alone.
 
+### One sandbox per machine, unless you say otherwise
+
+`up` refuses to start a second sandbox, because two would make every later
+command ambiguous about which one it drove. State lives in
+`~/.promptster-verify/cli/`. If another agent session on this machine is already
+using the skill, give yourself your own:
+
+```bash
+export PROMPTSTER_VERIFY_HOME="$HOME/.promptster-verify/cli-$(date +%s)"
+export PROMPTSTER_VERIFY_EVIDENCE="$PROMPTSTER_VERIFY_HOME/evidence"
+```
+
+Observed for real: two sessions sharing the default home collide on `state.json`,
+and the second one's `down` tears the first one's sandbox out from under it.
+
 ## 2. Doctor
 
 ```bash
