@@ -67,6 +67,28 @@ const run = (cmd, args, opts = {}) =>
 
 // ------------------------------------------------------------ defect injection
 
+// A killed runner must not leave a defect in the tree. This eval was itself
+// killed mid-case once (a memory-pressured machine, several agent sessions), and
+// it left normalize.go injected — a booby trap for the next person to build.
+// So the pristine content is written to disk BEFORE the file is touched, and
+// restored from there on exit, on a signal, and on the next startup.
+const PENDING = path.join(HERE, ".eval-pending.json");
+
+function restorePending() {
+  if (!fs.existsSync(PENDING)) return null;
+  try {
+    const p = JSON.parse(fs.readFileSync(PENDING, "utf8"));
+    fs.writeFileSync(path.join(REPO, p.file), p.original);
+    fs.rmSync(PENDING, { force: true });
+    return p.file;
+  } catch { return null; }
+}
+
+for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+  process.on(sig, () => { restorePending(); process.exit(130); });
+}
+process.on("exit", () => restorePending());
+
 function inject(defect) {
   const file = path.join(REPO, defect.file);
   if (!fs.existsSync(file)) throw new Error(`case targets a file that does not exist: ${defect.file}`);
@@ -78,8 +100,9 @@ function inject(defect) {
       `The CLI changed under the case — fix the case, do not loosen the anchor.`
     );
   }
+  fs.writeFileSync(PENDING, JSON.stringify({ file: defect.file, original }));
   fs.writeFileSync(file, original.replace(defect.find, defect.replace));
-  return () => fs.writeFileSync(file, original);
+  return () => { fs.writeFileSync(file, original); fs.rmSync(PENDING, { force: true }); };
 }
 
 // A defect that does not compile is not a behavioural defect — it is a build
@@ -122,6 +145,9 @@ PASS means the feature works as its feature-map file says it should. FAIL means 
 
 async function main() {
   fs.mkdirSync(RESULTS, { recursive: true });
+
+  const stranded = restorePending();
+  if (stranded) console.error(`restored ${stranded} — a previous run was killed mid-injection`);
 
   const only = flag("case");
   let cases = fs.readdirSync(CASES).filter((f) => f.endsWith(".json")).sort()
