@@ -1,0 +1,12 @@
+{
+  "id": "doctor-not-tool-aware",
+  "feature": "doctor",
+  "expect": "FAIL",
+  "detects": "`doctor` prints its Claude hooks section on a codex-only session, where no Claude wiring was ever meant to exist",
+  "why": "Medium difficulty, and it fails in the direction that looks GENEROUS: doctor shows more, not less. Nothing errors and no line is wrong in isolation. The agent has to know from features/doctor.md that tool-awareness is directional — a codex session must show the codex binary and must NOT show a Claude hooks section — and then drive a codex-only session to see it. This is the exact regression cmd_status.go's comments describe shipping once already: a panel that read as 'Claude capture is configured' on a session with no Claude wiring at all.",
+  "defect": {
+    "file": "cmd_doctor.go",
+    "find": "\tif claudeRelevant && sessionErr == nil && session.TaskRoot != \"\" {",
+    "replace": "\tif sessionErr == nil && session.TaskRoot != \"\" {"
+  }
+}

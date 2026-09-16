@@ -1,0 +1,12 @@
+{
+  "id": "start-hooks-not-written",
+  "feature": "start",
+  "expect": "FAIL",
+  "detects": "`start` completes its whole flow and prints Next steps, but never writes .claude/settings.local.json — so Claude Code is not instrumented and nothing the candidate does will ever be captured",
+  "why": "Shallow, and the floor of the eval. The failure is loud in the filesystem and the feature map names the exact file. An agent that misses this is not inspecting what the CLI wrote at all; it is reading stdout and calling it a day.",
+  "defect": {
+    "file": "cmd_start.go",
+    "find": "\t\thookErr = configureHooks(hookRoot)",
+    "replace": "\t\thookErr = nil"
+  }
+}

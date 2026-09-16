@@ -1,0 +1,4 @@
+results/
+.eval-build-probe
+.eval-pending.json
+.verdict-*.txt
