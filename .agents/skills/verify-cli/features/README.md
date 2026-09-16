@@ -4,10 +4,10 @@ What a candidate can actually do with this binary, and how an agent drives it.
 Read this before driving a command; it costs far fewer tokens than re-deriving
 the dispatch table from `main.go`.
 
-Every drive command below is:
+Every drive command below assumes, from the repo root:
 
 ```bash
-node .agents/skills/verify-cli/control-cli.mjs <cmd>
+CC=".agents/skills/verify-cli/control-cli.mjs"
 ```
 
 ## Before anything: three ways a proof lies here
