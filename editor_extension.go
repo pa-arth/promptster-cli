@@ -105,10 +105,22 @@ func supportedEditors() []supportedEditor {
 	}
 }
 
-// resolveEditorCLI returns the path to the editor's CLI, or "" if not present.
+// resolveEditorCLI returns the path to THIS editor's CLI, or "" if not present.
+//
+// The PATH entry is preferred but must be proved to belong to this editor
+// first. VS Code and Cursor both ship a `code` command, and Cursor's own
+// "Install 'code' command in PATH" writes /usr/local/bin/code pointing into
+// Cursor.app — so `exec.LookPath("code")` routinely returns a Cursor binary.
+// Returning it would make every caller act on the wrong app: installing into
+// Cursor twice, and doctor reporting Cursor's extension list as VS Code's.
+//
+// When the PATH entry belongs to someone else we fall through to the known
+// bundle rather than giving up. Both editors CAN be installed at once with
+// `code` pointing at Cursor, and in that case VS Code is genuinely present —
+// dropping it would trade one wrong answer for another.
 func resolveEditorCLI(e supportedEditor) string {
-	if path, err := exec.LookPath(e.command); err == nil {
-		return path
+	if p, err := exec.LookPath(e.command); err == nil && ownedBy(p, e) {
+		return p
 	}
 	if runtime.GOOS == "darwin" && e.bundlePath != "" {
 		if st, err := os.Stat(e.bundlePath); err == nil && !st.IsDir() {
@@ -116,6 +128,25 @@ func resolveEditorCLI(e supportedEditor) string {
 		}
 	}
 	return ""
+}
+
+// ownedBy reports whether a resolved command actually belongs to e.
+//
+// Identity is only decidable when both sides live in a .app bundle. Off macOS
+// there is none — a Linux candidate's `code` is a real binary in ~/.local/bin —
+// so the name is all there is and we accept it.
+func ownedBy(cliPath string, e supportedEditor) bool {
+	want := editorIdentity(e.bundlePath)
+	if want == "" {
+		return true
+	}
+	// A dangling symlink is not a present editor.
+	resolved, err := filepath.EvalSymlinks(cliPath)
+	if err != nil {
+		return false
+	}
+	got := editorIdentity(resolved)
+	return got == "" || got == want
 }
 
 // appBundle returns the ".app" directory containing p, or "" when p is not
@@ -140,22 +171,11 @@ func editorIdentity(resolved string) string {
 	return filepath.Base(appBundle(resolved))
 }
 
-// detectEditors returns the supported editors present on this machine, keyed by
-// the app each command ACTUALLY resolves to.
+// detectEditors returns the supported editors present on this machine.
 //
-// `exec.LookPath` is not enough. VS Code and Cursor both ship a shell shim, and
-// on a machine with only Cursor installed `/usr/local/bin/code` is routinely a
-// symlink into Cursor.app — Cursor's own "Install 'code' command" writes it.
-// Matching on command name alone therefore reported BOTH editors on a machine
-// with one, installed the same .vsix into Cursor twice, told the candidate it
-// had installed into "VS Code and Cursor", and recorded an editor on the
-// session that does not exist on the machine. Editor attribution in captured
-// sessions was wrong on any machine where `code` is a Cursor shim, which is
-// common.
-//
-// So: resolve the symlink, take identity from the containing .app, drop an
-// entry whose command belongs to a DIFFERENT editor, and dedupe by resolved
-// path so one binary can never be reported as two editors.
+// resolveEditorCLI already guarantees each path belongs to the editor asking
+// for it, so all that is left is to make sure one binary is never reported as
+// two editors.
 func detectEditors() []supportedEditor {
 	var found []supportedEditor
 	seen := map[string]bool{}
@@ -164,18 +184,9 @@ func detectEditors() []supportedEditor {
 		if cli == "" {
 			continue
 		}
-		// EvalSymlinks fails on a dangling link, which is itself "not present".
 		resolved, err := filepath.EvalSymlinks(cli)
 		if err != nil {
 			continue
-		}
-		// Identity is only decidable when both sides live in a bundle; off
-		// macOS (systemd boxes, Linux candidates) there is none, and a
-		// name-based match is all there is.
-		if want := editorIdentity(e.bundlePath); want != "" {
-			if got := editorIdentity(resolved); got != "" && got != want {
-				continue // this command is another editor wearing our name
-			}
 		}
 		if seen[resolved] {
 			continue // same binary already claimed by an earlier editor

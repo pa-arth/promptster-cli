@@ -19,7 +19,11 @@ const editorExtensionID = "promptster.promptster"
 // listExtensionsTimeout bounds the editor query in doctor. Shorter than
 // installExtensionTimeout because this one only reads a list — it unpacks
 // nothing. Measured at ~1s locally; this is slack, not a target.
-const listExtensionsTimeout = 15 * time.Second
+//
+// A var, not a const, so the test that proves the bound works can use a short
+// deadline instead of making every run of the suite sit through the production
+// one.
+var listExtensionsTimeout = 15 * time.Second
 
 // captureStateFile is where the extension reports what it is doing, relative to
 // the workspace root. Written by promptster-vscode's src/captureState.ts.
@@ -61,6 +65,12 @@ func installedExtensionVersion(e supportedEditor) (string, error) {
 	cmd := exec.CommandContext(ctx, cli, "--list-extensions", "--show-versions")
 	// A first-run editor CLI can block on stdin. Give it nothing to read.
 	cmd.Stdin = nil
+	// CommandContext kills the editor process at the deadline, but Output waits
+	// on the stdout pipe — and a helper the launcher left running inherits that
+	// pipe and holds it open, so the call could still hang past its own timeout.
+	// WaitDelay bounds that second wait: once the context is done, give any
+	// straggler a moment, then stop reading and return.
+	cmd.WaitDelay = 2 * time.Second
 	out, err := cmd.Output()
 	if ctx.Err() == context.DeadlineExceeded {
 		return "", fmt.Errorf("%s --list-extensions timed out after %s", filepath.Base(cli), listExtensionsTimeout)
