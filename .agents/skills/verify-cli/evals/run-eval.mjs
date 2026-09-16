@@ -41,6 +41,23 @@ const RESULTS = path.join(HERE, "results");
 const CONTROL = path.join(SKILL, "control-cli.mjs");
 
 const argv = process.argv.slice(2);
+
+// An unrecognised flag used to fall through to a FULL run — which builds the
+// repo and spawns real agent sessions. A typo should not cost ten minutes and a
+// pile of nested agents, so unknown flags are a hard error. (Learned the hard
+// way: `--validate` instead of `--validate-only` silently started a real run.)
+const KNOWN_FLAGS = new Set(["validate", "validate-only", "agent", "all-agents", "case", "help"]);
+for (const a of argv.filter((x) => x.startsWith("--"))) {
+  const name = a.slice(2).split("=")[0];
+  if (!KNOWN_FLAGS.has(name)) {
+    console.error(JSON.stringify({
+      ok: false,
+      error: `unknown flag: --${name}`,
+      hint: `Known flags: ${[...KNOWN_FLAGS].map((f) => "--" + f).join(", ")}. Refusing to start a full agent run on a typo.`,
+    }, null, 2));
+    process.exit(2);
+  }
+}
 const flag = (n, d) => {
   const i = argv.indexOf(`--${n}`);
   if (i === -1) return d;
@@ -168,7 +185,7 @@ async function main() {
     console.error(JSON.stringify({ ok: false, error: "case anchors are stale", hint: "Fix the case files against the current source. Do not loosen an anchor to make it match — a two-hit anchor injects a defect somewhere you did not intend.", anchorProblems }, null, 2));
     process.exit(1);
   }
-  if (flag("validate-only")) {
+  if (flag("validate-only") || flag("validate")) {
     process.stdout.write(JSON.stringify({ ok: true, validated: cases.length, cases: cases.map((c) => c.id) }, null, 2) + "\n");
     return;
   }
