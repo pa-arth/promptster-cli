@@ -91,6 +91,55 @@ const run = (cmd, args, opts = {}) =>
 // restored from there on exit, on a signal, and on the next startup.
 const PENDING = path.join(HERE, ".eval-pending.json");
 
+const LOCK = path.join(HERE, ".eval-lock");
+
+/** Set once takeLock() succeeds. Recovery must never run without it. */
+let holdsLock = false;
+
+/**
+ * One evaluator per checkout, enforced.
+ *
+ * A run EDITS source in the shared working tree to inject a defect, and startup
+ * recovery treats any pending file as a crashed run. Two evaluators in the same
+ * checkout therefore corrupt each other: the second restores the first's source
+ * out from under it and deletes its marker, so the first builds and scores the
+ * wrong tree, and a later crash can leave the defect in place permanently. This
+ * repo is routinely worked by several sessions at once, so that is a matter of
+ * course rather than bad luck.
+ *
+ * `wx` is atomic: whoever creates the file owns the tree. A lock whose owner is
+ * gone is stale and is taken over, so a killed run cannot wedge the next one.
+ */
+function takeLock() {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      fs.writeFileSync(LOCK, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }), { flag: "wx" });
+      holdsLock = true;
+      return;
+    } catch (e) {
+      if (e.code !== "EEXIST") throw e;
+      let owner = null;
+      try { owner = JSON.parse(fs.readFileSync(LOCK, "utf8")); } catch { /* unreadable => stale */ }
+      const live = owner?.pid && (() => { try { process.kill(owner.pid, 0); return true; } catch { return false; } })();
+      if (live) {
+        console.error(
+          `REFUSING to start: another evaluation (pid ${owner.pid}, since ${owner.at}) holds this checkout.\n` +
+          `It injects defects into shared source, so two at once corrupt each other's tree.\n` +
+          `Wait for it, or run this one against a separate worktree.`,
+        );
+        process.exit(2);
+      }
+      console.error(`Clearing a stale eval lock from pid ${owner?.pid ?? "?"} (no longer running).`);
+      try { fs.unlinkSync(LOCK); } catch { /* someone else cleared it; retry */ }
+    }
+  }
+  console.error("Could not take the eval lock after clearing a stale one. Remove .eval-lock by hand if nothing is running.");
+  process.exit(2);
+}
+
+const releaseLock = () => { if (holdsLock) { holdsLock = false; try { fs.unlinkSync(LOCK); } catch { /* already gone */ } } };
+
+
 function restorePending() {
   if (!fs.existsSync(PENDING)) return null;
   try {
@@ -101,13 +150,32 @@ function restorePending() {
   } catch { return null; }
 }
 
+// Guarded by holdsLock: a --validate run never owns the tree, and must not
+// restore a pending file belonging to the evaluator that does.
 for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {
-  process.on(sig, () => { restorePending(); process.exit(130); });
+  process.on(sig, () => { if (holdsLock) restorePending(); releaseLock(); process.exit(130); });
 }
-process.on("exit", () => restorePending());
+process.on("exit", () => { if (holdsLock) restorePending(); });
+
+/**
+ * Resolve a case's target path and prove it stays inside the repo.
+ *
+ * Case files declare `defect.file` as repo-relative, but nothing checked it. A
+ * typo or a future case containing `../` would make --validate read an outside
+ * file and make a real run OVERWRITE it — injection writes before it restores,
+ * so a crash in between leaves someone else's file holding sabotaged content.
+ * Every caller routes through here so none can be the one that forgets.
+ */
+function caseTarget(relative) {
+  const file = path.resolve(REPO, relative);
+  const base = path.resolve(REPO);
+  if (!file.startsWith(base + path.sep))
+    throw new Error(`case targets a path outside the repository: ${relative}`);
+  return file;
+}
 
 function inject(defect) {
-  const file = path.join(REPO, defect.file);
+  const file = caseTarget(defect.file);
   if (!fs.existsSync(file)) throw new Error(`case targets a file that does not exist: ${defect.file}`);
   const original = fs.readFileSync(file, "utf8");
   const hits = original.split(defect.find).length - 1;
@@ -170,9 +238,6 @@ PASS means the feature works as its feature-map file says it should. FAIL means 
 async function main() {
   fs.mkdirSync(RESULTS, { recursive: true });
 
-  const stranded = restorePending();
-  if (stranded) console.error(`restored ${stranded} — a previous run was killed mid-injection`);
-
   const only = flag("case");
   let cases = fs.readdirSync(CASES).filter((f) => f.endsWith(".json")).sort()
     .map((f) => JSON.parse(fs.readFileSync(path.join(CASES, f), "utf8")));
@@ -183,7 +248,9 @@ async function main() {
   const anchorProblems = [];
   for (const c of cases) {
     if (!c.defect) continue;
-    const file = path.join(REPO, c.defect.file);
+    let file;
+    try { file = caseTarget(c.defect.file); }
+    catch (e) { anchorProblems.push({ case: c.id, problem: String(e.message) }); continue; }
     if (!fs.existsSync(file)) { anchorProblems.push({ case: c.id, problem: `missing file ${c.defect.file}` }); continue; }
     const hits = fs.readFileSync(file, "utf8").split(c.defect.find).length - 1;
     if (hits !== 1) anchorProblems.push({ case: c.id, file: c.defect.file, matched: hits, problem: "anchor must match exactly once" });
@@ -196,6 +263,15 @@ async function main() {
     process.stdout.write(JSON.stringify({ ok: true, validated: cases.length, cases: cases.map((c) => c.id) }, null, 2) + "\n");
     return;
   }
+
+  // Everything above only READS, so --validate needs no lock and stays usable in
+  // CI while a run is in flight. Past this point the tree gets edited, so take
+  // the lock BEFORE recovery — recovering without it would restore a live run's
+  // source out from under it, which is the corruption this guards against.
+  takeLock();
+  process.on("exit", releaseLock);
+  const stranded = restorePending();
+  if (stranded) console.error(`restored ${stranded} — a previous run was killed mid-injection`);
 
   const agentNames = flag("all-agents") ? Object.keys(AGENTS) : [flag("agent", "claude")];
   for (const a of agentNames) if (!AGENTS[a]) { console.error(`unknown agent: ${a}. Known: ${Object.keys(AGENTS).join(", ")}`); process.exit(1); }
