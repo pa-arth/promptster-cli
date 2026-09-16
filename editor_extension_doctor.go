@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -14,6 +15,11 @@ import (
 
 // The extension's marketplace identity: publisher.name from its package.json.
 const editorExtensionID = "promptster.promptster"
+
+// listExtensionsTimeout bounds the editor query in doctor. Shorter than
+// installExtensionTimeout because this one only reads a list — it unpacks
+// nothing. Measured at ~1s locally; this is slack, not a target.
+const listExtensionsTimeout = 15 * time.Second
 
 // captureStateFile is where the extension reports what it is doing, relative to
 // the workspace root. Written by promptster-vscode's src/captureState.ts.
@@ -44,8 +50,21 @@ func installedExtensionVersion(e supportedEditor) (string, error) {
 		return "", fmt.Errorf("no %s CLI on this machine", e.name)
 	}
 
-	cmd := exec.Command(cli, "--list-extensions", "--show-versions")
+	// Bounded. This was exec.Command with no deadline, and `doctor` is the first
+	// thing a confused candidate runs — an editor CLI that blocks would hang it
+	// forever with no output. runInstall has had a timeout all along; this call
+	// simply never got one. A query that lists installed extensions has no
+	// reason to take longer than this.
+	ctx, cancel := context.WithTimeout(context.Background(), listExtensionsTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, cli, "--list-extensions", "--show-versions")
+	// A first-run editor CLI can block on stdin. Give it nothing to read.
+	cmd.Stdin = nil
 	out, err := cmd.Output()
+	if ctx.Err() == context.DeadlineExceeded {
+		return "", fmt.Errorf("%s --list-extensions timed out after %s", filepath.Base(cli), listExtensionsTimeout)
+	}
 	if err != nil {
 		return "", fmt.Errorf("%s --list-extensions failed: %v", filepath.Base(cli), err)
 	}

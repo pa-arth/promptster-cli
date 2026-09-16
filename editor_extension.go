@@ -118,13 +118,70 @@ func resolveEditorCLI(e supportedEditor) string {
 	return ""
 }
 
-// detectEditors returns the supported editors present on this machine.
+// appBundle returns the ".app" directory containing p, or "" when p is not
+// inside one. Walking up finds the innermost bundle, which is the one that owns
+// the binary.
+func appBundle(p string) string {
+	for d := filepath.Clean(p); ; {
+		parent := filepath.Dir(d)
+		if strings.HasSuffix(d, ".app") {
+			return d
+		}
+		if parent == d {
+			return ""
+		}
+		d = parent
+	}
+}
+
+// editorIdentity reports which app a resolved CLI path actually belongs to, as
+// a bundle name like "Cursor.app". Empty when it cannot be told.
+func editorIdentity(resolved string) string {
+	return filepath.Base(appBundle(resolved))
+}
+
+// detectEditors returns the supported editors present on this machine, keyed by
+// the app each command ACTUALLY resolves to.
+//
+// `exec.LookPath` is not enough. VS Code and Cursor both ship a shell shim, and
+// on a machine with only Cursor installed `/usr/local/bin/code` is routinely a
+// symlink into Cursor.app — Cursor's own "Install 'code' command" writes it.
+// Matching on command name alone therefore reported BOTH editors on a machine
+// with one, installed the same .vsix into Cursor twice, told the candidate it
+// had installed into "VS Code and Cursor", and recorded an editor on the
+// session that does not exist on the machine. Editor attribution in captured
+// sessions was wrong on any machine where `code` is a Cursor shim, which is
+// common.
+//
+// So: resolve the symlink, take identity from the containing .app, drop an
+// entry whose command belongs to a DIFFERENT editor, and dedupe by resolved
+// path so one binary can never be reported as two editors.
 func detectEditors() []supportedEditor {
 	var found []supportedEditor
+	seen := map[string]bool{}
 	for _, e := range supportedEditors() {
-		if resolveEditorCLI(e) != "" {
-			found = append(found, e)
+		cli := resolveEditorCLI(e)
+		if cli == "" {
+			continue
 		}
+		// EvalSymlinks fails on a dangling link, which is itself "not present".
+		resolved, err := filepath.EvalSymlinks(cli)
+		if err != nil {
+			continue
+		}
+		// Identity is only decidable when both sides live in a bundle; off
+		// macOS (systemd boxes, Linux candidates) there is none, and a
+		// name-based match is all there is.
+		if want := editorIdentity(e.bundlePath); want != "" {
+			if got := editorIdentity(resolved); got != "" && got != want {
+				continue // this command is another editor wearing our name
+			}
+		}
+		if seen[resolved] {
+			continue // same binary already claimed by an earlier editor
+		}
+		seen[resolved] = true
+		found = append(found, e)
 	}
 	return found
 }
