@@ -217,6 +217,29 @@ A proof that does not meet these is not evidence:
 - **Confirm the binary is current** (`doctor` → `binaryCurrent`) before
   believing any result. Go does not rebuild on its own.
 
+## 4b. Attest on the PR, or it will not merge
+
+Automerge requires a verify-cli attestation naming the **head commit**.
+Marking a PR ready for review used to be the only signal that a proof happened,
+and nothing read it. Post this after the drive, from the branch:
+
+```bash
+gh pr comment <N> --body "<!-- verified: verify-cli sha=$(git rev-parse HEAD) -->
+Drove: <what you drove>. Evidence: <the paths you captured>."
+```
+
+The SHA is the whole point. Push another commit and the attestation stops
+matching, so the PR blocks until you re-verify — verifying commit A and merging
+commit B is the failure this closes. Automerge also needs Greptile at 5/5 with
+no P1s; see `scripts/automerge-decision.mjs`.
+
+Post it from an account that is an OWNER, MEMBER or COLLABORATOR on the repo.
+Anyone at all can comment on a public repo's PR, so the gate ignores a marker
+from anyone else — a stranger's attestation is not evidence of anything.
+
+This is still your own claim. It does not prove you drove anything — it means
+not driving is now a thing you had to assert, not a thing you could skip.
+
 ## 5. Cleanup
 
 ```bash

@@ -36,3 +36,10 @@ jobs:
 
       - name: Verify the packed tarball installs a runnable promptster
         run: node npm/scripts/check-install.js
+
+      # The automerge gate's decision test. It is what keeps REQUIRED_CHECKS
+      # naming jobs that really exist — a required check that never reports is a
+      # gate that never merges — so it runs inside a check the gate itself
+      # requires. Node stdlib only; the scripts live at the repo root.
+      - name: Automerge decision tests
+        run: node --test scripts/__tests__/automerge-decision.test.mjs
