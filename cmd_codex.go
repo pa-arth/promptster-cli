@@ -123,7 +123,7 @@ func codexLaunchArgv(bin, baseURL string, args []string) []string {
 }
 
 // codexProxyBaseURL is the Responses-API prefix codex POSTs to (<base>/responses).
-func codexProxyBaseURL() string { return apiURL() + "/v1/proxy/openai/v1" }
+func codexProxyBaseURL() string { return proxyBaseURL() + "/v1/proxy/openai/v1" }
 
 // codexLaunchFail prints a refusal plus the command that fixes it, and exits
 // non-zero. Never returns.

@@ -15,6 +15,26 @@ import (
 
 const defaultAPIURL = "https://api.promptster.ai"
 
+// defaultProxyURL fronts the model proxy with a Cloudflare Worker that gzips
+// request bodies. Render's edge WAF 403s bodies that look like SQL injection
+// or path traversal, and LLM conversations are full of both; Claude Code
+// shows that as "Please run /login · API Error: Blocked" and the session is
+// dead. See promptster-backend proxy-edge/.
+const defaultProxyURL = "https://llm.promptster.ai"
+
+// proxyBaseURL is where Claude Code and Codex send model calls. A self-hosted
+// API (PROMPTSTER_API_URL) serves its own proxy; PROMPTSTER_PROXY_URL
+// overrides both.
+func proxyBaseURL() string {
+	if u := os.Getenv("PROMPTSTER_PROXY_URL"); u != "" {
+		return u
+	}
+	if usingDefaultAPI() {
+		return defaultProxyURL
+	}
+	return apiURL()
+}
+
 func apiURL() string {
 	if u := os.Getenv("PROMPTSTER_API_URL"); u != "" {
 		return u
