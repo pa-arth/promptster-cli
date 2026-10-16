@@ -449,6 +449,11 @@ func cmdStart(args []string) {
 			}
 			f.WriteString(".promptster/\n") //nolint:errcheck
 			f.Close()                       //nolint:errcheck
+			// Our own edit, not the candidate's: claim it so the git watcher
+			// doesn't emit it as a likely_human file_diff.
+			if h, ok := fileContentSHA(gitignorePath); ok {
+				claimFileDiff(session.SessionID, ".gitignore", h)
+			}
 		}
 	}
 

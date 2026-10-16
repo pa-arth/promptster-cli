@@ -214,6 +214,7 @@ func runGitWatcher() error {
 
 	// Take initial snapshot so we don't send the entire repo as a diff on first poll
 	saveCurrentTreeHash(session.TaskRoot)
+	pruneStaleClaims(session.SessionID, session.TaskRoot)
 
 	fmt.Fprintf(os.Stderr, "git-watcher: started, polling every %s in %s\n", gitWatchInterval, session.TaskRoot)
 
