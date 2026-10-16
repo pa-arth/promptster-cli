@@ -1,9 +1,11 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // fileDiffEvent builds a minimal file_diff event for dedup tests.
@@ -54,5 +56,42 @@ func TestDedupeIgnoresNonFileDiff(t *testing.T) {
 	cmd.Data = map[string]interface{}{"command": "ls"}
 	if !dedupeFileDiff("/ws", &cmd) {
 		t.Error("non-file_diff events must always pass through")
+	}
+}
+
+// Regression: the git watcher re-diffs unchanged AI files on every poll when
+// its baseline can't advance. An aged claim must still dedupe, or that AI work
+// leaks through as ai_revised_by_human once it's old enough.
+func TestDedupeHoldsAfterClaimAges(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("PROMPTSTER_BUFFER_PATH", filepath.Join(tmp, "buffer.jsonl"))
+	t.Setenv("PROMPTSTER_STATE_DIR", tmp)
+
+	ws := t.TempDir()
+	if err := os.WriteFile(filepath.Join(ws, "a.txt"), []byte("ai wrote this\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ai := fileDiffEvent("a.txt", "+ai wrote this")
+	if !dedupeFileDiff(ws, &ai) {
+		t.Fatal("first emission should be allowed")
+	}
+
+	// Age the claim an hour into the past.
+	ledger := map[string]diffDedupEntry{}
+	data, _ := os.ReadFile(diffDedupLedgerPath())
+	if err := json.Unmarshal(data, &ledger); err != nil {
+		t.Fatal(err)
+	}
+	e := ledger["a.txt"]
+	e.TsMs = time.Now().Add(-time.Hour).UnixMilli()
+	ledger["a.txt"] = e
+	data, _ = json.Marshal(ledger)
+	if err := os.WriteFile(diffDedupLedgerPath(), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	git := fileDiffEvent("a.txt", "diff --git a/a.txt b/a.txt\n+ai wrote this")
+	if dedupeFileDiff(ws, &git) {
+		t.Error("unchanged content must stay deduped however old the claim is")
 	}
 }
