@@ -452,7 +452,7 @@ func cmdStart(args []string) {
 			// Our own edit, not the candidate's: claim it so the git watcher
 			// doesn't emit it as a likely_human file_diff.
 			if h, ok := fileContentSHA(gitignorePath); ok {
-				claimFileDiff(".gitignore", h)
+				claimFileDiff(session.SessionID, ".gitignore", h)
 			}
 		}
 	}

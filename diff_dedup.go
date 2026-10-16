@@ -32,7 +32,8 @@ import (
 // on every poll. A 5-minute TTL let each one through as "ai_revised_by_human"
 // once the claim aged out — observed live: 909 AI-written lines credited to the
 // candidate in one 22-minute session. The ledger holds one entry per path, so
-// it stays bounded without expiry.
+// it stays bounded without expiry. Claims are keyed by session so a reused
+// workspace doesn't inherit the previous session's.
 
 func diffDedupLedgerPath() string { return filepath.Join(stateDir(), "diff-hashes.json") }
 
@@ -117,7 +118,8 @@ func hashString(s string) string {
 // caller won the claim. Returns true if the path's last claimed content differs
 // (caller should emit); false if that exact resulting content was already
 // emitted (caller should skip).
-func claimFileDiff(relPath, hash string) bool {
+func claimFileDiff(sessionID, relPath, hash string) bool {
+	key := sessionID + "\x00" + relPath
 	won := true
 	_ = withBufferLock(diffDedupLedgerPath()+".lock", func() error {
 		ledger := map[string]diffDedupEntry{}
@@ -125,11 +127,11 @@ func claimFileDiff(relPath, hash string) bool {
 			_ = json.Unmarshal(data, &ledger)
 		}
 
-		if e, ok := ledger[relPath]; ok && e.Hash == hash {
+		if e, ok := ledger[key]; ok && e.Hash == hash {
 			won = false
 			return nil
 		}
-		ledger[relPath] = diffDedupEntry{Hash: hash, TsMs: time.Now().UnixMilli()}
+		ledger[key] = diffDedupEntry{Hash: hash, TsMs: time.Now().UnixMilli()}
 
 		data, err := json.Marshal(ledger)
 		if err != nil {
@@ -171,7 +173,7 @@ func dedupeFileDiff(taskRoot string, e *Event) bool {
 		diff, _ := data["diff"].(string)
 		hash = hashString("∅:" + diff)
 	}
-	won := claimFileDiff(rel, hash)
+	won := claimFileDiff(e.SessionID, rel, hash)
 	// Track AI-edited paths for later git-watcher attribution
 	// (ai_revised_by_human vs likely_human). Recorded regardless of claim
 	// outcome — a deduped re-observation is still an AI edit to this path.

@@ -82,9 +82,10 @@ func TestDedupeHoldsAfterClaimAges(t *testing.T) {
 	if err := json.Unmarshal(data, &ledger); err != nil {
 		t.Fatal(err)
 	}
-	e := ledger["a.txt"]
+	key := "sess-1\x00a.txt"
+	e := ledger[key]
 	e.TsMs = time.Now().Add(-time.Hour).UnixMilli()
-	ledger["a.txt"] = e
+	ledger[key] = e
 	data, _ = json.Marshal(ledger)
 	if err := os.WriteFile(diffDedupLedgerPath(), data, 0o644); err != nil {
 		t.Fatal(err)
@@ -93,5 +94,27 @@ func TestDedupeHoldsAfterClaimAges(t *testing.T) {
 	git := fileDiffEvent("a.txt", "diff --git a/a.txt b/a.txt\n+ai wrote this")
 	if dedupeFileDiff(ws, &git) {
 		t.Error("unchanged content must stay deduped however old the claim is")
+	}
+}
+
+// Without a TTL, claims must not outlive their session: a reused workspace
+// whose file returns to a previously-claimed content is new work this session.
+func TestDedupeDoesNotCarryAcrossSessions(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("PROMPTSTER_BUFFER_PATH", filepath.Join(tmp, "buffer.jsonl"))
+	t.Setenv("PROMPTSTER_STATE_DIR", tmp)
+
+	ws := t.TempDir()
+	if err := os.WriteFile(filepath.Join(ws, "a.txt"), []byte("same\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	first := fileDiffEvent("a.txt", "+same")
+	if !dedupeFileDiff(ws, &first) {
+		t.Fatal("first emission should be allowed")
+	}
+	next := newEvent("file_diff", "sess-2")
+	next.Data = map[string]interface{}{"path": "a.txt", "diff": "+same"}
+	if !dedupeFileDiff(ws, &next) {
+		t.Error("a new session must not inherit the previous session's claim")
 	}
 }
