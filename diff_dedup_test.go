@@ -154,3 +154,23 @@ func TestPruneStaleClaimsOnWatcherStart(t *testing.T) {
 		t.Error("an unchanged AI file must keep its claim across a restart")
 	}
 }
+
+// Greptile P1 on #50: deletions are claimed by diff text (there's no file to
+// hash), so a restart must not read the absent file as a stale claim — the
+// HEAD-fallback baseline re-diffs the same deletion and it would count twice.
+func TestPruneKeepsDeletionClaims(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("PROMPTSTER_BUFFER_PATH", filepath.Join(tmp, "buffer.jsonl"))
+	t.Setenv("PROMPTSTER_STATE_DIR", tmp)
+
+	ws := t.TempDir()
+	del := fileDiffEvent("gone.txt", "diff --git a/gone.txt b/gone.txt\n-old")
+	if !dedupeFileDiff(ws, &del) {
+		t.Fatal("first emission of the deletion should be allowed")
+	}
+	pruneStaleClaims("sess-1", ws)
+	again := fileDiffEvent("gone.txt", "diff --git a/gone.txt b/gone.txt\n-old")
+	if dedupeFileDiff(ws, &again) {
+		t.Error("the same deletion re-diffed after a restart must stay deduped")
+	}
+}

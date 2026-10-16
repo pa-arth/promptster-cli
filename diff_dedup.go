@@ -164,7 +164,9 @@ func pruneStaleClaims(sessionID, taskRoot string) {
 			if !ok {
 				continue
 			}
-			if hash, ok := fileContentSHA(filepath.Join(taskRoot, rel)); !ok || hash != e.Hash {
+			// An absent file keeps its claim: deletions are claimed by diff
+			// text, and the restarted watcher may re-diff the same deletion.
+			if hash, ok := fileContentSHA(filepath.Join(taskRoot, rel)); ok && hash != e.Hash {
 				delete(ledger, key)
 			}
 		}
