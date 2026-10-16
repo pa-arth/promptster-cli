@@ -242,7 +242,7 @@ func cmdDoctor() {
 				if blocked := proxyProbeBlocker(session); blocked != "" {
 					return "skipped (" + blocked + " — see above)", ""
 				}
-				if err := smokeTestProxy(apiURL()+"/v1/proxy/anthropic", session.SessionToken); err != nil {
+				if err := smokeTestProxy(proxyBaseURL()+"/v1/proxy/anthropic", session.SessionToken); err != nil {
 					return "", err.Error() + "\n    Fix: if the key was rejected or the budget is spent, contact the recruiter"
 				}
 				return "yes", ""

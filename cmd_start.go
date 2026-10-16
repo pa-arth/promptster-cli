@@ -583,7 +583,7 @@ func cmdStart(args []string) {
 	// we can capture full conversations and supply the credential. Writes
 	// ANTHROPIC_BASE_URL + an apiKeyHelper into the workspace settings.
 	// (Codex BYOK proxy wiring is handled separately; see codex_proxy.go.)
-	proxyURL := apiURL() + "/v1/proxy/anthropic"
+	proxyURL := proxyBaseURL() + "/v1/proxy/anthropic"
 	if useClaude {
 		verbosef("setting ANTHROPIC_BASE_URL=%s + apiKeyHelper in %s", proxyURL, claudeProjectSettingsPath(hookRoot))
 		configureProxyEnv(hookRoot, proxyURL, session.SessionToken)
