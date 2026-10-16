@@ -118,3 +118,39 @@ func TestDedupeDoesNotCarryAcrossSessions(t *testing.T) {
 		t.Error("a new session must not inherit the previous session's claim")
 	}
 }
+
+// Greptile P1 on #50: a claim must not outlive a watcher restart that missed
+// the change away from it, or restoring the claimed content later is dropped.
+func TestPruneStaleClaimsOnWatcherStart(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("PROMPTSTER_BUFFER_PATH", filepath.Join(tmp, "buffer.jsonl"))
+	t.Setenv("PROMPTSTER_STATE_DIR", tmp)
+
+	ws := t.TempDir()
+	write := func(name, body string) {
+		if err := os.WriteFile(filepath.Join(ws, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("a.txt", "A\n")
+	write("kept.txt", "ai\n")
+	for _, p := range []string{"a.txt", "kept.txt"} {
+		ev := fileDiffEvent(p, "+x")
+		if !dedupeFileDiff(ws, &ev) {
+			t.Fatalf("first emission of %s should be allowed", p)
+		}
+	}
+
+	write("a.txt", "B\n") // candidate edit while the watcher was down
+	pruneStaleClaims("sess-1", ws)
+
+	write("a.txt", "A\n") // candidate restores A
+	restored := fileDiffEvent("a.txt", "+A")
+	if !dedupeFileDiff(ws, &restored) {
+		t.Error("restoring previously-claimed content after a missed change must emit")
+	}
+	kept := fileDiffEvent("kept.txt", "+ai")
+	if dedupeFileDiff(ws, &kept) {
+		t.Error("an unchanged AI file must keep its claim across a restart")
+	}
+}

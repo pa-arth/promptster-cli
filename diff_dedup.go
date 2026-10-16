@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -144,6 +145,39 @@ func claimFileDiff(sessionID, relPath, hash string) bool {
 		return os.Rename(tmp, diffDedupLedgerPath())
 	})
 	return won
+}
+
+// pruneStaleClaims drops this session's claims whose file no longer holds the
+// claimed content. Called when the watcher (re)starts and resets its baseline:
+// a change made while it was down was never observed, so the old claim would
+// otherwise suppress a later restore of that content as a duplicate.
+func pruneStaleClaims(sessionID, taskRoot string) {
+	prefix := sessionID + "\x00"
+	_ = withBufferLock(diffDedupLedgerPath()+".lock", func() error {
+		ledger := map[string]diffDedupEntry{}
+		data, err := os.ReadFile(diffDedupLedgerPath())
+		if err != nil || json.Unmarshal(data, &ledger) != nil {
+			return nil
+		}
+		for key, e := range ledger {
+			rel, ok := strings.CutPrefix(key, prefix)
+			if !ok {
+				continue
+			}
+			if hash, ok := fileContentSHA(filepath.Join(taskRoot, rel)); !ok || hash != e.Hash {
+				delete(ledger, key)
+			}
+		}
+		data, err = json.Marshal(ledger)
+		if err != nil {
+			return err
+		}
+		tmp := diffDedupLedgerPath() + ".tmp"
+		if err := os.WriteFile(tmp, data, 0o644); err != nil {
+			return err
+		}
+		return os.Rename(tmp, diffDedupLedgerPath())
+	})
 }
 
 // dedupeFileDiff reports whether a file_diff event should be emitted. It is a
