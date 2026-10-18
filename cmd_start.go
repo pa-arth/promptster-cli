@@ -439,23 +439,7 @@ func cmdStart(args []string) {
 	// Write TASK.md so the candidate (and Claude Code) can reference the brief
 	writeTaskFile(workspaceForState, session, taskBrief, timeLimitMinutes)
 
-	// Ensure .promptster is gitignored in the workspace
-	gitignorePath := filepath.Join(workspaceForState, ".gitignore")
-	if data, err := os.ReadFile(gitignorePath); err != nil || !strings.Contains(string(data), ".promptster") {
-		f, err := os.OpenFile(gitignorePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
-		if err == nil {
-			if len(data) > 0 && !strings.HasSuffix(string(data), "\n") {
-				f.WriteString("\n") //nolint:errcheck
-			}
-			f.WriteString(".promptster/\n") //nolint:errcheck
-			f.Close()                       //nolint:errcheck
-			// Our own edit, not the candidate's: claim it so the git watcher
-			// doesn't emit it as a likely_human file_diff.
-			if h, ok := fileContentSHA(gitignorePath); ok {
-				claimFileDiff(session.SessionID, ".gitignore", h)
-			}
-		}
-	}
+	ensureWorkspaceGitExcludes(workspaceForState)
 
 	// Honeypot: drop a marker file inside .promptster/ when the candidate has
 	// opted in to integrity checks. The token is random per-session; if it ever
@@ -1520,4 +1504,42 @@ func endStepWarn(n, total int, label, detail string) {
 		return
 	}
 	fmt.Printf("\r%s%s %s  %s\n", stepPrefix(n, total), stepLabel.Render(padded), stepWarnIcon, stepWarnNote.Render(detail))
+}
+
+// Keep generated workspace files local, without changing the candidate's tree.
+func ensureWorkspaceGitExcludes(root string) {
+	out, err := runCommand(root, "git", "rev-parse", "--git-path", "info/exclude")
+	if err != nil {
+		return
+	}
+	path := strings.TrimSpace(string(out))
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(root, path)
+	}
+	data, _ := os.ReadFile(path)
+	lines := "\n" + string(data) + "\n"
+	var added strings.Builder
+	for _, pattern := range []string{"/.promptster/", "/TASK.md", "/.claude/settings.local.json", "/.claude/commands/explain.md"} {
+		if !strings.Contains(lines, "\n"+pattern+"\n") {
+			added.WriteString(pattern + "\n")
+		}
+	}
+	if added.Len() == 0 {
+		return
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		verbosef("could not exclude workspace files: %v", err)
+		return
+	}
+	defer f.Close()
+	if len(data) > 0 && data[len(data)-1] != '\n' {
+		addedText := "\n" + added.String()
+		_, err = f.WriteString(addedText)
+	} else {
+		_, err = f.WriteString(added.String())
+	}
+	if err != nil {
+		verbosef("could not exclude workspace files: %v", err)
+	}
 }

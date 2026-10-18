@@ -16,27 +16,26 @@ import (
 )
 
 // gitExcludePathspecs scopes `git add` / `git diff` to everything except
-// CLI-generated workspace files (TASK.md, .promptster/, .claude/ — hook
-// settings + the /explain command the CLI installs) so the submission diff,
+// CLI-generated workspace files (TASK.md, .promptster/, hook settings and
+// the /explain command) so the submission diff,
 // periodic snapshots, and git-watcher file_diff events don't carry them.
-// Candidate edits under .claude/ are still observable via the tool-call
-// capture channels; only the git channels exclude them.
+// Other candidate files under .claude/ remain in the submission.
 // Pathspec syntax requires at least one positive include (".") before the
 // excludes — git ignores standalone exclude pathspecs.
 //
-// The excludes are emitted only for paths NOT already covered by .gitignore:
-// `promptster start` appends both to the workspace .gitignore, and git (≤2.37
+// The excludes are emitted only for paths NOT already covered by ignore rules:
+// `promptster start` writes local excludes, and git (≤2.37
 // at least) hard-errors on `git add` when an explicit pathspec names an
 // ignored path — even an :(exclude) one.
 func gitExcludePathspecs(root string) []string {
 	specs := []string{"--", "."}
-	for _, p := range []string{"TASK.md", ".promptster/", ".claude/"} {
+	for _, p := range []string{"TASK.md", ".promptster/", ".claude/settings.local.json", ".claude/commands/explain.md"} {
 		probe := strings.TrimSuffix(p, "/")
 		cmd := exec.Command("git", "-C", root, "check-ignore", "-q", probe)
 		if cmd.Run() == nil {
 			continue // already gitignored — exclude pathspec is redundant and breaks git add
 		}
-		specs = append(specs, ":(exclude)"+p)
+		specs = append(specs, ":(top,exclude)"+p)
 	}
 	return specs
 }
