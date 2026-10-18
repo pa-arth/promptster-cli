@@ -107,16 +107,17 @@ func gitPollProvenance(aiTouched bool) *Provenance {
 	}
 }
 
-// codexTurnProvenance is attribution for working-tree diffs observed while a
-// codex turn was actively writing its rollout: agent work the rollout does
-// not itemize per-edit (shell-command writes, mid-turn snapshots of files the
-// agent is still editing).
-func codexTurnProvenance() *Provenance {
+// agentWindowProvenance is attribution for working-tree diffs observed while
+// an agent was actively working: a codex turn writing its rollout, or a Claude
+// Bash tool call. That is agent work no hook itemizes per-edit (shell-command
+// writes such as `pnpm install` rewriting a lockfile, mid-turn snapshots of
+// files the agent is still editing). method names which signal fired.
+func agentWindowProvenance(method string) *Provenance {
 	return &Provenance{
 		Attribution:   "likely_ai",
 		Confidence:    0.6,
 		Observability: "medium",
-		Methods:       []string{"git-poll", "codex-turn-window"},
+		Methods:       []string{"git-poll", method},
 	}
 }
 
@@ -162,6 +163,32 @@ func loadLastPromptTs() time.Time {
 		return time.Time{}
 	}
 	return time.UnixMilli(ms)
+}
+
+// agentShellStatePath records when a Claude Bash tool call last started or
+// finished, so the git watcher can credit the files it wrote to the agent.
+func agentShellStatePath() string {
+	return filepath.Join(filepath.Dir(lastPromptStatePath()), "agent_shell.ts")
+}
+
+func saveAgentShellTs() {
+	p := agentShellStatePath()
+	_ = os.MkdirAll(filepath.Dir(p), 0o755)
+	_ = os.WriteFile(p, []byte(fmt.Sprintf("%d", time.Now().UnixMilli())), 0o644)
+}
+
+// agentShellActiveSince reports whether a Claude Bash tool call started or
+// finished after t.
+func agentShellActiveSince(t time.Time) bool {
+	data, err := os.ReadFile(agentShellStatePath())
+	if err != nil {
+		return false
+	}
+	var ms int64
+	if _, err := fmt.Sscanf(strings.TrimSpace(string(data)), "%d", &ms); err != nil {
+		return false
+	}
+	return time.UnixMilli(ms).After(t)
 }
 
 // rawPayloadString marshals payload to JSON and returns the first 500 chars.
@@ -412,6 +439,9 @@ func normalizeClaudeCode(payload map[string]interface{}, sessionID string) (Even
 		e := newEvent("tool_intent", sessionID)
 		e.Actor = aiActor()
 		toolName, _ := payload["tool_name"].(string)
+		if toolName == "Bash" {
+			saveAgentShellTs()
+		}
 		inputPreview := jsonPreview(payload["tool_input"], 100)
 		e.Data = map[string]interface{}{
 			"toolName":     toolName,
@@ -422,6 +452,9 @@ func normalizeClaudeCode(payload map[string]interface{}, sessionID string) (Even
 
 	case "PostToolUse":
 		toolName, _ := payload["tool_name"].(string)
+		if toolName == "Bash" {
+			saveAgentShellTs()
+		}
 		toolInput, _ := payload["tool_input"].(map[string]interface{})
 		if toolInput == nil {
 			toolInput = map[string]interface{}{}
