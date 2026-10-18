@@ -292,14 +292,18 @@ func nextWakeIn(session Session) time.Duration {
 func pollGitDiffs(session Session, client *http.Client) (int, error) {
 	taskRoot := session.TaskRoot
 	lastHash := loadLastTreeHash()
+	currentHash, err := currentTreeHash(taskRoot)
+	if err != nil {
+		return 0, err
+	}
 
 	// Build git diff command against our stored baseline. Pathspec excludes
 	// keep CLI-generated files (TASK.md, .promptster/) out of file_diff events.
 	var args []string
 	if lastHash == "" {
-		args = []string{"-C", taskRoot, "diff", "HEAD", "--no-color", "--unified=3"}
+		args = []string{"-C", taskRoot, "diff", "HEAD", currentHash, "--no-color", "--unified=3"}
 	} else {
-		args = []string{"-C", taskRoot, "diff", lastHash, "--no-color", "--unified=3"}
+		args = []string{"-C", taskRoot, "diff", lastHash, currentHash, "--no-color", "--unified=3"}
 	}
 	args = append(args, gitExcludePathspecs(taskRoot)...)
 
@@ -370,7 +374,7 @@ func pollGitDiffs(session Session, client *http.Client) (int, error) {
 	}
 
 	// Update baseline to current state after successful send
-	saveCurrentTreeHash(taskRoot)
+	_ = os.WriteFile(lastDiffRefPath(), []byte(currentHash), 0o644)
 
 	if sent > 0 {
 		fmt.Fprintf(os.Stderr, "git-watcher: sent %d file_diff event(s)\n", sent)
@@ -435,23 +439,44 @@ func splitUnifiedDiff(raw string) []fileDiffChunk {
 	return results
 }
 
-// saveCurrentTreeHash records the current working tree state so the next poll
-// only picks up new changes. Uses `git stash create` to get a commit object
-// representing the working tree without actually stashing anything.
+// saveCurrentTreeHash seeds the poll baseline before the candidate starts.
 func saveCurrentTreeHash(taskRoot string) {
-	// git stash create returns a commit hash representing current working tree
-	// state (staged + unstaged). Returns empty if working tree is clean.
-	out, err := exec.Command("git", "-C", taskRoot, "stash", "create").Output()
-	hash := strings.TrimSpace(string(out))
-	if err != nil || hash == "" {
-		// No uncommitted changes — use HEAD as baseline
-		out, err = exec.Command("git", "-C", taskRoot, "rev-parse", "HEAD").Output()
-		if err != nil {
-			return
-		}
-		hash = strings.TrimSpace(string(out))
+	hash, err := currentTreeHash(taskRoot)
+	if err == nil {
+		_ = os.WriteFile(lastDiffRefPath(), []byte(hash), 0o644)
 	}
-	_ = os.WriteFile(lastDiffRefPath(), []byte(hash), 0o644)
+}
+
+// currentTreeHash captures tracked and untracked files without changing the
+// candidate's index. stash create omits untracked setup files and fails on
+// snapshotWorkspace's intent-to-add entries; its HEAD fallback replayed setup
+// writes as likely_human. Polls compare two captured trees so untracked files
+// don't appear as deletions simply because they aren't in the real index yet.
+func currentTreeHash(taskRoot string) (string, error) {
+	dir, err := os.MkdirTemp("", "promptster-git-baseline-")
+	if err != nil {
+		return "", err
+	}
+	defer os.RemoveAll(dir)
+	runGit := func(args ...string) ([]byte, error) {
+		cmd := exec.Command("git", append([]string{"-C", taskRoot}, args...)...)
+		cmd.Env = append(os.Environ(), "GIT_INDEX_FILE="+filepath.Join(dir, "index"))
+		return cmd.Output()
+	}
+	if _, err := runGit("read-tree", "HEAD"); err != nil {
+		return "", err
+	}
+	// Keep changes to upstream-tracked files, including tracked secret fixtures;
+	// the add exclusions below apply to candidate-created files only.
+	if _, err := runGit("add", "-u"); err != nil {
+		return "", err
+	}
+	args := append([]string{"add", "-A"}, gitAddExcludePathspecs(taskRoot)...)
+	if _, err := runGit(args...); err != nil {
+		return "", err
+	}
+	out, err := runGit("write-tree")
+	return strings.TrimSpace(string(out)), err
 }
 
 func loadLastTreeHash() string {
