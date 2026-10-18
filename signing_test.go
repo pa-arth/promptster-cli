@@ -2,9 +2,12 @@ package main
 
 import (
 	"crypto/ed25519"
+	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -174,5 +177,63 @@ func TestBufferLock_ChainsSigs(t *testing.T) {
 	}
 	if e2.Sig == "" || e2.Sig == e1.Sig {
 		t.Fatalf("e2 sig unexpected: %q", e2.Sig)
+	}
+}
+
+// Expected bytes are JSON.stringify output, as used by the API's canonicalJson.
+// Go's default HTML/JSONP escaping is valid JSON but changes the signed hash.
+func TestSigningMatchesJavaScriptStrings(t *testing.T) {
+	cases := []struct{ name, text, want string }{
+		{"shell redirection", "echo <input >output && true", `"echo <input >output && true"`},
+		{"code and prose", "<div title=\"a&b\">\n\t</div>", `"<div title=\"a&b\">\n\t</div>"`},
+		{"line separators", "before\u2028between\u2029after", "\"before\u2028between\u2029after\""},
+		{"literal escapes", `\u003c \u003e \u0026 \u2028 \u2029`, `"\\u003c \\u003e \\u0026 \\u2028 \\u2029"`},
+		{"escaped slash before separator", "\\\u2028", "\"\\\\\u2028\""},
+	}
+	priv := ed25519.NewKeyFromSeed(fixtureSeed)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Exercise both object keys and nested values; both are signed strings.
+			e := fixtureEvent
+			e.Data = map[string]interface{}{tc.text: []interface{}{tc.text}}
+			want := "{" + tc.want + ":[" + tc.want + "]}"
+			got, err := canonicalJSON(e.Data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != want {
+				t.Fatalf("canonical bytes = %q, want JavaScript %q", got, want)
+			}
+			sigHex, _, err := signEvent(e, fixturePrevSig, priv)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Transport escapes must not affect the signature after JSON decoding.
+			wire, err := json.Marshal(e)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var decoded Event
+			if err := json.Unmarshal(wire, &decoded); err != nil {
+				t.Fatal(err)
+			}
+			hash := sha256.Sum256([]byte(want))
+			msg := strings.Replace(fixtureExpectedMessage, "754338c13ebc454648b60cc340edc9221e95c6e30e5feba10aa5a7b8506d24a5", hex.EncodeToString(hash[:]), 1)
+			sig, err := hex.DecodeString(sigHex)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !ed25519.Verify(priv.Public().(ed25519.PublicKey), []byte(msg), sig) {
+				t.Fatal("signature rejected by JavaScript canonical envelope")
+			}
+			decodedBytes, err := canonicalJSON(decoded.Data)
+			if err != nil || string(decodedBytes) != want {
+				t.Fatalf("wire round trip changed canonical bytes: %q, %v", decodedBytes, err)
+			}
+			tampered := strings.Replace(msg, e.ID, "tampered", 1)
+			if ed25519.Verify(priv.Public().(ed25519.PublicKey), []byte(tampered), sig) {
+				t.Fatal("accepted tampered envelope")
+			}
+		})
 	}
 }

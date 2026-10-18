@@ -73,6 +73,14 @@ func canonicalJSON(v interface{}) ([]byte, error) {
 	return []byte(buf.String()), nil
 }
 
+// JSON.stringify leaves HTML characters and Unicode line separators literal.
+// Consume escaped backslashes first so text like `\u003c` stays unchanged.
+var canonicalStringEscapes = strings.NewReplacer(
+	`\\`, `\\`,
+	`\u003c`, "<", `\u003e`, ">", `\u0026`, "&",
+	`\u2028`, "\u2028", `\u2029`, "\u2029",
+)
+
 func writeCanonical(buf *strings.Builder, v interface{}) error {
 	switch x := v.(type) {
 	case nil:
@@ -88,7 +96,7 @@ func writeCanonical(buf *strings.Builder, v interface{}) error {
 		if err != nil {
 			return err
 		}
-		buf.Write(b)
+		buf.WriteString(canonicalStringEscapes.Replace(string(b)))
 	case float64:
 		// json.Unmarshal decodes all numbers as float64. Emit integer form when
 		// the value has no fractional component — matches TS JSON.stringify.
@@ -134,7 +142,7 @@ func writeCanonical(buf *strings.Builder, v interface{}) error {
 			if err != nil {
 				return err
 			}
-			buf.Write(kb)
+			buf.WriteString(canonicalStringEscapes.Replace(string(kb)))
 			buf.WriteByte(':')
 			if err := writeCanonical(buf, val); err != nil {
 				return err
