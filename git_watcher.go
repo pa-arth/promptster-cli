@@ -26,6 +26,26 @@ const gitWatchInterval = 60 * time.Second
 // human, which inflates the candidate's contribution.
 const codexTurnAttributionWindow = gitWatchInterval + 30*time.Second
 
+// lockfileExcludePathspecs keep package-manager lockfiles out of file_diff
+// events. A lockfile is rewritten by an install, not authored, and one
+// `pnpm install` is thousands of lines that would otherwise dominate the
+// session's line attribution. They stay in the submission bundle and diff.
+var lockfileExcludePathspecs = []string{
+	":(exclude,glob)**/pnpm-lock.yaml",
+	":(exclude,glob)**/package-lock.json",
+	":(exclude,glob)**/npm-shrinkwrap.json",
+	":(exclude,glob)**/yarn.lock",
+	":(exclude,glob)**/bun.lock",
+	":(exclude,glob)**/bun.lockb",
+	":(exclude,glob)**/go.sum",
+	":(exclude,glob)**/Cargo.lock",
+	":(exclude,glob)**/poetry.lock",
+	":(exclude,glob)**/uv.lock",
+	":(exclude,glob)**/Pipfile.lock",
+	":(exclude,glob)**/Gemfile.lock",
+	":(exclude,glob)**/composer.lock",
+}
+
 // gitWatcherState tracks the background git-diff polling process.
 type gitWatcherState struct {
 	PID int `json:"pid"`
@@ -306,6 +326,7 @@ func pollGitDiffs(session Session, client *http.Client) (int, error) {
 		args = []string{"-C", taskRoot, "diff", lastHash, currentHash, "--no-color", "--unified=3"}
 	}
 	args = append(args, gitExcludePathspecs(taskRoot)...)
+	args = append(args, lockfileExcludePathspecs...)
 
 	diffOutput, err := exec.Command("git", args...).Output()
 	if err != nil {
@@ -340,9 +361,13 @@ func pollGitDiffs(session Session, client *http.Client) (int, error) {
 		// Otherwise: a fresh manual edit, or a human revision of a file an AI
 		// channel touched earlier (ai-paths ledger).
 		aiTouched := wasAiTouchedPath(session.SessionID, fd.path)
-		if codexRolloutActiveSince(time.Now().Add(-codexTurnAttributionWindow)) {
+		windowStart := time.Now().Add(-codexTurnAttributionWindow)
+		if codexRolloutActiveSince(windowStart) {
 			event.Actor = aiActor()
-			event.Provenance = codexTurnProvenance()
+			event.Provenance = agentWindowProvenance("codex-turn-window")
+		} else if agentShellActiveSince(windowStart) {
+			event.Actor = aiActor()
+			event.Provenance = agentWindowProvenance("claude-shell-window")
 		} else {
 			event.Actor = humanActor()
 			event.Provenance = gitPollProvenance(aiTouched)
