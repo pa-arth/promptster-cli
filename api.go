@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -589,6 +590,44 @@ func isRetryable(err error) bool {
 }
 
 // apiGetSession fetches session details via GET /v1/sessions/:id with API key auth.
+// sessionBudget is the candidate's spend against the cap the model proxy enforces.
+type sessionBudget struct {
+	SpentUsd  float64 `json:"spentUsd"`
+	BudgetUsd float64 `json:"budgetUsd"`
+}
+
+// apiGetBudget reads the session's spend and budget. Short timeout: it feeds a
+// status line, and a slow API must not hold up `promptster status`.
+func apiGetBudget(sessionID, apiKey string) (sessionBudget, error) {
+	var b sessionBudget
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL()+"/v1/sessions/"+sessionID+"/budget", nil)
+	if err != nil {
+		return b, err
+	}
+	req.Header.Set("X-API-Key", apiKey)
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return b, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return b, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&b); err != nil {
+		return b, err
+	}
+	if b.BudgetUsd <= 0 {
+		return b, fmt.Errorf("no budget in response")
+	}
+	return b, nil
+}
+
+func budgetText(b sessionBudget) string {
+	return fmt.Sprintf("$%.2f / $%.2f", b.SpentUsd, b.BudgetUsd)
+}
+
 func apiGetSession(sessionID, apiKey string) (map[string]interface{}, error) {
 	req, err := http.NewRequest(http.MethodGet, apiURL()+"/v1/sessions/"+sessionID, nil)
 	if err != nil {
