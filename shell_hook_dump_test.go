@@ -190,10 +190,10 @@ func TestShellHookScriptStructure(t *testing.T) {
 	}
 }
 
-// A new terminal in the hosted box never sees `start`'s output, so the hook
-// prints the candidate commands — only when a session is live.
-func TestShellHookPrintsCommandsWhenSessionLive(t *testing.T) {
-	if !strings.Contains(shellHookScript(), `[ -n "$_promptster_ws" ] && "$_promptster_bin" help 2>/dev/null`) {
-		t.Error("shell hook missing the session-gated `promptster help` banner")
+// The hook must not run `promptster help` on terminal open: the extension types
+// `claude`/`codex` into the terminal it creates, and the banner swallowed it.
+func TestShellHookDoesNotPrintBanner(t *testing.T) {
+	if strings.Contains(shellHookScript(), `"$_promptster_bin" help`) {
+		t.Error("shell hook must not run `promptster help` on terminal open; it swallows the auto-launched agent")
 	}
 }
