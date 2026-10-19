@@ -189,3 +189,11 @@ func TestShellHookScriptStructure(t *testing.T) {
 		t.Logf("--- rendered shell-hook.sh ---\n%s\n--- end ---", script)
 	}
 }
+
+// A new terminal in the hosted box never sees `start`'s output, so the hook
+// prints the candidate commands — only when a session is live.
+func TestShellHookPrintsCommandsWhenSessionLive(t *testing.T) {
+	if !strings.Contains(shellHookScript(), `[ -n "$_promptster_ws" ] && "$_promptster_bin" help 2>/dev/null`) {
+		t.Error("shell hook missing the session-gated `promptster help` banner")
+	}
+}
