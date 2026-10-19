@@ -62,6 +62,12 @@ func cmdStatus(args []string) {
 			out["remainingSeconds"] = int(remaining.Seconds())
 		}
 
+		// Absent on failure: an unreadable budget is not an unspent one.
+		if b, err := apiGetBudget(session.SessionID, session.SessionToken); err == nil {
+			out["spentUsd"] = b.SpentUsd
+			out["budgetUsd"] = b.BudgetUsd
+		}
+
 		nudge := loadNudgeState()
 		if !nudge.LastExplainAt.IsZero() {
 			out["lastExplainSecondsAgo"] = int(time.Since(nudge.LastExplainAt).Seconds())
@@ -118,6 +124,9 @@ func cmdStatus(args []string) {
 			remaining = 0
 		}
 		rows = append(rows, row("Remaining:", remaining.Round(time.Second).String()))
+	}
+	if b, err := apiGetBudget(session.SessionID, session.SessionToken); err == nil {
+		rows = append(rows, row("Budget:", budgetText(b)))
 	}
 
 	// Try to fetch live event count and status from the API.

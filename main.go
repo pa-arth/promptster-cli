@@ -14,6 +14,12 @@ var version = "dev"
 
 func main() {
 	if len(os.Args) < 2 {
+		// Mid-assessment the setup menu (start, doctor, abort) is noise; show
+		// the four commands a candidate actually uses.
+		if _, err := loadSession(); err == nil {
+			printCandidateUsage()
+			return
+		}
 		interactiveMenu()
 		return
 	}
@@ -77,7 +83,7 @@ func main() {
 	case "version", "--version", "-version", "-v":
 		fmt.Println(version)
 	case "help", "--help", "-h":
-		printUsage()
+		printHelp(os.Args[2:])
 		os.Exit(0)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n\n", os.Args[1])
@@ -172,6 +178,37 @@ func interactiveMenu() {
 			fmt.Fprintf(os.Stderr, "  Unknown option: %s\n", choice)
 		}
 	}
+}
+
+func hasArg(args []string, want string) bool {
+	for _, a := range args {
+		if a == want {
+			return true
+		}
+	}
+	return false
+}
+
+// printHelp shows the short candidate list inside a session, the full one otherwise.
+func printHelp(args []string) {
+	if _, err := loadSession(); err == nil && !hasArg(args, "--all") {
+		printCandidateUsage()
+		return
+	}
+	printUsage()
+}
+
+// printCandidateUsage is help for someone already inside an assessment.
+func printCandidateUsage() {
+	fmt.Print(`Your assessment is running. Commands:
+
+  promptster brief      Open the task
+  promptster status     Time and budget left
+  promptster explain    Note your reasoning for recent work
+  promptster done       Submit when you're finished
+
+  promptster help --all  — every command
+`)
 }
 
 func printUsage() {
