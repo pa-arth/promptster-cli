@@ -1,5 +1,9 @@
 # CLI Changelog
 
+## 1.12.1 - 2026-10-19
+
+- fix(hook): a new terminal no longer prints the candidate commands. 1.12.0 made the shell hook run `promptster help` whenever an interactive shell opened during a live session. In the hosted box the editor extension opens the assessment terminal and types `claude` (or `promptster codex`) into it straight away, and that typed command was lost while the hook ran, so candidates landed on the command list with no agent running. The hook is back to printing nothing. `promptster help` inside a session still prints the short candidate list from 1.12.0.
+
 ## 1.12.0 - 2026-10-19
 
 - feat(hook): a new terminal opened during a live session prints the candidate commands. Several candidates said they could not tell which `promptster` commands existed or how to submit. In the hosted box the worker runs `start --seeded` headlessly, so the "Helpful commands" block `start` prints went to the provisioning log and never reached the candidate, and the shell hook sourced from `/etc/bash.bashrc` printed nothing, so every code-server terminal opened to a bare prompt. The hook now runs `promptster help` once when an interactive shell is sourced with a live session, which prints the short list from the entry below. A shell with no session and a non-interactive shell (scp, scripts) stay silent. A terminal opened before the session went live shows nothing until the next one is opened
