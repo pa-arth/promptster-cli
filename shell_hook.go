@@ -121,6 +121,9 @@ _promptster_resolve_ws() {
 # ordinary no-session case; the hooks below still install, and no-op.
 _promptster_resolve_ws || :
 
+# Show the candidate commands once per new terminal while a session is live.
+[ -n "$_promptster_ws" ] && "$_promptster_bin" help 2>/dev/null
+
 _promptster_in_workspace() {
   # No live session → no workspace to be inside of.
   [ -n "$_promptster_ws" ] || return 1
