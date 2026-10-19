@@ -33,7 +33,8 @@ func TestAPIGetBudget(t *testing.T) {
 	for _, c := range []struct {
 		body   string
 		status int
-	}{{`{"error":"nope"}`, 500}, {`{"spentUsd":0}`, 200}, {`not json`, 200}} {
+	}{{`{"error":"nope"}`, 500}, {`{"spentUsd":0}`, 200}, {`not json`, 200},
+		{`{"budgetUsd":25}`, 200}, {`{"spentUsd":null,"budgetUsd":25}`, 200}} {
 		body, status = c.body, c.status
 		if _, err := apiGetBudget("sess-1", "PST-KEY"); err == nil {
 			t.Errorf("%d %s: want error", c.status, c.body)

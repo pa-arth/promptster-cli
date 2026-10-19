@@ -589,7 +589,6 @@ func isRetryable(err error) bool {
 	return false
 }
 
-// apiGetSession fetches session details via GET /v1/sessions/:id with API key auth.
 // sessionBudget is the candidate's spend against the cap the model proxy enforces.
 type sessionBudget struct {
 	SpentUsd  float64 `json:"spentUsd"`
@@ -615,19 +614,25 @@ func apiGetBudget(sessionID, apiKey string) (sessionBudget, error) {
 	if resp.StatusCode != 200 {
 		return b, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&b); err != nil {
+	// Pointers, so a missing or null field is an error rather than a zero.
+	var raw struct {
+		SpentUsd  *float64 `json:"spentUsd"`
+		BudgetUsd *float64 `json:"budgetUsd"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
 		return b, err
 	}
-	if b.BudgetUsd <= 0 {
-		return b, fmt.Errorf("no budget in response")
+	if raw.SpentUsd == nil || raw.BudgetUsd == nil || *raw.BudgetUsd <= 0 {
+		return b, fmt.Errorf("incomplete budget in response")
 	}
-	return b, nil
+	return sessionBudget{SpentUsd: *raw.SpentUsd, BudgetUsd: *raw.BudgetUsd}, nil
 }
 
 func budgetText(b sessionBudget) string {
 	return fmt.Sprintf("$%.2f / $%.2f", b.SpentUsd, b.BudgetUsd)
 }
 
+// apiGetSession fetches session details via GET /v1/sessions/:id with API key auth.
 func apiGetSession(sessionID, apiKey string) (map[string]interface{}, error) {
 	req, err := http.NewRequest(http.MethodGet, apiURL()+"/v1/sessions/"+sessionID, nil)
 	if err != nil {
