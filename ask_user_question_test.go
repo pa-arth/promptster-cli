@@ -205,15 +205,20 @@ func TestDrainQueuedPrompts(t *testing.T) {
 	second := strings.Replace(queuedHumanLine, "4k/hr at peak", "9k/hr on Mondays", 1)
 	write(second[:40])
 
-	got := drainQueuedPrompts(transcript, "sess-1", start)
+	drain := func() []Event {
+		var got []Event
+		drainQueuedPrompts(transcript, "sess-1", start, func(e Event) { got = append(got, e) })
+		return got
+	}
+	got := drain()
 	if len(got) != 1 || dm(got[0])["text"] != "also the rate is about 4k/hr at peak" || got[0].SessionID != "sess-1" {
 		t.Fatalf("first drain = %v", got)
 	}
-	if again := drainQueuedPrompts(transcript, "sess-1", start); len(again) != 0 {
+	if again := drain(); len(again) != 0 {
 		t.Fatalf("re-drain emitted %v", again)
 	}
 	write(second[40:] + "\n")
-	got = drainQueuedPrompts(transcript, "sess-1", start)
+	got = drain()
 	if len(got) != 1 || dm(got[0])["text"] != "also the rate is about 9k/hr on Mondays" {
 		t.Fatalf("second drain = %v", got)
 	}

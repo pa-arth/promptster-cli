@@ -30,17 +30,18 @@ func queuedScanStatePath() string {
 	return filepath.Join(stateDir(), "claude-queued-scan.json")
 }
 
-// drainQueuedPrompts returns prompt events for queued messages written to
-// transcriptPath since the last call. Messages stamped before notBefore are
-// skipped: a transcript resumed from before the session started is not part of
-// it. The read and the offset update happen under one lock so concurrent hooks
-// never emit the same message twice.
-func drainQueuedPrompts(transcriptPath, sessionID string, notBefore time.Time) []Event {
+// drainQueuedPrompts passes emit a prompt event for each queued message
+// written to transcriptPath since the last call. Messages stamped before
+// notBefore are skipped: a transcript resumed from before the session started
+// is not part of it. Read, emit and offset update happen under one lock, and the
+// offset only advances once every event in the batch has been emitted, so
+// concurrent hooks never send a message twice and a hook killed mid-batch
+// leaves the batch to be read again rather than lost.
+func drainQueuedPrompts(transcriptPath, sessionID string, notBefore time.Time, emit func(Event)) {
 	if transcriptPath == "" {
-		return nil
+		return
 	}
 	statePath := queuedScanStatePath()
-	var events []Event
 	err := withBufferLock(statePath+".lock", func() error {
 		state := queuedScanState{Offsets: map[string]int64{}}
 		if data, err := os.ReadFile(statePath); err == nil {
@@ -88,7 +89,7 @@ func drainQueuedPrompts(transcriptPath, sessionID string, notBefore time.Time) [
 				if t, err := time.Parse(time.RFC3339Nano, e.Ts); err == nil && t.Before(notBefore) {
 					continue
 				}
-				events = append(events, e)
+				emit(e)
 			}
 		}
 		state.Offsets[transcriptPath] = offset + int64(len(chunk))
@@ -97,7 +98,6 @@ func drainQueuedPrompts(transcriptPath, sessionID string, notBefore time.Time) [
 	if err != nil {
 		hookDebugf("queued prompt scan: %v", err)
 	}
-	return events
 }
 
 func saveQueuedScanState(path string, state queuedScanState) error {

@@ -198,9 +198,9 @@ func cmdHook(args []string) {
 	// them out of the transcript on whichever hook runs next.
 	if detectSource(payload) == "claude-code" {
 		transcriptPath, _ := payload["transcript_path"].(string)
-		for _, queued := range drainQueuedPrompts(transcriptPath, session.SessionID, session.StartedAt) {
+		drainQueuedPrompts(transcriptPath, session.SessionID, session.StartedAt, func(queued Event) {
 			sendHookEvent(session, queued)
-		}
+		})
 	}
 
 	event, ok := normalize(payload, session.SessionID)

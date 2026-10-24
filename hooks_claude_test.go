@@ -168,3 +168,40 @@ func TestConfigureClaudeHooks_ReRunStillCleansLegacyGlobalHooks(t *testing.T) {
 		t.Fatalf("stale global Promptster hooks remained after rerun: %s", string(globalData))
 	}
 }
+
+// A workspace configured before PostToolUseFailure was registered gains it on
+// the next start, without duplicating the hook points it already had.
+func TestConfigureClaudeHooks_AddsMissingPointsWithoutDuplicates(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	workspace := filepath.Join(t.TempDir(), "task")
+	path := claudeProjectSettingsPath(workspace)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	old := map[string]interface{}{}
+	for _, point := range []string{"PreToolUse", "PostToolUse", "UserPromptSubmit", "Stop", "Notification"} {
+		old[point] = []interface{}{hookEntry("/bin/promptster hook post-tool-use")}
+	}
+	data, _ := json.Marshal(map[string]interface{}{"hooks": old})
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := configureClaudeHooks(workspace); err != nil {
+		t.Fatalf("configureClaudeHooks: %v", err)
+	}
+	data, _ = os.ReadFile(path)
+	var settings map[string]interface{}
+	if err := json.Unmarshal(data, &settings); err != nil {
+		t.Fatal(err)
+	}
+	if !isHookConfigured(settings) {
+		t.Fatalf("hooks not fully configured: %s", data)
+	}
+	hooks := settings["hooks"].(map[string]interface{})
+	for _, point := range claudeHookPointNames {
+		if n := len(hooks[point].([]interface{})); n != 1 {
+			t.Errorf("%s has %d entries, want 1", point, n)
+		}
+	}
+}
