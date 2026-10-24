@@ -194,6 +194,15 @@ func cmdHook(args []string) {
 		return
 	}
 
+	// Messages typed while Claude was working fire no hook of their own; lift
+	// them out of the transcript on whichever hook runs next.
+	if detectSource(payload) == "claude-code" {
+		transcriptPath, _ := payload["transcript_path"].(string)
+		for _, queued := range drainQueuedPrompts(transcriptPath, session.SessionID, session.StartedAt) {
+			sendHookEvent(session, queued)
+		}
+	}
+
 	event, ok := normalize(payload, session.SessionID)
 	if !ok {
 		return
@@ -239,6 +248,12 @@ func cmdHook(args []string) {
 	// a FALLBACK and for the lifecycle/intent kinds the transcript doesn't
 	// carry. All side effects above (snapshot push, time-limit check, file
 	// change counter) already ran — suppression only skips buffer + ingest.
+	sendHookEvent(session, event)
+}
+
+// sendHookEvent buffers, signs and ingests one hook-captured event, unless the
+// transcript watcher owns its kind.
+func sendHookEvent(session Session, event Event) {
 	if suppressForTranscriptCapture(session, &event) {
 		hookDebugf("suppressed kind=%s (transcript watcher healthy)", event.Kind)
 		return
@@ -250,7 +265,7 @@ func cmdHook(args []string) {
 
 	hookDebugAppend(time.Now().UTC().Format(time.RFC3339Nano) + " sending " + apiURL() + "/v1/hooks/ingest")
 	client := &http.Client{Timeout: 3 * time.Second}
-	err = ingestEventWithClient(client, event, session.SessionToken)
+	err := ingestEventWithClient(client, event, session.SessionToken)
 	if err != nil {
 		hookDebugAppend(time.Now().UTC().Format(time.RFC3339Nano) + " send_error " + err.Error())
 		hookDebugf("send request: %v", err)
