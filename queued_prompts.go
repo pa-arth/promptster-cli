@@ -36,7 +36,8 @@ func queuedScanStatePath() string {
 // is not part of it. Read, emit and offset update happen under one lock, and the
 // offset only advances once every event in the batch has been emitted, so
 // concurrent hooks never send a message twice and a hook killed mid-batch
-// leaves the batch to be read again rather than lost.
+// leaves the batch to be read again rather than lost. emit runs under the lock:
+// it should persist the event, not wait on the network.
 func drainQueuedPrompts(transcriptPath, sessionID string, notBefore time.Time, emit func(Event)) {
 	if transcriptPath == "" {
 		return

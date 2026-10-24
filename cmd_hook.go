@@ -198,9 +198,17 @@ func cmdHook(args []string) {
 	// them out of the transcript on whichever hook runs next.
 	if detectSource(payload) == "claude-code" {
 		transcriptPath, _ := payload["transcript_path"].(string)
-		drainQueuedPrompts(transcriptPath, session.SessionID, session.StartedAt, func(queued Event) {
-			sendHookEvent(session, queued)
+		// Buffered inside the scan lock (so the offset never passes an event
+		// that is not on disk), sent after it (so no hook waits on the network).
+		var queued []Event
+		drainQueuedPrompts(transcriptPath, session.SessionID, session.StartedAt, func(e Event) {
+			if bufferHookEvent(session, &e) {
+				queued = append(queued, e)
+			}
 		})
+		for _, e := range queued {
+			ingestHookEvent(session, e)
+		}
 	}
 
 	event, ok := normalize(payload, session.SessionID)
@@ -254,15 +262,27 @@ func cmdHook(args []string) {
 // sendHookEvent buffers, signs and ingests one hook-captured event, unless the
 // transcript watcher owns its kind.
 func sendHookEvent(session Session, event Event) {
-	if suppressForTranscriptCapture(session, &event) {
-		hookDebugf("suppressed kind=%s (transcript watcher healthy)", event.Kind)
-		return
+	if bufferHookEvent(session, &event) {
+		ingestHookEvent(session, event)
 	}
+}
 
-	if err := appendEventToLocalBuffer(&event); err != nil {
+// bufferHookEvent signs the event and appends it to the local buffer. It
+// reports false when the transcript watcher owns the kind and the event must
+// not be sent at all.
+func bufferHookEvent(session Session, event *Event) bool {
+	if suppressForTranscriptCapture(session, event) {
+		hookDebugf("suppressed kind=%s (transcript watcher healthy)", event.Kind)
+		return false
+	}
+	if err := appendEventToLocalBuffer(event); err != nil {
 		hookDebugf("buffer append error: %v", err)
 	}
+	return true
+}
 
+// ingestHookEvent posts an already-buffered event to the ingest API.
+func ingestHookEvent(session Session, event Event) {
 	hookDebugAppend(time.Now().UTC().Format(time.RFC3339Nano) + " sending " + apiURL() + "/v1/hooks/ingest")
 	client := &http.Client{Timeout: 3 * time.Second}
 	err := ingestEventWithClient(client, event, session.SessionToken)
