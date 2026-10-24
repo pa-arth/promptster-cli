@@ -215,6 +215,9 @@ func (p *claudeTranscriptProcessor) processLine(line []byte) []Event {
 		// is complete before tool results / next prompts get written).
 		events := p.flushAccum()
 		return append(events, p.handleUser(rec, line)...)
+	case "attachment":
+		events := p.flushAccum()
+		return append(events, p.handleQueuedPrompt(rec, line)...)
 	default:
 		// mode / worktree-state / file-history-snapshot / system / ... carry
 		// no signal of their own but are reliable flush boundaries.
@@ -639,6 +642,65 @@ func (p *claudeTranscriptProcessor) promptEvent(text string, rec map[string]inte
 	e.Data = data
 	e.RawPayload = strPreview(string(line), 500)
 	return []Event{e}
+}
+
+// handleQueuedPrompt turns a message the candidate typed while Claude was
+// still working into a prompt event. Claude Code queues it and, rather than
+// starting a new turn, injects it into the running one as an attachment line —
+// no user line is written and no UserPromptSubmit hook fires, so it was
+// otherwise captured nowhere:
+//
+//	{"type":"attachment","timestamp",...,"attachment":{"type":"queued_command",
+//	 "prompt":"...","commandMode":"prompt","origin":{"kind":"human"},"timestamp"}}
+//
+// The attachment's timestamp is when the candidate pressed enter, not when
+// Claude picked it up. Background-task notifications and coordinator messages
+// travel the same way; only human-typed prompts become events.
+func (p *claudeTranscriptProcessor) handleQueuedPrompt(rec map[string]interface{}, line []byte) []Event {
+	att, _ := rec["attachment"].(map[string]interface{})
+	if att == nil || stringField(att, "type") != "queued_command" {
+		return nil
+	}
+	if mode := stringField(att, "commandMode"); mode != "" && mode != "prompt" {
+		return nil
+	}
+	if origin, ok := att["origin"].(map[string]interface{}); ok && stringField(origin, "kind") != "human" {
+		return nil
+	}
+	if isMeta, _ := att["isMeta"].(bool); isMeta {
+		return nil
+	}
+	var text string
+	switch prompt := att["prompt"].(type) {
+	case string:
+		text = prompt
+	case []interface{}:
+		// Pasted images make the prompt a block array; keep its text.
+		var parts []string
+		for _, rawBlock := range prompt {
+			if block, _ := rawBlock.(map[string]interface{}); block != nil && stringField(block, "type") == "text" {
+				parts = append(parts, stringField(block, "text"))
+			}
+		}
+		text = strings.Join(parts, "\n")
+	}
+	if strings.HasPrefix(strings.TrimSpace(text), "<task-notification>") {
+		return nil
+	}
+	ts := stringField(att, "timestamp")
+	if ts == "" {
+		ts, _ = rec["timestamp"].(string)
+	}
+	events := p.promptEvent(text, rec, ts, line)
+	for i := range events {
+		if events[i].Kind != "prompt" {
+			continue
+		}
+		if data, ok := events[i].Data.(map[string]interface{}); ok {
+			data["queued"] = true
+		}
+	}
+	return events
 }
 
 // slashCommandBuiltins are Claude Code built-ins with dedicated semantics

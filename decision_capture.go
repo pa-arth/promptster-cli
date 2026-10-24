@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -513,8 +514,6 @@ func maybeCaptureDecisionFromHook(event Event) {
 	}
 }
 
-
-
 func sanitizeImpact(score int) int {
 	if score < 1 {
 		return 1
@@ -524,7 +523,6 @@ func sanitizeImpact(score int) int {
 	}
 	return score
 }
-
 
 func persistDecisionCapture(record decisionCaptureRecord) error {
 	session, err := loadSession()
@@ -595,9 +593,29 @@ func ingestEventWithClient(client *http.Client, event Event, apiKey string) erro
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	if resp.StatusCode >= 300 {
-		return fmt.Errorf("ingest failed: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+		return &ingestStatusError{Status: resp.StatusCode, Body: strings.TrimSpace(string(respBody))}
 	}
 	return nil
+}
+
+// ingestStatusError is an ingest request the server answered with a non-2xx.
+type ingestStatusError struct {
+	Status int
+	Body   string
+}
+
+func (e *ingestStatusError) Error() string {
+	return fmt.Sprintf("ingest failed: HTTP %d: %s", e.Status, e.Body)
+}
+
+// ingestRejectedPermanently reports whether retrying the same event can never
+// succeed: the server answered with a 4xx other than timeout / rate limit.
+func ingestRejectedPermanently(err error) bool {
+	var se *ingestStatusError
+	if !errors.As(err, &se) {
+		return false
+	}
+	return se.Status >= 400 && se.Status < 500 && se.Status != http.StatusRequestTimeout && se.Status != http.StatusTooManyRequests
 }
 
 func severityFromImpact(score int) string {

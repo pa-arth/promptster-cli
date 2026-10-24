@@ -194,6 +194,30 @@ func cmdHook(args []string) {
 		return
 	}
 
+	// Messages typed while Claude was working fire no hook of their own; lift
+	// them out of the transcript on whichever hook runs next.
+	if detectSource(payload) == "claude-code" {
+		transcriptPath, _ := payload["transcript_path"].(string)
+		// Buffered and queued for sending inside the scan lock (so the offset
+		// never passes an event that is not on disk), sent after it (so no hook
+		// waits on the network behind another).
+		drainQueuedPrompts(transcriptPath, session.SessionID, session.StartedAt, func(e Event) {
+			if !bufferHookEvent(session, &e) {
+				return
+			}
+			if err := savePendingQueued(e); err != nil {
+				hookDebugf("queue pending prompt: %v", err)
+				ingestHookEvent(session, e)
+			}
+		})
+		client := &http.Client{Timeout: 3 * time.Second}
+		flushPendingQueued(session.SessionID, func(e Event) error {
+			err := ingestEventWithClient(client, e, session.SessionToken)
+			hookDebugf("queued prompt sent: err=%v", err)
+			return err
+		})
+	}
+
 	event, ok := normalize(payload, session.SessionID)
 	if !ok {
 		return
@@ -239,18 +263,36 @@ func cmdHook(args []string) {
 	// a FALLBACK and for the lifecycle/intent kinds the transcript doesn't
 	// carry. All side effects above (snapshot push, time-limit check, file
 	// change counter) already ran — suppression only skips buffer + ingest.
-	if suppressForTranscriptCapture(session, &event) {
-		hookDebugf("suppressed kind=%s (transcript watcher healthy)", event.Kind)
-		return
-	}
+	sendHookEvent(session, event)
+}
 
-	if err := appendEventToLocalBuffer(&event); err != nil {
+// sendHookEvent buffers, signs and ingests one hook-captured event, unless the
+// transcript watcher owns its kind.
+func sendHookEvent(session Session, event Event) {
+	if bufferHookEvent(session, &event) {
+		ingestHookEvent(session, event)
+	}
+}
+
+// bufferHookEvent signs the event and appends it to the local buffer. It
+// reports false when the transcript watcher owns the kind and the event must
+// not be sent at all.
+func bufferHookEvent(session Session, event *Event) bool {
+	if suppressForTranscriptCapture(session, event) {
+		hookDebugf("suppressed kind=%s (transcript watcher healthy)", event.Kind)
+		return false
+	}
+	if err := appendEventToLocalBuffer(event); err != nil {
 		hookDebugf("buffer append error: %v", err)
 	}
+	return true
+}
 
+// ingestHookEvent posts an already-buffered event to the ingest API.
+func ingestHookEvent(session Session, event Event) {
 	hookDebugAppend(time.Now().UTC().Format(time.RFC3339Nano) + " sending " + apiURL() + "/v1/hooks/ingest")
 	client := &http.Client{Timeout: 3 * time.Second}
-	err = ingestEventWithClient(client, event, session.SessionToken)
+	err := ingestEventWithClient(client, event, session.SessionToken)
 	if err != nil {
 		hookDebugAppend(time.Now().UTC().Format(time.RFC3339Nano) + " send_error " + err.Error())
 		hookDebugf("send request: %v", err)

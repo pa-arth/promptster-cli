@@ -479,6 +479,11 @@ func normalizeClaudeCode(payload map[string]interface{}, sessionID string) (Even
 
 	case "PostToolUseFailure":
 		toolName, _ := payload["tool_name"].(string)
+		if toolName == "AskUserQuestion" {
+			// Dismissed question: keep what was asked, with no answer.
+			toolInput, _ := payload["tool_input"].(map[string]interface{})
+			return normalizeAskUserQuestion(toolInput, nil, sessionID, raw), true
+		}
 		errMsg, _ := payload["error"].(string)
 		if errMsg == "" {
 			errMsg = fmt.Sprintf("tool %s failed", toolName)
@@ -645,6 +650,9 @@ func taskNumberFromResponse(toolResponse map[string]interface{}) (int, bool) {
 
 func normalizePostToolUseByTool(toolName string, toolInput, toolResponse map[string]interface{}, sessionID, raw string) (Event, bool) {
 	switch {
+	case toolName == "AskUserQuestion":
+		return normalizeAskUserQuestion(toolInput, toolResponse, sessionID, raw), true
+
 	case strings.Contains(toolName, "Edit") || toolName == "Write" || toolName == "StrReplace":
 		filePath, _ := toolInput["file_path"].(string)
 		if filePath == "" {

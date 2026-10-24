@@ -106,24 +106,19 @@ func configureClaudeHooks(workspacePath string) error {
 		hooksSection = make(map[string]interface{})
 	}
 
-	// Register all Claude Code hook points that Promptster needs.
-	// PreToolUse/PostToolUse capture tool calls (commands, file edits, reads, etc.)
-	// UserPromptSubmit captures every prompt the user sends.
-	// Stop captures turn-end metadata (token usage, cost, duration).
-	// Notification is used for session lifecycle events.
-	claudeHookPoints := []string{
-		"PreToolUse",
-		"PostToolUse",
-		"UserPromptSubmit",
-		"Stop",
-		"Notification",
-	}
-	for _, hookPoint := range claudeHookPoints {
+	// Register all Claude Code hook points that Promptster needs (see
+	// claudeHookPointNames). A workspace configured by an older CLI lacks the
+	// points added since, so only those are appended — points that already
+	// carry a promptster entry are left alone rather than duplicated.
+	for _, hookPoint := range claudeHookPointNames {
 		subcommand := "post-tool-use"
 		if hookPoint == "PreToolUse" || hookPoint == "UserPromptSubmit" {
 			subcommand = "pre-tool-use"
 		}
 		arr, _ := hooksSection[hookPoint].([]interface{})
+		if hookPointHasPromptster(arr) {
+			continue
+		}
 		hooksSection[hookPoint] = append(arr, hookEntry(bin+" hook "+subcommand))
 	}
 
@@ -237,7 +232,24 @@ func removePromptsterClaudeHooks(settings map[string]interface{}) (map[string]in
 // isHookConfigured returns true when a "promptster hook" command is already
 // present anywhere in the Claude PreToolUse or PostToolUse hook arrays.
 // claudeHookPointNames lists all Claude Code hook points Promptster registers.
-var claudeHookPointNames = []string{"PreToolUse", "PostToolUse", "UserPromptSubmit", "Stop", "Notification"}
+// PreToolUse/PostToolUse capture tool calls (commands, file edits, reads, etc.);
+// PostToolUseFailure captures failed and rejected ones, including a dismissed
+// AskUserQuestion. UserPromptSubmit captures every prompt the user sends. Stop
+// captures turn-end metadata (token usage, cost, duration). Notification is
+// used for session lifecycle events.
+var claudeHookPointNames = []string{"PreToolUse", "PostToolUse", "PostToolUseFailure", "UserPromptSubmit", "Stop", "Notification"}
+
+// hookPointHasPromptster reports whether a hook point's entry list already
+// runs `promptster hook`.
+func hookPointHasPromptster(arr []interface{}) bool {
+	for _, entry := range arr {
+		b, _ := json.Marshal(entry)
+		if strings.Contains(string(b), "promptster hook") {
+			return true
+		}
+	}
+	return false
+}
 
 // hasAnyPromptsterHook returns true if ANY hook entry contains "promptster hook".
 // Used for legacy migration where not all hook points may be present.
@@ -265,16 +277,8 @@ func isHookConfigured(settings map[string]interface{}) bool {
 	}
 	// Consider configured if ALL expected hook points have a promptster entry.
 	for _, key := range claudeHookPointNames {
-		found := false
 		arr, _ := hooksSection[key].([]interface{})
-		for _, entry := range arr {
-			b, _ := json.Marshal(entry)
-			if strings.Contains(string(b), "promptster hook") {
-				found = true
-				break
-			}
-		}
-		if !found {
+		if !hookPointHasPromptster(arr) {
 			return false
 		}
 	}
