@@ -211,7 +211,7 @@ func cmdHook(args []string) {
 			}
 		})
 		client := &http.Client{Timeout: 3 * time.Second}
-		flushPendingQueued(func(e Event) error {
+		flushPendingQueued(session.SessionID, func(e Event) error {
 			err := ingestEventWithClient(client, e, session.SessionToken)
 			hookDebugf("queued prompt sent: err=%v", err)
 			return err

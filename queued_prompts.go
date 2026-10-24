@@ -120,13 +120,15 @@ func saveQueuedScanState(path string, state queuedScanState) error {
 // leaves the rest there, and the next hook sends them. Nothing else retries
 // buffer.jsonl, so this directory is what makes the hand-off durable.
 
-func queuedPendingDir() string {
-	return filepath.Join(stateDir(), "queued-pending")
+// queuedPendingDir is per session: a prompt is only ever sent with the token
+// of the session it was captured in, never with whichever session is current.
+func queuedPendingDir(sessionID string) string {
+	return filepath.Join(stateDir(), "queued-pending", sessionID)
 }
 
 // savePendingQueued records a buffered queued prompt awaiting ingest.
 func savePendingQueued(e Event) error {
-	dir := queuedPendingDir()
+	dir := queuedPendingDir(e.SessionID)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
@@ -141,14 +143,14 @@ func savePendingQueued(e Event) error {
 	return os.Rename(path+".tmp", path)
 }
 
-// flushPendingQueued sends every pending queued prompt, oldest first, deleting
+// flushPendingQueued sends every pending queued prompt of sessionID, oldest first, deleting
 // each once the server has it. A send that may succeed later (network error,
 // 5xx, 408, 429) stops the flush and keeps the rest for the next hook; a
 // permanent rejection is dropped so it cannot block the queue forever. When
 // another hook is already flushing, this one returns at once rather than wait
 // or send the same prompts twice.
-func flushPendingQueued(send func(Event) error) {
-	dir := queuedPendingDir()
+func flushPendingQueued(sessionID string, send func(Event) error) {
+	dir := queuedPendingDir(sessionID)
 	_, err := tryBufferLock(dir+".lock", func() error {
 		entries, err := os.ReadDir(dir)
 		if err != nil {

@@ -237,13 +237,13 @@ func TestFlushPendingQueued(t *testing.T) {
 		}
 	}
 	pending := func() int {
-		entries, _ := os.ReadDir(queuedPendingDir())
+		entries, _ := os.ReadDir(queuedPendingDir("sess-1"))
 		return len(entries)
 	}
 
 	// A transient failure stops the flush and keeps the rest, oldest first.
 	var sent []string
-	flushPendingQueued(func(e Event) error {
+	flushPendingQueued("sess-1", func(e Event) error {
 		sent = append(sent, e.Ts)
 		if len(sent) == 2 {
 			return errors.New("ingest request failed: timeout")
@@ -256,7 +256,7 @@ func TestFlushPendingQueued(t *testing.T) {
 
 	// A permanent rejection is dropped rather than retried forever.
 	sent = nil
-	flushPendingQueued(func(e Event) error {
+	flushPendingQueued("sess-1", func(e Event) error {
 		sent = append(sent, e.Ts)
 		if e.Ts == "2026-10-24T06:10:02Z" {
 			return &ingestStatusError{Status: 400, Body: "invalid"}
@@ -273,13 +273,19 @@ func TestFlushPendingQueued(t *testing.T) {
 		t.Fatal(err)
 	}
 	called := false
-	if _, err := tryBufferLock(queuedPendingDir()+".lock", func() error {
-		flushPendingQueued(func(Event) error { called = true; return nil })
+	if _, err := tryBufferLock(queuedPendingDir("sess-1")+".lock", func() error {
+		flushPendingQueued("sess-1", func(Event) error { called = true; return nil })
 		return nil
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if called || pending() != 1 {
 		t.Fatalf("flushed under a held lock (called=%v, %d pending)", called, pending())
+	}
+
+	// Another session's leftovers are never sent with this session's token.
+	flushPendingQueued("sess-2", func(Event) error { called = true; return nil })
+	if called || pending() != 1 {
+		t.Fatalf("sess-2 flush touched sess-1 (called=%v, %d pending)", called, pending())
 	}
 }
