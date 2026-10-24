@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 )
 
@@ -111,4 +112,79 @@ func saveQueuedScanState(path string, state queuedScanState) error {
 		return err
 	}
 	return os.Rename(tmp, path)
+}
+
+// Queued prompts are signed and buffered under the scan lock, but posted after
+// it is released so no hook waits on the network behind another. Between the
+// two, each one waits as a file in queuedPendingDir: a hook killed mid-send
+// leaves the rest there, and the next hook sends them. Nothing else retries
+// buffer.jsonl, so this directory is what makes the hand-off durable.
+
+func queuedPendingDir() string {
+	return filepath.Join(stateDir(), "queued-pending")
+}
+
+// savePendingQueued records a buffered queued prompt awaiting ingest.
+func savePendingQueued(e Event) error {
+	dir := queuedPendingDir()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	data, err := json.Marshal(e)
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(dir, e.ID+".json")
+	if err := os.WriteFile(path+".tmp", data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(path+".tmp", path)
+}
+
+// flushPendingQueued sends every pending queued prompt, oldest first, deleting
+// each once the server has it. A send that may succeed later (network error,
+// 5xx, 408, 429) stops the flush and keeps the rest for the next hook; a
+// permanent rejection is dropped so it cannot block the queue forever. When
+// another hook is already flushing, this one returns at once rather than wait
+// or send the same prompts twice.
+func flushPendingQueued(send func(Event) error) {
+	dir := queuedPendingDir()
+	_, err := tryBufferLock(dir+".lock", func() error {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		type pending struct {
+			path  string
+			event Event
+		}
+		var queue []pending
+		for _, entry := range entries {
+			if filepath.Ext(entry.Name()) != ".json" {
+				continue
+			}
+			path := filepath.Join(dir, entry.Name())
+			var e Event
+			data, err := os.ReadFile(path)
+			if err != nil || json.Unmarshal(data, &e) != nil {
+				_ = os.Remove(path) // unreadable: nothing to send
+				continue
+			}
+			queue = append(queue, pending{path, e})
+		}
+		sort.Slice(queue, func(i, j int) bool { return queue[i].event.Ts < queue[j].event.Ts })
+		for _, q := range queue {
+			if err := send(q.event); err != nil && !ingestRejectedPermanently(err) {
+				return err
+			}
+			_ = os.Remove(q.path)
+		}
+		return nil
+	})
+	if err != nil {
+		hookDebugf("queued prompt flush: %v", err)
+	}
 }

@@ -198,17 +198,24 @@ func cmdHook(args []string) {
 	// them out of the transcript on whichever hook runs next.
 	if detectSource(payload) == "claude-code" {
 		transcriptPath, _ := payload["transcript_path"].(string)
-		// Buffered inside the scan lock (so the offset never passes an event
-		// that is not on disk), sent after it (so no hook waits on the network).
-		var queued []Event
+		// Buffered and queued for sending inside the scan lock (so the offset
+		// never passes an event that is not on disk), sent after it (so no hook
+		// waits on the network behind another).
 		drainQueuedPrompts(transcriptPath, session.SessionID, session.StartedAt, func(e Event) {
-			if bufferHookEvent(session, &e) {
-				queued = append(queued, e)
+			if !bufferHookEvent(session, &e) {
+				return
+			}
+			if err := savePendingQueued(e); err != nil {
+				hookDebugf("queue pending prompt: %v", err)
+				ingestHookEvent(session, e)
 			}
 		})
-		for _, e := range queued {
-			ingestHookEvent(session, e)
-		}
+		client := &http.Client{Timeout: 3 * time.Second}
+		flushPendingQueued(func(e Event) error {
+			err := ingestEventWithClient(client, e, session.SessionToken)
+			hookDebugf("queued prompt sent: err=%v", err)
+			return err
+		})
 	}
 
 	event, ok := normalize(payload, session.SessionID)

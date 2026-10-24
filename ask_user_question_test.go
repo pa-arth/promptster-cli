@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -221,5 +223,63 @@ func TestDrainQueuedPrompts(t *testing.T) {
 	got = drain()
 	if len(got) != 1 || dm(got[0])["text"] != "also the rate is about 9k/hr on Mondays" {
 		t.Fatalf("second drain = %v", got)
+	}
+}
+
+func TestFlushPendingQueued(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	for i, ts := range []string{"2026-10-24T06:10:03Z", "2026-10-24T06:10:01Z", "2026-10-24T06:10:02Z"} {
+		e := newEvent("prompt", "sess-1")
+		e.ID = fmt.Sprintf("e%d", i)
+		e.Ts = ts
+		if err := savePendingQueued(e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pending := func() int {
+		entries, _ := os.ReadDir(queuedPendingDir())
+		return len(entries)
+	}
+
+	// A transient failure stops the flush and keeps the rest, oldest first.
+	var sent []string
+	flushPendingQueued(func(e Event) error {
+		sent = append(sent, e.Ts)
+		if len(sent) == 2 {
+			return errors.New("ingest request failed: timeout")
+		}
+		return nil
+	})
+	if !reflect.DeepEqual(sent, []string{"2026-10-24T06:10:01Z", "2026-10-24T06:10:02Z"}) || pending() != 2 {
+		t.Fatalf("sent %v, %d pending", sent, pending())
+	}
+
+	// A permanent rejection is dropped rather than retried forever.
+	sent = nil
+	flushPendingQueued(func(e Event) error {
+		sent = append(sent, e.Ts)
+		if e.Ts == "2026-10-24T06:10:02Z" {
+			return &ingestStatusError{Status: 400, Body: "invalid"}
+		}
+		return nil
+	})
+	if len(sent) != 2 || pending() != 0 {
+		t.Fatalf("sent %v, %d pending", sent, pending())
+	}
+
+	// While another hook holds the flush, this one neither waits nor sends.
+	e := newEvent("prompt", "sess-1")
+	if err := savePendingQueued(e); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	if _, err := tryBufferLock(queuedPendingDir()+".lock", func() error {
+		flushPendingQueued(func(Event) error { called = true; return nil })
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if called || pending() != 1 {
+		t.Fatalf("flushed under a held lock (called=%v, %d pending)", called, pending())
 	}
 }
