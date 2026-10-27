@@ -110,6 +110,7 @@ func submitWorkspaceCode(session Session, autoSubmit bool) (bool, bool) {
 
 	if !isGitRepository(taskRoot) {
 		fmt.Fprintf(os.Stderr, "  error: workspace is not a git repository, cannot bundle\n")
+		recordSubmitFailure(session, "done", "git", errors.New("workspace is not a git repository"))
 		return false, false
 	}
 
@@ -118,6 +119,7 @@ func submitWorkspaceCode(session Session, autoSubmit bool) (bool, bool) {
 	addArgs := append([]string{"add", "-A"}, gitAddExcludePathspecs(taskRoot)...)
 	if _, err := runCommand(taskRoot, "git", addArgs...); err != nil {
 		fmt.Fprintf(os.Stderr, "  error: git add failed: %v\n", err)
+		recordSubmitFailure(session, "done", "git_add", err)
 		return false, false
 	}
 	// Commit for audit trail. Disable gpgsign + skip hooks: a candidate's global
@@ -196,6 +198,7 @@ func submitWorkspaceCode(session Session, autoSubmit bool) (bool, bool) {
 	bundle, err := bundleWorkspace(taskRoot, base)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "  error: %v\n", err)
+		recordSubmitFailure(session, "done", "bundle", err)
 		return false, false
 	}
 	defer os.Remove(bundle.Path)
@@ -211,6 +214,7 @@ func submitWorkspaceCode(session Session, autoSubmit bool) (bool, bool) {
 			return false, true
 		}
 		fmt.Fprintf(os.Stderr, "  error: could not get upload URL: %v\n", err)
+		recordSubmitFailure(session, "done", "upload_url", err)
 		return false, false
 	}
 
@@ -220,6 +224,7 @@ func submitWorkspaceCode(session Session, autoSubmit bool) (bool, bool) {
 		dim.Render("●"), sizeMB, bundle.FileCount)
 	if err := uploadBundle(urlResp.UploadURL, bundle.Path, bundle.Size); err != nil {
 		fmt.Fprintf(os.Stderr, "  error: upload failed: %v\n", err)
+		recordSubmitFailure(session, "done", "upload", err)
 		return false, false
 	}
 
@@ -241,9 +246,11 @@ func submitWorkspaceCode(session Session, autoSubmit bool) (bool, bool) {
 			return false, true
 		}
 		fmt.Fprintf(os.Stderr, "  error: submit-code failed: %v\n", err)
+		recordSubmitFailure(session, "done", "submit_code", err)
 		return false, false
 	}
 
+	clearSubmitFailure()
 	fmt.Printf("  %s Code submitted (%d files, %.1f MB)\n",
 		success.Render("✓"), bundle.FileCount, sizeMB)
 	return true, false
