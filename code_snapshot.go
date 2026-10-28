@@ -76,6 +76,7 @@ func snapshotWorkspace(session Session) {
 	addArgs := append([]string{"add", "-N"}, gitAddExcludePathspecs(taskRoot)...)
 	if _, err := runCommand(taskRoot, "git", addArgs...); err != nil {
 		hookDebugf("snapshot: git add -N failed: %v", err)
+		recordSubmitFailure(session, "snapshot", "git_add", err)
 		return
 	}
 
@@ -96,6 +97,7 @@ func snapshotWorkspace(session Session) {
 	bundle, err := bundleWorkspace(taskRoot, baseSha)
 	if err != nil {
 		hookDebugf("snapshot: bundle failed: %v", err)
+		recordSubmitFailure(session, "snapshot", "bundle", err)
 		return
 	}
 	defer os.Remove(bundle.Path)
@@ -103,10 +105,12 @@ func snapshotWorkspace(session Session) {
 	urlResp, err := apiGetUploadURL(session.SessionToken, session.SessionID)
 	if err != nil {
 		hookDebugf("snapshot: get upload URL failed: %v", err)
+		recordSubmitFailure(session, "snapshot", "upload_url", err)
 		return
 	}
 	if err := uploadBundle(urlResp.UploadURL, bundle.Path, bundle.Size); err != nil {
 		hookDebugf("snapshot: upload failed: %v", err)
+		recordSubmitFailure(session, "snapshot", "upload", err)
 		return
 	}
 
@@ -125,7 +129,9 @@ func snapshotWorkspace(session Session) {
 
 	if err := apiSubmitCode(session.SessionToken, payload); err != nil {
 		hookDebugf("snapshot: submit-code failed: %v", err)
+		recordSubmitFailure(session, "snapshot", "submit_code", err)
 		return
 	}
+	clearSubmitFailure()
 	hookDebugAppend(fmt.Sprintf("%s snapshot uploaded files=%d size=%d", time.Now().UTC().Format(time.RFC3339Nano), bundle.FileCount, bundle.Size))
 }

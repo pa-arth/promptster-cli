@@ -80,6 +80,7 @@ func cmdDone(args []string) {
 		// prints the same thing it would have printed had we closed it ourselves.
 		if !errors.Is(err, errAssessmentClosed) {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			recordSubmitFailure(session, "done", "complete", err)
 			os.Exit(1)
 		}
 		closedByServer = true

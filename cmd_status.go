@@ -68,6 +68,10 @@ func cmdStatus(args []string) {
 			out["budgetUsd"] = b.BudgetUsd
 		}
 
+		if f, ok := loadSubmitFailure(); ok {
+			out["lastSubmitFailure"] = f
+		}
+
 		nudge := loadNudgeState()
 		if !nudge.LastExplainAt.IsZero() {
 			out["lastExplainSecondsAgo"] = int(time.Since(nudge.LastExplainAt).Seconds())
@@ -138,6 +142,14 @@ func cmdStatus(args []string) {
 		if status, ok := sessionData["status"].(string); ok {
 			rows = append(rows, row("Status:", status))
 		}
+	}
+
+	// Status at 18:09 on session 73ee97cc looked healthy while every upload since
+	// minute 21 had failed. The candidate is the one person who can act on it.
+	if f, ok := loadSubmitFailure(); ok {
+		rows = append(rows, row("Upload:", lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Render(
+			fmt.Sprintf("FAILED %s ago (%s, %s): %s",
+				time.Since(f.At).Round(time.Second), f.Source, f.Stage, f.Error))))
 	}
 
 	header := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12")).Render("Assessment Status")
