@@ -116,16 +116,18 @@ func cmdDone(args []string) {
 		dim.Render("Session:  "), session.SessionID,
 		dim.Render("Completed:"), resp.CompletedAt,
 	)
-	details += fmt.Sprintf("\n\n%s\n%s", dim.Render("Your results:"), urlStyle.Render(resultsURL))
-
-	// Try to copy URL to clipboard
-	copied := copyToClipboard(resultsURL)
-	if copied {
-		details += "\n\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Render("✓ Link copied to clipboard")
-	}
 
 	fmt.Println()
 	fmt.Println(doneBox.Render(heading + "\n\n" + details))
+	fmt.Println()
+	// The link is printed outside the box, on one line. Inside the 68-wide box
+	// lipgloss wrapped it mid-UUID, so a terminal's link detection (and a
+	// copy) took only the first line, which lands on the reviewer sign-in page.
+	fmt.Println(dim.Render("Your results:"))
+	fmt.Println(urlStyle.Render(resultsURL))
+	if copyToClipboard(resultsURL) {
+		fmt.Println(lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Render("✓ Link copied to clipboard"))
+	}
 	fmt.Println()
 	// Truthful about the one case that matters: the assessment IS submitted, and
 	// the very last edits did not make it. Saying nothing here would let a
