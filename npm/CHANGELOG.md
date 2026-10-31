@@ -1,5 +1,9 @@
 # CLI Changelog
 
+## 1.13.2 - 2026-10-31
+
+- fix(done): the results link now works when clicked or copied. `promptster done` printed the replay URL inside its 68-column box, and lipgloss wrapped it mid-session-id, so a terminal linked and copied only the first line (`/replay/ded520dc-0ff8-435b-8dfa-`). That URL carries no `key`, so it redirected to the reviewer sign-in page and the candidate read the link as broken or not yet live. The full URL was fine the whole time. The box now holds the session and completion time, and the link prints below it on its own line, followed by the clipboard notice
+
 ## 1.13.1 - 2026-10-27
 
 - fix(submit): a failed upload now reaches the session record and `promptster status`. On a hiring customer's "CI queue poller" session (73ee97cc), `promptster done` exited 1 three times in the last ten minutes and periodic snapshots had stopped after minute 21, and all the session record held was three exit codes. `done` printed its error only to the candidate's terminal and snapshots wrote theirs to the hook debug log, both on a hosted box that was gone before anyone asked, so nobody could say why the upload failed. Every failure point in `done`, the snapshot path and `/complete` now sends a `submission_failed` event with the source, the stage that failed and the error text (scrubbed like every other event), and keeps the last failure in `last-submit-failure.json`. A snapshot that fails the same way as the previous one is not re-sent, since snapshots retry every 30s. `promptster status` shows an `Upload: FAILED` row, and `lastSubmitFailure` in `--json`, until an upload is accepted. promptster-backend#1228 accepts the event kind; an older backend rejects it with a 400
