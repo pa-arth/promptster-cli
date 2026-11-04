@@ -26,7 +26,8 @@ type BundleResult struct {
 
 // bundleWorkspace tars+gzips the candidate's workspace into a temp file
 // suitable for HTTP PUT to a signed S3-compatible URL. Walks `git ls-files`
-// output (respects .gitignore), applies shouldBundleFile, skips symlinks.
+// output (respects .gitignore), applies shouldBundleFile and isSecretFile
+// (candidate-changed files only), skips symlinks.
 //
 // Files that differ from baseSha — the candidate's own content, the only
 // bytes not already public in the problem repo — are secret-scrubbed via
@@ -46,6 +47,8 @@ func bundleWorkspace(taskRoot, baseSha string) (BundleResult, error) {
 	// nil means "couldn't determine the changed set" — scrub every file
 	// rather than risk shipping an unscanned secret.
 	scrubSet := changedFileSet(taskRoot, baseSha)
+	// Same nil rule for secret files: unknown means drop every one.
+	addedSet := changedFileSet(taskRoot, baseSha, "--no-renames", "--diff-filter=A")
 
 	tmpFile, err := os.CreateTemp("", "promptster-bundle-*.tar.gz")
 	if err != nil {
@@ -87,6 +90,13 @@ func bundleWorkspace(taskRoot, baseSha string) (BundleResult, error) {
 			continue
 		}
 		if !shouldBundleFile(rel, info.Size()) {
+			continue
+		}
+		// Credential files the candidate added never ship (git add already
+		// excludes them; this catches ones the candidate staged or committed
+		// themselves). Ones the problem repo tracks at base stay — the
+		// server's tests may need them — and go through redaction if edited.
+		if (addedSet == nil || addedSet[rel]) && isSecretFile(rel) {
 			continue
 		}
 
@@ -173,9 +183,12 @@ func bundleWorkspace(taskRoot, baseSha string) (BundleResult, error) {
 // changedFileSet returns the repo-relative paths that differ between the
 // working tree and the assessment's base commit — i.e. the candidate's own
 // content, the only part of the bundle that can carry their secrets. Returns
-// nil when no base is determinable (callers then scrub everything).
-func changedFileSet(taskRoot, baseSha string) map[string]bool {
-	args := []string{"-C", taskRoot, "diff", "--name-only", "-z"}
+// nil when no base is determinable (callers then scrub everything). Extra
+// diff flags (e.g. --diff-filter=A) narrow the set.
+func changedFileSet(taskRoot, baseSha string, flags ...string) map[string]bool {
+	// --relative: paths relative to taskRoot, matching listTrackedFiles, so a
+	// RepoSubdir workspace looks files up under the same names.
+	args := append([]string{"-C", taskRoot, "diff", "--name-only", "--relative", "-z"}, flags...)
 	switch {
 	case baseSha != "":
 		args = append(args, baseSha)
