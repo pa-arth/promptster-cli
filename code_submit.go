@@ -78,24 +78,35 @@ func gitAddExcludePathspecs(root string) []string {
 	return append(gitExcludePathspecs(root), secretAddExcludePathspecs(root)...)
 }
 
-// gitDiffPathspecs is the pathspec set for diffs that get uploaded (submit,
-// snapshot, git-watcher file_diff): the shared excludes plus every secret
-// file added since base. The git-add excludes can't un-stage a secret the
-// candidate staged or committed themselves; this keeps it out of the diff the
-// same way bundleWorkspace keeps it out of the tarball. Secret files tracked
-// at base (fixtures) stay. Unknown base ⇒ every tracked secret is excluded.
-func gitDiffPathspecs(root, base string) []string {
+// gitDiffPathspecs is the pathspec set for a diff that gets uploaded
+// (submit, snapshot, git-watcher file_diff), where diffRefs are the refs that
+// diff compares. It is the shared excludes plus every secret file in that
+// diff — added, modified or deleted — that the base commit doesn't track. The
+// git-add excludes can't un-stage a secret the candidate staged or committed
+// themselves, and a committed-then-deleted one still shows its body in a
+// tree-to-tree deletion hunk; this keeps both out, the same rule
+// bundleWorkspace applies to the tarball. Secret files tracked at base
+// (fixtures) stay. Unknown base ⇒ every secret file is excluded.
+func gitDiffPathspecs(root, base string, diffRefs ...string) []string {
 	specs := gitExcludePathspecs(root)
-	var paths []string
-	if added := changedFileSet(root, base, "--no-renames", "--diff-filter=A"); added != nil {
-		for p := range added {
-			paths = append(paths, p)
-		}
-	} else if out, err := exec.Command("git", "-C", root, "ls-files", "-z", "--full-name").Output(); err == nil {
-		paths = strings.Split(string(out), "\x00")
+	args := append([]string{"-C", root, "diff", "--name-only", "-z", "--no-renames"}, diffRefs...)
+	out, err := exec.Command("git", args...).Output()
+	if err != nil {
+		return specs
 	}
-	for _, p := range paths {
-		if p != "" && isSecretFile(p) {
+	if base == "" && hasHeadParent(root) {
+		base = "HEAD~1"
+	}
+	tracked := map[string]bool{}
+	if base != "" {
+		if t, err := exec.Command("git", "-C", root, "ls-tree", "-r", "-z", "--name-only", base).Output(); err == nil {
+			for _, p := range strings.Split(string(t), "\x00") {
+				tracked[p] = true
+			}
+		}
+	}
+	for _, p := range strings.Split(string(out), "\x00") {
+		if p != "" && isSecretFile(p) && !tracked[p] {
 			specs = append(specs, ":(top,exclude,literal)"+p)
 		}
 	}
@@ -185,7 +196,7 @@ func submitWorkspaceCode(session Session, autoSubmit bool) (bool, bool) {
 	var diff string
 	base := diffBaseFor(session)
 	if base != "" {
-		diffArgs := append([]string{"diff", base}, gitDiffPathspecs(taskRoot, base)...)
+		diffArgs := append([]string{"diff", base}, gitDiffPathspecs(taskRoot, base, base)...)
 		diffOut, err := runCommand(taskRoot, "git", diffArgs...)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "  warning: diff against %s failed: %v\n", base, err)
@@ -193,7 +204,7 @@ func submitWorkspaceCode(session Session, autoSubmit bool) (bool, bool) {
 			diff = string(diffOut)
 		}
 	} else if hasHeadParent(taskRoot) {
-		diffArgs := append([]string{"diff", "HEAD~1"}, gitDiffPathspecs(taskRoot, "HEAD~1")...)
+		diffArgs := append([]string{"diff", "HEAD~1"}, gitDiffPathspecs(taskRoot, "HEAD~1", "HEAD~1")...)
 		diffOut, _ := runCommand(taskRoot, "git", diffArgs...)
 		diff = string(diffOut)
 	}

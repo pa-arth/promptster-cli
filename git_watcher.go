@@ -319,13 +319,12 @@ func pollGitDiffs(session Session, client *http.Client) (int, error) {
 
 	// Build git diff command against our stored baseline. Pathspec excludes
 	// keep CLI-generated files (TASK.md, .promptster/) out of file_diff events.
-	var args []string
-	if lastHash == "" {
-		args = []string{"-C", taskRoot, "diff", "HEAD", currentHash, "--no-color", "--unified=3"}
-	} else {
-		args = []string{"-C", taskRoot, "diff", lastHash, currentHash, "--no-color", "--unified=3"}
+	from := lastHash
+	if from == "" {
+		from = "HEAD"
 	}
-	args = append(args, gitDiffPathspecs(taskRoot, diffBaseFor(session))...)
+	args := []string{"-C", taskRoot, "diff", from, currentHash, "--no-color", "--unified=3"}
+	args = append(args, gitDiffPathspecs(taskRoot, diffBaseFor(session), from, currentHash)...)
 	args = append(args, lockfileExcludePathspecs...)
 
 	diffOutput, err := exec.Command("git", args...).Output()

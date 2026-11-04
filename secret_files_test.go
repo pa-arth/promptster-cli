@@ -131,7 +131,7 @@ func TestSecretFilesNeverStagedOrBundled(t *testing.T) {
 	git("-c", "user.name=T", "-c", "user.email=t@example.com", "commit", "-qm", "candidate")
 
 	// The uploaded diff drops added secrets but keeps the edited fixture.
-	diffFiles := git(append([]string{"diff", "--name-only", base}, gitDiffPathspecs(root, base)...)...)
+	diffFiles := git(append([]string{"diff", "--name-only", base}, gitDiffPathspecs(root, base, base)...)...)
 	if diffFiles != ".env.example\napp.go\ntestdata/fixture.pem" {
 		t.Fatalf("diff files = %q", diffFiles)
 	}
@@ -143,5 +143,13 @@ func TestSecretFilesNeverStagedOrBundled(t *testing.T) {
 	defer os.Remove(res.Path)
 	if got := strings.Join(res.FileTree, "\n"); got != ".env.example\n.gitignore\napp.go\ntestdata/fixture.pem" {
 		t.Fatalf("bundle = %q", got)
+	}
+
+	// Git-watcher shape: tree-to-tree diff where a committed secret is then
+	// deleted — the deletion hunk would carry its body.
+	git("rm", "-q", "committed.key")
+	git("-c", "user.name=T", "-c", "user.email=t@example.com", "commit", "-qm", "delete")
+	if got := git(append([]string{"diff", "--name-only", "HEAD~1", "HEAD"}, gitDiffPathspecs(root, base, "HEAD~1", "HEAD")...)...); got != "" {
+		t.Fatalf("watcher diff leaked %q", got)
 	}
 }
