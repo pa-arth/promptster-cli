@@ -186,7 +186,9 @@ func bundleWorkspace(taskRoot, baseSha string) (BundleResult, error) {
 // nil when no base is determinable (callers then scrub everything). Extra
 // diff flags (e.g. --diff-filter=A) narrow the set.
 func changedFileSet(taskRoot, baseSha string, flags ...string) map[string]bool {
-	args := append([]string{"-C", taskRoot, "diff", "--name-only", "-z"}, flags...)
+	// --relative: paths relative to taskRoot, matching listTrackedFiles, so a
+	// RepoSubdir workspace looks files up under the same names.
+	args := append([]string{"-C", taskRoot, "diff", "--name-only", "--relative", "-z"}, flags...)
 	switch {
 	case baseSha != "":
 		args = append(args, baseSha)

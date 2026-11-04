@@ -99,7 +99,7 @@ func gitDiffPathspecs(root, base string, diffRefs ...string) []string {
 	}
 	tracked := map[string]bool{}
 	if base != "" {
-		if t, err := exec.Command("git", "-C", root, "ls-tree", "-r", "-z", "--name-only", base).Output(); err == nil {
+		if t, err := exec.Command("git", "-C", root, "ls-tree", "-r", "-z", "--full-tree", "--name-only", base).Output(); err == nil {
 			for _, p := range strings.Split(string(t), "\x00") {
 				tracked[p] = true
 			}

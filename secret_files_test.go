@@ -153,3 +153,50 @@ func TestSecretFilesNeverStagedOrBundled(t *testing.T) {
 		t.Fatalf("watcher diff leaked %q", got)
 	}
 }
+
+// RepoSubdir workspaces: taskRoot is below the repo top, so every path set
+// must agree on what a name is relative to.
+func TestSecretFilesSubdirWorkspace(t *testing.T) {
+	top := t.TempDir()
+	root := filepath.Join(top, "sub")
+	git := func(args ...string) string {
+		t.Helper()
+		out, err := exec.Command("git", append([]string{"-C", root}, args...)...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	write := func(path, body string) {
+		t.Helper()
+		full := filepath.Join(root, path)
+		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(body), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("app.go", "before\n")
+	write("testdata/fixture.pem", "upstream cert\n")
+	git("init", "-q", top)
+	git("add", ".")
+	git("-c", "user.name=T", "-c", "user.email=t@example.com", "commit", "-qm", "base")
+	base := git("rev-parse", "HEAD")
+
+	write("testdata/fixture.pem", "edited\n")
+	write(".npmrc", "secret\n")
+	git("add", "-f", ".npmrc") // staged by the candidate, past the add excludes
+
+	if got := git(append([]string{"diff", "--name-only", base}, gitDiffPathspecs(root, base, base)...)...); got != "sub/testdata/fixture.pem" {
+		t.Fatalf("diff files = %q", got)
+	}
+	res, err := bundleWorkspace(root, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(res.Path)
+	if got := strings.Join(res.FileTree, "\n"); got != "app.go\ntestdata/fixture.pem" {
+		t.Fatalf("bundle = %q", got)
+	}
+}
