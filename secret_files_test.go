@@ -59,11 +59,12 @@ func TestIsSecretFile(t *testing.T) {
 		".npmrc", "web/.npmrc", ".mcp.json", ".claude/settings.local.json",
 		"certs/server.PEM", "tls.key", ".ssh/config", "home/.ssh/known_hosts",
 		".aws/config", ".gnupg/x", "id_ed25519", "credentials", ".git-credentials",
+		"id_rsa.bak", "keys/id_ed25519.old", "ID_DSA_backup", "id_ecdsa-2024",
 		".env", ".env.local", ".env.production.local", "local.env", "secrets.yaml",
 	}
 	kept := []string{
 		"main.go", ".env.example", ".env.sample.local", "example.env", ".claude/settings.json",
-		"key.go", "keys/readme.md", "id_rsa.pub", "src/sshd/main.go", ".pem",
+		"key.go", "keys/readme.md", "id_rsa.pub", "id_ed25519.old.pub", "my_id_rsa.go", "src/sshd/main.go", ".pem",
 	}
 	for _, p := range secret {
 		if !isSecretFile(p) {

@@ -118,6 +118,11 @@ var excludedSecretFileNames = map[string]struct{}{
 // cliOnlySecretFileNames are the entries above the server doesn't have.
 var cliOnlySecretFileNames = []string{".git-credentials"}
 
+// cliOnlyPrivateKeyPrefixes: CLI-only, broader than the server's exact names.
+// Copies of a private key (id_rsa.bak, id_ed25519.old) are secret too; only
+// the .pub half is safe to ship.
+var cliOnlyPrivateKeyPrefixes = []string{"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"}
+
 // excludedSecretExtensions: key material regardless of where it sits.
 var excludedSecretExtensions = map[string]struct{}{
 	"pem": {}, "key": {}, "p12": {}, "pfx": {}, "jks": {},
@@ -145,6 +150,13 @@ func isSecretFile(path string) bool {
 	}
 	if _, ok := excludedSecretFileNames[base]; ok {
 		return true
+	}
+	if !strings.HasSuffix(base, ".pub") {
+		for _, p := range cliOnlyPrivateKeyPrefixes {
+			if strings.HasPrefix(base, p) {
+				return true
+			}
+		}
 	}
 	if dot := strings.LastIndex(base, "."); dot > 0 {
 		if _, ok := excludedSecretExtensions[base[dot+1:]]; ok {
