@@ -82,13 +82,13 @@ func snapshotWorkspace(session Session) {
 
 	var diff string
 	if baseSha != "" {
-		args := append([]string{"diff", baseSha}, gitExcludePathspecs(taskRoot)...)
+		args := append([]string{"diff", baseSha}, gitDiffPathspecs(taskRoot, baseSha)...)
 		if out, err := runCommand(taskRoot, "git", args...); err == nil {
 			diff = string(out)
 		}
 	}
 	if diff == "" {
-		args := append([]string{"diff", "HEAD"}, gitExcludePathspecs(taskRoot)...)
+		args := append([]string{"diff", "HEAD"}, gitDiffPathspecs(taskRoot, baseSha)...)
 		if out, err := runCommand(taskRoot, "git", args...); err == nil {
 			diff = string(out)
 		}

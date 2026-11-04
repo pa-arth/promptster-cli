@@ -125,6 +125,17 @@ func TestSecretFilesNeverStagedOrBundled(t *testing.T) {
 		t.Fatalf("index = %q, want %q", got, want)
 	}
 
+	// A secret the candidate committed is just as out of reach of git add.
+	write("committed.key", "candidate committed this\n")
+	git("add", "committed.key")
+	git("-c", "user.name=T", "-c", "user.email=t@example.com", "commit", "-qm", "candidate")
+
+	// The uploaded diff drops added secrets but keeps the edited fixture.
+	diffFiles := git(append([]string{"diff", "--name-only", base}, gitDiffPathspecs(root, base)...)...)
+	if diffFiles != ".env.example\napp.go\ntestdata/fixture.pem" {
+		t.Fatalf("diff files = %q", diffFiles)
+	}
+
 	res, err := bundleWorkspace(root, base)
 	if err != nil {
 		t.Fatal(err)

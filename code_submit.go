@@ -78,6 +78,30 @@ func gitAddExcludePathspecs(root string) []string {
 	return append(gitExcludePathspecs(root), secretAddExcludePathspecs(root)...)
 }
 
+// gitDiffPathspecs is the pathspec set for diffs that get uploaded (submit,
+// snapshot, git-watcher file_diff): the shared excludes plus every secret
+// file added since base. The git-add excludes can't un-stage a secret the
+// candidate staged or committed themselves; this keeps it out of the diff the
+// same way bundleWorkspace keeps it out of the tarball. Secret files tracked
+// at base (fixtures) stay. Unknown base ⇒ every tracked secret is excluded.
+func gitDiffPathspecs(root, base string) []string {
+	specs := gitExcludePathspecs(root)
+	var paths []string
+	if added := changedFileSet(root, base, "--no-renames", "--diff-filter=A"); added != nil {
+		for p := range added {
+			paths = append(paths, p)
+		}
+	} else if out, err := exec.Command("git", "-C", root, "ls-files", "-z", "--full-name").Output(); err == nil {
+		paths = strings.Split(string(out), "\x00")
+	}
+	for _, p := range paths {
+		if p != "" && isSecretFile(p) {
+			specs = append(specs, ":(top,exclude,literal)"+p)
+		}
+	}
+	return specs
+}
+
 // submitCodePayload is the body for POST /v1/candidate/submit-code.
 // Files travel out-of-band via a Supabase Storage tarball — this payload
 // just identifies the bundle and carries the diff for fast server-side
@@ -161,7 +185,7 @@ func submitWorkspaceCode(session Session, autoSubmit bool) (bool, bool) {
 	var diff string
 	base := diffBaseFor(session)
 	if base != "" {
-		diffArgs := append([]string{"diff", base}, gitExcludePathspecs(taskRoot)...)
+		diffArgs := append([]string{"diff", base}, gitDiffPathspecs(taskRoot, base)...)
 		diffOut, err := runCommand(taskRoot, "git", diffArgs...)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "  warning: diff against %s failed: %v\n", base, err)
@@ -169,7 +193,7 @@ func submitWorkspaceCode(session Session, autoSubmit bool) (bool, bool) {
 			diff = string(diffOut)
 		}
 	} else if hasHeadParent(taskRoot) {
-		diffArgs := append([]string{"diff", "HEAD~1"}, gitExcludePathspecs(taskRoot)...)
+		diffArgs := append([]string{"diff", "HEAD~1"}, gitDiffPathspecs(taskRoot, "HEAD~1")...)
 		diffOut, _ := runCommand(taskRoot, "git", diffArgs...)
 		diff = string(diffOut)
 	}

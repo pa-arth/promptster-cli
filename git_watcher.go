@@ -325,7 +325,7 @@ func pollGitDiffs(session Session, client *http.Client) (int, error) {
 	} else {
 		args = []string{"-C", taskRoot, "diff", lastHash, currentHash, "--no-color", "--unified=3"}
 	}
-	args = append(args, gitExcludePathspecs(taskRoot)...)
+	args = append(args, gitDiffPathspecs(taskRoot, diffBaseFor(session))...)
 	args = append(args, lockfileExcludePathspecs...)
 
 	diffOutput, err := exec.Command("git", args...).Output()
