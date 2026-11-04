@@ -40,36 +40,42 @@ func gitExcludePathspecs(root string) []string {
 	return specs
 }
 
-// secretAddExcludePathspecs keeps candidate-created credential files out of
-// the index entirely: never staged means never in the diff, the snapshot's
-// intent-to-add set (which would leak into git-watcher file_diff events), the
-// file tree, or the bundle. Applied to `git add` ONLY — never to `git diff` —
-// so files the upstream problem repo already tracks (a committed .env.test,
-// testdata certs) keep flowing into the diff and the bundle the server runs
-// tests against; tracked content is public anyway. Trade-off: a candidate
-// creating .env.example as part of a fix loses it from the submission.
-// Content-level secrets in other files are caught by the Titus scan in
-// bundleWorkspace and redactBytes on diffs.
-var secretAddExcludePathspecs = []string{
-	":(exclude,glob)**/.env",
-	":(exclude,glob)**/.env.*",
-	":(exclude,glob)**/*.env",
-	":(exclude,glob)**/id_rsa*",
-	":(exclude,glob)**/id_dsa*",
-	":(exclude,glob)**/id_ecdsa*",
-	":(exclude,glob)**/id_ed25519*",
-	":(exclude,glob)**/.netrc",
-	":(exclude,glob)**/_netrc",
-	":(exclude,glob)**/.git-credentials",
-	":(exclude,glob)**/.pgpass",
-	":(exclude,glob)**/.htpasswd",
-	":(exclude,glob)**/.aws/credentials",
+// secretAddExcludePathspecs keeps candidate-created credential files (any
+// path isSecretFile matches) out of the index entirely: never staged means
+// never in the diff, the snapshot's intent-to-add set (which would leak into
+// git-watcher file_diff events), the file tree, or the bundle.
+//
+// It names each matching untracked-or-staged file literally rather than
+// translating isSecretFile into globs, so the one Go list stays the only
+// definition (and `.env.example` survives, as it does on the server).
+//
+// Files the upstream problem repo already tracks (a committed .env.test,
+// testdata certs) still flow into the diff and the bundle the server runs
+// tests against — the diff reads the working tree, the bundle reads `git
+// ls-files` + disk, and the git watcher runs `add -u` before this; tracked
+// content is public anyway. Content-level secrets in other files are caught by
+// the Titus scan in bundleWorkspace and redactBytes on diffs.
+func secretAddExcludePathspecs(root string) []string {
+	out, err := exec.Command("git", "-C", root, "ls-files", "-z", "--full-name",
+		"--cached", "--others", "--exclude-standard").Output()
+	if err != nil {
+		return nil // bundleWorkspace still drops candidate-added secrets
+	}
+	var specs []string
+	seen := map[string]bool{}
+	for _, p := range strings.Split(string(out), "\x00") {
+		if p != "" && !seen[p] && isSecretFile(p) {
+			seen[p] = true
+			specs = append(specs, ":(top,exclude,literal)"+p)
+		}
+	}
+	return specs
 }
 
 // gitAddExcludePathspecs is the pathspec set for `git add` calls: the shared
 // excludes plus the secret-file excludes above.
 func gitAddExcludePathspecs(root string) []string {
-	return append(append([]string{}, gitExcludePathspecs(root)...), secretAddExcludePathspecs...)
+	return append(gitExcludePathspecs(root), secretAddExcludePathspecs(root)...)
 }
 
 // submitCodePayload is the body for POST /v1/candidate/submit-code.
