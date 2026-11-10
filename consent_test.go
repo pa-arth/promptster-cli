@@ -56,7 +56,7 @@ func TestFallbackDisclosureIsCurrent(t *testing.T) {
 		t.Fatal("fallback has no data-use clause — the one omission that made every prior consent a false proof")
 	}
 	dataUse := strings.Join(d.DataUse, "\n")
-	for _, want := range []string{"de-identified", "train", "decline"} {
+	for _, want := range []string{"does not use it to train", "deletion", "privacy@promptster.ai"} {
 		if !strings.Contains(strings.ToLower(dataUse), want) {
 			t.Errorf("data-use clause missing %q: %q", want, dataUse)
 		}
