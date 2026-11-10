@@ -55,8 +55,8 @@ var fallbackDisclosure = ConsentDisclosure{
 		"How you explain your key decisions",
 	},
 	DataUse: []string{
-		"In de-identified form — with your name, email, and account identifiers removed — your assessment may be used to improve and train Promptster’s evaluation models.",
-		"This never affects your assessment result, and you can decline this specific use at any time by contacting privacy@promptster.ai.",
+		"Your assessment is shared with the company that invited you. Promptster does not use it to train or improve models.",
+		"To ask for a copy or deletion of your data, contact privacy@promptster.ai.",
 	},
 	TosURL: fallbackTosURL,
 }
