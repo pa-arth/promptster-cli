@@ -168,7 +168,11 @@ func appBundle(p string) string {
 // editorIdentity reports which app a resolved CLI path actually belongs to, as
 // a bundle name like "Cursor.app". Empty when it cannot be told.
 func editorIdentity(resolved string) string {
-	return filepath.Base(appBundle(resolved))
+	bundle := appBundle(resolved)
+	if bundle == "" {
+		return "" // filepath.Base("") is ".", which made every non-bundle `code` unowned
+	}
+	return filepath.Base(bundle)
 }
 
 // detectEditors returns the supported editors present on this machine.

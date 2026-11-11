@@ -232,3 +232,23 @@ func TestBundleFallbackWhenPathCommandBelongsToAnotherEditor(t *testing.T) {
 		t.Fatal("a Cursor-owned `code` must not be reported as owned by VS Code")
 	}
 }
+
+// Off macOS a `code` binary lives in no .app bundle, and identity cannot be
+// told. editorIdentity returned "." for that (filepath.Base of ""), so ownedBy
+// rejected every Linux `code`: start skipped the extension and doctor reported
+// "no VS Code or Cursor" with VS Code on PATH.
+func TestALinuxCodeOnPathIsDetected(t *testing.T) {
+	if got := editorIdentity("/home/candidate/.local/opt/VSCode-linux-x64/bin/code"); got != "" {
+		t.Fatalf("a path outside any .app bundle has no identity, got %q", got)
+	}
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "code")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	found := detectEditors()
+	if len(found) != 1 || found[0].key != "vscode" {
+		t.Fatalf("a plain `code` on PATH must be detected as VS Code, got %+v", found)
+	}
+}
