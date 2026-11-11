@@ -247,8 +247,12 @@ func TestALinuxCodeOnPathIsDetected(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir)
-	found := detectEditors()
-	if len(found) != 1 || found[0].key != "vscode" {
-		t.Fatalf("a plain `code` on PATH must be detected as VS Code, got %+v", found)
+	// Only VS Code is asserted: on a Mac with Cursor.app installed, the bundle
+	// fallback also (correctly) reports Cursor.
+	for _, e := range detectEditors() {
+		if e.key == "vscode" {
+			return
+		}
 	}
+	t.Fatal("a plain `code` on PATH must be detected as VS Code")
 }
