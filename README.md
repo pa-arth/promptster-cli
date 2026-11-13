@@ -25,7 +25,7 @@ curl -fsSL https://get.promptster.ai | sh
 npm install -g @promptster/cli
 
 # Or from source
-go install github.com/pa-arth/promptster-cli@latest
+go install github.com/promptster-ai/promptster-cli@latest
 ```
 
 ## Commands

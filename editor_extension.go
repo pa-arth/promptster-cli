@@ -13,7 +13,7 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/pa-arth/promptster-cli/vsix"
+	"github.com/promptster-ai/promptster-cli/vsix"
 )
 
 // Editor attention capture — installing the promptster-vscode extension.

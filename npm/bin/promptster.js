@@ -37,7 +37,7 @@ const binaryName = BINARY_BY_PLATFORM[platformKey];
 if (!binaryName) {
   console.error(`promptster: unsupported platform ${platformKey}`);
   console.error("Supported: " + Object.keys(BINARY_BY_PLATFORM).sort().join(", "));
-  console.error("Build from source instead: go install github.com/pa-arth/promptster-cli@latest");
+  console.error("Build from source instead: go install github.com/promptster-ai/promptster-cli@latest");
   process.exit(1);
 }
 

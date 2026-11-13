@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pa-arth/promptster-cli/vsix"
+	"github.com/promptster-ai/promptster-cli/vsix"
 )
 
 // withEmptyPath makes editor detection deterministic by removing every editor

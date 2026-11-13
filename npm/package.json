@@ -9,10 +9,10 @@
     "developer",
     "ai"
   ],
-  "homepage": "https://github.com/pa-arth/promptster-cli",
+  "homepage": "https://github.com/promptster-ai/promptster-cli",
   "repository": {
     "type": "git",
-    "url": "https://github.com/pa-arth/promptster-cli"
+    "url": "https://github.com/promptster-ai/promptster-cli"
   },
   "license": "MIT",
   "bin": {

@@ -58,7 +58,7 @@ git push origin HEAD --follow-tags
 
 Release notes come from `CHANGELOG.md`. The helper scripts only stage the release manifest and will not sweep in unrelated repo changes.
 
-Source lives at [github.com/pa-arth/promptster-cli](https://github.com/pa-arth/promptster-cli).
+Source lives at [github.com/promptster-ai/promptster-cli](https://github.com/promptster-ai/promptster-cli).
 
 ## License
 
