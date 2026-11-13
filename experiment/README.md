@@ -170,7 +170,7 @@ the exact `POST /v1/teams/experiments/assignment` body:
   "experimentKey": "batch1-context-mechanics",
   "taskKey": "promptster-cli/task-envelope",
   "weekBlock": "2026-W33",
-  "repo": "pa-arth/promptster-cli",
+  "repo": "promptster-ai/promptster-cli",
   "taskClass": "feature",
   "sizeBand": "M",
   "cliVersion": "0.1.0",

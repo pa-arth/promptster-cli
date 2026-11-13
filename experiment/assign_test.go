@@ -26,7 +26,7 @@ func testCfg() Config {
 //	sha256(experimentKey || 0x00 || orgId || 0x00 || engineerUserId || 0x00 ||
 //	       stratum || 0x00 || decimal(block))
 func TestBlockSeedMatchesTheSpecLiterally(t *testing.T) {
-	ek, org, eng, stratum, block := "batch1-context-mechanics", "org_test", "eng@example.com", "pa-arth/promptster-cli|feature", 3
+	ek, org, eng, stratum, block := "batch1-context-mechanics", "org_test", "eng@example.com", "promptster-ai/promptster-cli|feature", 3
 
 	var want []byte
 	want = append(want, []byte(ek)...)
@@ -93,7 +93,7 @@ func TestPermutationFollowsDeclarationOrderFisherYates(t *testing.T) {
 // this is re-run against that file.
 func TestAllocatorSelfVectorsAreStable(t *testing.T) {
 	cfg := testCfg()
-	stratum := "pa-arth/promptster-cli|feature"
+	stratum := "promptster-ai/promptster-cli|feature"
 	var got []string
 	for pos := 0; pos < 8; pos++ {
 		arm, _, _ := assignArm(cfg, stratum, pos)
@@ -114,7 +114,7 @@ func TestAllocatorSelfVectorsAreStable(t *testing.T) {
 
 func TestEveryCompleteBlockHoldsAllFourCells(t *testing.T) {
 	cfg := testCfg()
-	stratum := "pa-arth/promptster-cli|feature"
+	stratum := "promptster-ai/promptster-cli|feature"
 
 	for block := 0; block < 25; block++ {
 		seen := map[string]int{}
@@ -147,7 +147,7 @@ func TestDifferentStrataGetDifferentPermutations(t *testing.T) {
 	cfg := testCfg()
 	same := 0
 	for pos := 0; pos < 16; pos++ {
-		x, _, _ := assignArm(cfg, "pa-arth/promptster-cli|feature", pos)
+		x, _, _ := assignArm(cfg, "promptster-ai/promptster-cli|feature", pos)
 		y, _, _ := assignArm(cfg, "pa-arth/promptster-backend|feature", pos)
 		if x == y {
 			same++
@@ -180,8 +180,8 @@ func TestDifferentEngineersGetDifferentPermutations(t *testing.T) {
 func TestBatchSizedRunStaysBalanced(t *testing.T) {
 	cfg := testCfg()
 	strata := []string{
-		"pa-arth/promptster-cli|feature",
-		"pa-arth/promptster-cli|fix",
+		"promptster-ai/promptster-cli|feature",
+		"promptster-ai/promptster-cli|fix",
 		"pa-arth/promptster-backend|feature",
 		"pa-arth/promptster-backend|fix",
 		"pa-arth/promptster-teams|analysis",
@@ -287,7 +287,7 @@ func TestExistingTaskIsFoundByTheBackendIdempotencyKey(t *testing.T) {
 
 func TestOfflineRowCarriesEverythingTheServerNeedsToStoreItVerbatim(t *testing.T) {
 	cfg := testCfg()
-	a := newAssignment(cfg, nil, "repo/t-1", "pa-arth/promptster-cli", "feature", "M",
+	a := newAssignment(cfg, nil, "repo/t-1", "promptster-ai/promptster-cli", "feature", "M",
 		Envelope{RepoRoot: "/Users/someone/repos/promptster-cli", Title: "t"}, "", time.Now())
 
 	p := a.syncPayload()
@@ -364,8 +364,8 @@ func TestValidateTaskKeyMatchesTheBackendContract(t *testing.T) {
 
 func TestRepoSlugFromURL(t *testing.T) {
 	cases := map[string]string{
-		"git@github.com:pa-arth/promptster-cli.git":     "pa-arth/promptster-cli",
-		"https://github.com/pa-arth/promptster-cli.git": "pa-arth/promptster-cli",
+		"git@github.com:promptster-ai/promptster-cli.git":     "promptster-ai/promptster-cli",
+		"https://github.com/promptster-ai/promptster-cli.git": "promptster-ai/promptster-cli",
 		"https://user@github.com/pa-arth/x":             "pa-arth/x",
 		"ssh://git@github.com/pa-arth/y.git":            "pa-arth/y",
 	}
@@ -397,10 +397,10 @@ func TestRepoAttributionGuard(t *testing.T) {
 
 	ok := []struct{ key, slug string }{
 		{"promptster-teams/github-linear-join-dashboard", "pa-arth/promptster-teams"}, // the other real row
-		{"promptster-cli/experiment-envelope", "pa-arth/promptster-cli"},
-		{"PROMPTSTER-CLI/x", "pa-arth/promptster-cli"},     // repo names are case-insensitive
-		{"promptster-cli/a/b", "pa-arth/promptster-cli"},   // only the first segment is the repo
-		{"no-repo-claimed-here", "pa-arth/promptster-cli"}, // no "/" claims no repo — the escape hatch
+		{"promptster-cli/experiment-envelope", "promptster-ai/promptster-cli"},
+		{"PROMPTSTER-CLI/x", "promptster-ai/promptster-cli"},     // repo names are case-insensitive
+		{"promptster-cli/a/b", "promptster-ai/promptster-cli"},   // only the first segment is the repo
+		{"no-repo-claimed-here", "promptster-ai/promptster-cli"}, // no "/" claims no repo — the escape hatch
 		{"promptster-backend/x", ""},                       // nothing to compare against
 		{"promptster-cli/x", "promptster-cli"},             // bare slug, no owner
 	}
@@ -412,8 +412,8 @@ func TestRepoAttributionGuard(t *testing.T) {
 
 	bad := []struct{ key, slug string }{
 		{"promptster-backend/x", "pa-arth/promptster-teams"},
-		{"openspec/practice-effect", "pa-arth/promptster-cli"},
-		{"pa-arth/promptster-cli", "pa-arth/promptster-cli"}, // owner/name as the key: segment is the OWNER, not the repo
+		{"openspec/practice-effect", "promptster-ai/promptster-cli"},
+		{"promptster-ai/promptster-cli", "promptster-ai/promptster-cli"}, // owner/name as the key: segment is the OWNER, not the repo
 	}
 	for _, c := range bad {
 		if err := checkRepoAttribution(c.key, c.slug); err == nil {

@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/pa-arth/promptster-cli/vsix"
+	"github.com/promptster-ai/promptster-cli/vsix"
 )
 
 // The extension's marketplace identity: publisher.name from its package.json.
