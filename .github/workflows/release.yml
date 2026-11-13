@@ -6,7 +6,7 @@ on:
       - 'v*' # v1.4.0
 
 env:
-  PUBLIC_RELEASES_REPO: pa-arth/promptster-cli-releases
+  PUBLIC_RELEASES_REPO: promptster-ai/promptster-cli-releases
 
 jobs:
   release:

@@ -4,7 +4,7 @@
 # Or:    PROMPTSTER_VERSION=0.2.9 curl -fsSL https://get.promptster.ai | sh
 set -euo pipefail
 
-REPO="pa-arth/promptster-cli-releases"
+REPO="promptster-ai/promptster-cli-releases"
 VERSION="${PROMPTSTER_VERSION:-latest}"
 BINARY="promptster"
 
